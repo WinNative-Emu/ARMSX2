@@ -158,11 +158,13 @@ void Host::ReportFormattedErrorAsync(const std::string_view title, const char* f
 std::string Host::GetHTTPUserAgent()
 {
 	// RetroAchievements identifies the client by the leading Name/Version token of
-	// this User-Agent, so report ARMSX2 with the stable dotted version the RA server
-	// has registered/pinned (matches the refresh-experimental Android build). A
-	// "PCSX2 <gitrev>" UA is rejected as an outdated/unknown emulator, which disables
-	// hardcore unlocks ("Warning: Outdated Emulator").
-	return fmt::format("ARMSX2/2.7.407.0 ({})", GetOSVersionString());
+	// this User-Agent. Report WinNative honestly rather than a token belonging to
+	// another build: the previously hardcoded ARMSX2 version was a registered
+	// credential that has since been withdrawn from public source, and the server now
+	// refuses it outright ("This client is not supported"). An unregistered client is
+	// tracked in softcore, which is what the libretro side already does under the
+	// matching WinNative user agent; hardcore needs registering this token with RA.
+	return fmt::format("WinNative/1.0.0 ({}) armsx2", GetOSVersionString());
 }
 
 std::unique_lock<std::mutex> Host::GetSettingsLock()
