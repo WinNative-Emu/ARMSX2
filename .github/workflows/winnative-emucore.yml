@@ -1,0 +1,74 @@
+name: emucore
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [winnative]
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: 27.3.13750724
+  ABI: arm64-v8a
+  PLATFORM: android-26
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build cmake python3
+          echo "NDK=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Sync shaderc deps
+        run: python3 platforms/android/app/src/main/cpp/3rdparty/shaderc/utils/git-sync-deps
+
+      - name: Build variants
+        run: |
+          CPP="platforms/android/app/src/main/cpp"
+          STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          mkdir -p dist
+          build() {
+            name="$1"; page="$2"; bdir="build-$name"
+            rm -rf "$bdir"
+            cmake -G Ninja -B "$bdir" -S "$CPP" \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$ABI" -DANDROID_PLATFORM="$PLATFORM" \
+              -DANDROID=true -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release \
+              -DLTO_PCSX2_CORE=ON \
+              -DARMSX2_EMUCORE_LIBRARY_NAME="$name" \
+              -DARMSX2_ANDROID_HOST_PAGE_SIZE="$page"
+            ninja -C "$bdir" "$name"
+            so="$(find "$bdir" -name "lib${name}.so" | head -1)"
+            if [ -z "$so" ]; then
+              echo "$name produced no .so" >&2
+              exit 1
+            fi
+            "$STRIP" --strip-unneeded "$so" -o "dist/lib${name}.so"
+          }
+          build emucore_4k 4096
+          build emucore_16k 16384
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emucore
+          path: dist/*.so
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view latest > /dev/null 2>&1; then
+            gh release create latest --title latest --notes "arm64-v8a ARMSX2 emucore for WinNative."
+          fi
+          gh release upload latest dist/*.so --clobber
+          gh release edit latest --notes "arm64-v8a emucore built from ${GITHUB_SHA} on $(date -u +%Y-%m-%dT%H:%M:%SZ)"
