@@ -28,6 +28,14 @@ namespace Sessions
 
 		u16 srcPort = 0;
 		u16 destPort = 0;
+
+		// PS2 DNS redirect (Manual DNS mode): the actual socket is aimed at the
+		// emulator's configured DNS server, while responses are still presented as
+		// coming from the address the game queried — so the emulator's DNS setting
+		// applies regardless of the DNS baked into the game's memory-card profile.
+		bool dnsRedirect = false;
+		PacketReader::IP::IP_Address dnsRedirectIP{};
+
 		// UDP_Session flags
 		const bool isBroadcast;
 		const bool isMulticast;

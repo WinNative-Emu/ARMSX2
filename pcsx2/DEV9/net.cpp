@@ -362,6 +362,19 @@ bool NetAdapter::InternalServerRecv(NetPacket* pkt)
 		IP_Packet* ippkt = new IP_Packet(ippay);
 		ippkt->destinationIP = ps2IP;
 		ippkt->sourceIP = internalIP;
+		// If this query was redirected from another server address (Internal
+		// DNS mode override), present the reply as coming from the address the
+		// game actually queried so its network stack accepts it.
+		{
+			UDP_Packet* udppay = static_cast<UDP_Packet*>(ippay);
+			std::lock_guard lk(dnsRedirectMutex);
+			const auto it = dnsRedirectSources.find(udppay->destinationPort);
+			if (it != dnsRedirectSources.end())
+			{
+				ippkt->sourceIP = it->second;
+				dnsRedirectSources.erase(it);
+			}
+		}
 		EthernetFrame frame(ippkt);
 		frame.sourceMAC = internalMAC;
 		frame.destinationMAC = ps2MAC;
@@ -392,6 +405,23 @@ bool NetAdapter::InternalServerSend(NetPacket* pkt)
 				//Send DHCP
 				if (dhcpOn)
 					return dhcpServer.Send(&udppkt);
+			}
+
+			// Internal DNS mode: route EVERY DNS query to the internal DNS
+			// server, whatever server address the game's (memory-card) network
+			// profile points at — the emulator's DNS settings are the source of
+			// truth. The queried address is remembered per source port so the
+			// reply can be presented as coming from it (see InternalServerRecv).
+			if (udppkt.destinationPort == 53 &&
+				EmuConfig.DEV9.ModeDNS1 == Pcsx2Config::DEV9Options::DnsMode::Internal &&
+				ippkt.destinationIP != internalIP)
+			{
+				ps2IP = ippkt.sourceIP;
+				{
+					std::lock_guard lk(dnsRedirectMutex);
+					dnsRedirectSources[udppkt.sourcePort] = ippkt.destinationIP;
+				}
+				return dnsServer.Send(&udppkt);
 			}
 		}
 

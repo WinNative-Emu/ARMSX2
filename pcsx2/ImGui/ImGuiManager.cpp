@@ -966,33 +966,52 @@ void ImGuiManager::DrawOSDMessages(Common::Timer::Value current_time)
 	const float margin = std::ceil(GSConfig.OsdMargin * scale);
 	const float padding = std::ceil(8.0f * scale);
 	const float rounding = std::ceil(5.0f * scale);
-	const float max_width = s_window_width - (margin + padding) * 2.0f;
 
-	float position_y = margin;
+	// Anchor OSD messages to the game display rectangle rather than the window,
+	// so letterboxed/pillarboxed output doesn't push them into the black bars.
+	float rect_x = 0.0f, rect_y = 0.0f, rect_w = s_window_width, rect_h = s_window_height;
+	{
+		float dx, dy, dw, dh;
+		GSGetLastDrawRect(&dx, &dy, &dw, &dh);
+		if (dx < 0.0f) { dw += dx; dx = 0.0f; }
+		if (dy < 0.0f) { dh += dy; dy = 0.0f; }
+		if (dx + dw > s_window_width) dw = s_window_width - dx;
+		if (dy + dh > s_window_height) dh = s_window_height - dy;
+		if (dw >= 1.0f && dh >= 1.0f)
+		{
+			rect_x = dx;
+			rect_y = dy;
+			rect_w = dw;
+			rect_h = dh;
+		}
+	}
+	const float max_width = rect_w - (margin + padding) * 2.0f;
+
+	float position_y = rect_y + margin;
 	switch (GSConfig.OsdMessagesPos)
 	{
 		case OsdOverlayPos::TopLeft:
 		case OsdOverlayPos::TopCenter:
 		case OsdOverlayPos::TopRight:
-			position_y = margin;
+			position_y = rect_y + margin;
 			break;
 
 		case OsdOverlayPos::CenterLeft:
 		case OsdOverlayPos::Center:
 		case OsdOverlayPos::CenterRight:
-			position_y = s_window_height * 0.5f;
+			position_y = rect_y + rect_h * 0.5f;
 			break;
 
 		case OsdOverlayPos::BottomLeft:
 		case OsdOverlayPos::BottomCenter:
 		case OsdOverlayPos::BottomRight:
 			// For bottom positions, start from the bottom and let messages stack upward
-			position_y = s_window_height - margin;
+			position_y = rect_y + rect_h - margin;
 			break;
 
 		case OsdOverlayPos::None:
 		default:
-			position_y = margin;
+			position_y = rect_y + margin;
 			break;
 	}
 
@@ -1071,8 +1090,8 @@ void ImGuiManager::DrawOSDMessages(Common::Timer::Value current_time)
 			final_y = actual_y - size.y;
 		}
 
-		const ImVec2 base_pos = CalculateOSDPosition(GSConfig.OsdMessagesPos, margin, size, s_window_width, s_window_height);
-		const ImVec2 pos(base_pos.x, final_y);
+		const ImVec2 base_pos = CalculateOSDPosition(GSConfig.OsdMessagesPos, margin, size, rect_w, rect_h);
+		const ImVec2 pos(rect_x + base_pos.x, final_y);
 		const ImVec4 text_rect(pos.x + padding, pos.y + padding, pos.x + size.x - padding, pos.y + size.y - padding);
 
 		ImDrawList* dl = ImGui::GetBackgroundDrawList();

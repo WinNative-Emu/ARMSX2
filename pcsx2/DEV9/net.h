@@ -8,6 +8,7 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <condition_variable>
 
@@ -98,6 +99,13 @@ private:
 	bool internalRxHasData = false;
 
 	bool dhcpOn = false;
+
+	// DNS source-of-truth redirect (Internal DNS mode): maps the game's UDP
+	// source port to the DNS server address its network profile queried, so
+	// the internal DNS server's reply can be presented as coming from that
+	// address and the PS2 stack accepts it.
+	std::mutex dnsRedirectMutex;
+	std::map<u16, PacketReader::IP::IP_Address> dnsRedirectSources;
 
 protected:
 	InternalServers::DHCP_Logger dhcpLogger;

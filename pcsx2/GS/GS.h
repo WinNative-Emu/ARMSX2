@@ -118,6 +118,10 @@ void GSgetTitleStats(std::string& info);
 /// returned if the position lies outside the display area.
 void GSTranslateWindowToDisplayCoordinates(float window_x, float window_y, float* display_x, float* display_y);
 
+/// Returns the last presented draw rectangle (the game display area) in window coordinates.
+/// Width/height are 0 until a frame has been presented.
+void GSGetLastDrawRect(float* x, float* y, float* width, float* height);
+
 void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config);
 void GSSetSoftwareRendering(bool software_renderer, GSInterlaceMode new_interlace);
 bool GSSaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
