@@ -258,15 +258,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_emulog(JNIEnv *env, jclass, jstring p_msg) 
         Console.WriteLnFmt("{}", msg);
 }
 
-// Read the real flag so the UI can reflect it. The toggle previously kept its
-// state in a Compose `remember`, so navigating away reset the switch to off while the native
-// flag stayed on — the switch was lying about whether the diagnostic was armed.
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_isEeDiffVerify(JNIEnv*, jclass) {
-    return eeDiffGetEnabled() ? JNI_TRUE : JNI_FALSE;
-}
-
 extern "C"
 JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_initialize(JNIEnv *env, jclass clazz,
@@ -3751,15 +3742,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_osdSetColor(JNIEnv*, jclass, jint rgb) {
     applyOsdSetting([=]() {
         EmuConfig.GS.OsdColor = static_cast<u32>(rgb) & 0x00FFFFFFu;
     });
-}
-
-// OSD text colour as 0xRRGGBB; 0 restores the default white. Rides applyOsdSetting()'s
-// reload-immune snapshot like every other OSD setter, so VMManager::ApplySettings
-// re-deriving EmuConfig.GS can't revert it mid-session.
-extern "C" JNIEXPORT void JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_osdSetColor(JNIEnv*, jclass, jint rgb) {
-    EmuConfig.GS.OsdColor = static_cast<u32>(rgb) & 0x00FFFFFFu;
-    applyOsdSetting();
 }
 
 extern "C" JNIEXPORT void JNICALL
