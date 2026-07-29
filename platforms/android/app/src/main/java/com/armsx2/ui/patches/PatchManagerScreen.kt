@@ -60,6 +60,11 @@ import java.io.File
 fun PatchManagerScreen(onBack: () -> Unit, game: GameInfo? = null, viewModel: PatchManagerViewModel = viewModel()) {
     val state = viewModel.state.value
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(viewModel::import) }
+    // Folder import: cheats arrive as a folder of files far more often than one at a time, and the
+    // single-file picker made adding a set a repetitive chore. Requested by Fun (SD712).
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        uri?.let(viewModel::importFolder)
+    }
     // Keyed on the game (this screen shares one Activity-scoped VM with the settings tab), and
     // resets the online browser first so a previous game's fetched results don't linger here.
     LaunchedEffect(game?.uri) { viewModel.resetOnlineForGame(); viewModel.refresh() }
@@ -71,6 +76,7 @@ fun PatchManagerScreen(onBack: () -> Unit, game: GameInfo? = null, viewModel: Pa
                 leading = { RoundAction("←", str("action.back"), onBack) },
                 actions = {
                     RoundAction("＋", str("action.import"), { picker.launch(arrayOf("text/plain", "application/octet-stream", "*/*")) })
+                    RoundAction("🗀", str("patches.import.folder"), { folderPicker.launch(null) })
                     RoundAction("↻", str("games.card.refresh"), viewModel::refresh)
                 },
             )
@@ -425,6 +431,15 @@ private fun PatchFiles(state: PatchManagerUiState, viewModel: PatchManagerViewMo
                 )
             }
         }
+        if (state.bundledEntry.isNotBlank()) {
+            BundledPatchCard(
+                entry = state.bundledEntry,
+                cheats = state.bundledCheats,
+                unlabelled = state.bundledUnlabelled,
+                onExtract = viewModel::extractBundled,
+            )
+            Spacer(Modifier.height(8.dp))
+        }
         if (state.files.isEmpty()) {
             PatchFilesEmptyState()
         } else if (listOpen) {
@@ -437,10 +452,60 @@ private fun PatchFiles(state: PatchManagerUiState, viewModel: PatchManagerViewMo
                         cheats = if (expanded) state.localCheats else emptyList(),
                         onExpand = { viewModel.expandLocal(file) },
                         onToggleCheat = viewModel::toggleLocalCheat,
+                        onSetAllCheats = viewModel::setAllLocalCheats,
                         onDelete = { viewModel.delete(file) },
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * What ARMSX2's own patches.zip is doing to this game.
+ *
+ * Exists because that was previously invisible: the OSD would say "3 game patches are active" and
+ * the manager showed an empty list, because it only knows about files on disk. Reported by Rei
+ * Ayanami, who correctly concluded there was nothing to find.
+ */
+@Composable
+private fun BundledPatchCard(
+    entry: String,
+    cheats: List<PatchRepo.LocalCheat>,
+    unlabelled: Int,
+    onExtract: () -> Unit,
+) {
+    Surface(
+        Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.46f)),
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                str("patches.bundled.header"),
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                str("patches.bundled.explain"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(entry, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            cheats.forEach { cheat ->
+                val unnamed = cheat.name.equals("Unlabelled", true)
+                Text(
+                    if (unnamed) "• ${cheat.name} — ${str("patches.bundled.alwaysOn")}" else "• ${cheat.name}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (unnamed) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurface,
+                )
+            }
+            TextButton(
+                onClick = onExtract,
+                modifier = Modifier.controllerFocusable("patches.bundled.extract", onConfirm = onExtract),
+            ) { Text(str("patches.bundled.extract")) }
         }
     }
 }
@@ -498,6 +563,7 @@ private fun PatchFileRow(
     cheats: List<PatchRepo.LocalCheat>,
     onExpand: () -> Unit,
     onToggleCheat: (String) -> Unit,
+    onSetAllCheats: (Boolean) -> Unit,
     onDelete: () -> Unit,
 ) {
     Surface(
@@ -529,6 +595,34 @@ private fun PatchFileRow(
                     )
                 } else {
                     Column(Modifier.padding(start = 34.dp, end = 12.dp, bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        // Above the list, not below it: a community pnach can run to a hundred
+                        // entries, and a control you have to scroll past all of them to reach is
+                        // no better than flipping them one at a time.
+                        if (cheats.size > 1) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                val anyOff = cheats.any { !it.enabled }
+                                val anyOn = cheats.any { it.enabled }
+                                TextButton(
+                                    onClick = { onSetAllCheats(true) },
+                                    enabled = anyOff,
+                                    modifier = Modifier.controllerFocusable(
+                                        "patches.allOn.${file.absolutePath}",
+                                        onConfirm = { if (anyOff) onSetAllCheats(true) },
+                                    ),
+                                ) { Text(str("patches.action.allOn")) }
+                                TextButton(
+                                    onClick = { onSetAllCheats(false) },
+                                    enabled = anyOn,
+                                    modifier = Modifier.controllerFocusable(
+                                        "patches.allOff.${file.absolutePath}",
+                                        onConfirm = { if (anyOn) onSetAllCheats(false) },
+                                    ),
+                                ) { Text(str("patches.action.allOff")) }
+                            }
+                        }
                         cheats.forEach { cheat -> LocalCheatRow(cheat) { onToggleCheat(cheat.name) } }
                     }
                 }

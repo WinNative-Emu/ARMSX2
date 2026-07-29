@@ -110,6 +110,10 @@ fun TouchControlsOverlay() {
             // layout: resolve it here and it's up from the first frame, rather than
             // whenever the Skins tab happens to be opened.
             ControllerSkinStore.applyForSerial(skinCtx, gameSerial)
+        } else {
+            // Out of game the layout is the global profile's, and nothing re-read it on rotate —
+            // so the editor kept whichever orientation was loaded when it opened.
+            TouchControls.applyActiveProfileForOrientation()
         }
     }
     // ---- Gyroscope / motion controls -------------------------------------
@@ -504,6 +508,12 @@ private fun skinKeyFor(id: TouchButtonId): String? = when (id) {
     TouchButtonId.R3 -> "r3"
     TouchButtonId.START -> "start"
     TouchButtonId.SELECT -> "select"
+    // Macros are skinnable too: a pack that ships ic_controller_macro1_button.png (or m1) gets
+    // its own artwork on them instead of the generic M1-M4 label.
+    TouchButtonId.MACRO1 -> "macro1"
+    TouchButtonId.MACRO2 -> "macro2"
+    TouchButtonId.MACRO3 -> "macro3"
+    TouchButtonId.MACRO4 -> "macro4"
     else -> null
 }
 
@@ -524,7 +534,7 @@ private fun drawableFor(id: TouchButtonId, pressed: Boolean): Int = when (id) {
     TouchButtonId.DPAD, TouchButtonId.L_STICK, TouchButtonId.R_STICK,
     TouchButtonId.PAUSE, TouchButtonId.PRESSURE, TouchButtonId.FAST_FORWARD,
     TouchButtonId.MACRO1, TouchButtonId.MACRO2, TouchButtonId.MACRO3, TouchButtonId.MACRO4,
-    TouchButtonId.SAVE_STATE, TouchButtonId.LOAD_STATE -> R.drawable.pad_cross
+    TouchButtonId.SAVE_STATE, TouchButtonId.LOAD_STATE, TouchButtonId.SCREENSHOT -> R.drawable.pad_cross
 }
 
 /** Pressure-sensitivity modifier button. Emits no PS2 keycode; while held it
@@ -945,20 +955,37 @@ private fun MacroWidget(cfg: TouchButtonCfg, edit: Boolean) {
         }
     } else {
         val opacity = TouchControls.opacity.floatValue
+        // A skin can replace the M1-M4 label with its own artwork. Adding the skin KEY and the
+        // skinKeyFor mapping was not enough on its own: this widget drew a Text and never consulted
+        // skinPainter at all, so a pack shipping ic_controller_macro1_button.png was parsed,
+        // stored, and then silently never drawn. Reported by Duda, who had analog_base working and
+        // reasonably assumed the macro name was wrong.
+        val skin = skinPainter(skinKeyFor(cfg.id))
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .clip(CircleShape)
-                .background(Color.Black.copy(alpha = 0.30f * opacity))
+                // No dark circle behind custom art — the pack draws its own shape, and the backing
+                // would show as a disc behind a square button.
+                .then(if (skin == null) Modifier.clip(CircleShape).background(Color.Black.copy(alpha = 0.30f * opacity)) else Modifier)
                 .macroPressGestures(cfg.id),
             contentAlignment = Alignment.Center,
         ) {
-            Text(
-                cfg.id.label,
-                color = Color.White.copy(alpha = legibleAlpha(opacity, 0.35f)),
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-            )
+            if (skin != null) {
+                Image(
+                    painter = skin,
+                    contentDescription = cfg.id.label,
+                    contentScale = ContentScale.Fit,
+                    alpha = opacity,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Text(
+                    cfg.id.label,
+                    color = Color.White.copy(alpha = legibleAlpha(opacity, 0.35f)),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
         }
     }
 }
@@ -969,7 +996,11 @@ private fun MacroWidget(cfg: TouchButtonCfg, edit: Boolean) {
  *  default layout). */
 @Composable
 private fun StateActionWidget(cfg: TouchButtonCfg, edit: Boolean) {
-    val label = if (cfg.id == TouchButtonId.SAVE_STATE) str("touch.stateAction.save") else str("touch.stateAction.load")
+    val label = when (cfg.id) {
+        TouchButtonId.SAVE_STATE -> str("touch.stateAction.save")
+        TouchButtonId.LOAD_STATE -> str("touch.stateAction.load")
+        else -> str("touch.stateAction.screenshot")
+    }
     if (edit) {
         Box(
             modifier = Modifier.fillMaxSize().editGestures(cfg),
@@ -990,12 +1021,21 @@ private fun StateActionWidget(cfg: TouchButtonCfg, edit: Boolean) {
                         // Quick TAP = save/load the current slot directly (native shows an OSD
                         // confirmation). LONG-PRESS = open the slot picker to choose a slot.
                         onTap = {
-                            if (cfg.id == TouchButtonId.SAVE_STATE) MainActivityRuntime.instance?.saveState()
-                            else MainActivityRuntime.instance?.loadState()
+                            when (cfg.id) {
+                                TouchButtonId.SAVE_STATE -> MainActivityRuntime.instance?.saveState()
+                                TouchButtonId.LOAD_STATE -> MainActivityRuntime.instance?.loadState()
+                                else -> MainActivityRuntime.instance?.applicationContext?.let {
+                                    com.armsx2.Screenshots.capture(it)
+                                }
+                            }
                         },
                         onLongPress = {
-                            if (cfg.id == TouchButtonId.SAVE_STATE) InGameOverlay.openSaveStatePicker()
-                            else InGameOverlay.openLoadStatePicker()
+                            // Screenshot has no slots, so nothing to pick.
+                            when (cfg.id) {
+                                TouchButtonId.SAVE_STATE -> InGameOverlay.openSaveStatePicker()
+                                TouchButtonId.LOAD_STATE -> InGameOverlay.openLoadStatePicker()
+                                else -> Unit
+                            }
                         },
                     )
                 },
@@ -1604,6 +1644,28 @@ private fun Modifier.editGestures(cfg: TouchButtonCfg): Modifier =
         }
     }
 
+/** Round every widget's centre onto the grid, matching exactly what the editor was drawing.
+ *
+ *  A no-op when the grid is off or the overlay has never been measured -- in both cases the raw
+ *  fractions ARE what was displayed, so there is nothing to reconcile. */
+private fun snapLayoutToGrid() {
+    if (!TouchControls.gridSnap.value) return
+    val overlay = OverlayDims.last ?: return
+    val gridPx = overlay.widthPx / GRID_COLS
+    if (gridPx <= 0f) return
+    // One pass over the layout rather than updateButton per id: updateButton rebuilds the whole
+    // button list each call, so doing it ~25 times would be 25 list copies for one save.
+    val current = TouchControls.activeLayout.value
+    TouchControls.activeLayout.value = current.copy(
+        buttons = current.buttons.map { c ->
+            c.copy(
+                xFrac = snapFracToGrid(c.xFrac, overlay.widthPx, gridPx),
+                yFrac = snapFracToGrid(c.yFrac, overlay.heightPx, gridPx),
+            )
+        },
+    )
+}
+
 private object OverlayDims {
     @Volatile var last: Dims? = null
     data class Dims(val widthPx: Float, val heightPx: Float)
@@ -1735,6 +1797,19 @@ private fun EditToolbar(modifier: Modifier = Modifier) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             ToolbarChip(str("action.save")) {
+                // Commit the snap HERE, not only on finger-up.
+                //
+                // The editor draws every widget snapped to the grid, but the underlying fraction
+                // stays raw while dragging (snapping it live fights the transform gesture's delta
+                // accumulation and makes the widget feel stuck). The commit was supposed to happen
+                // in editGestures' tryAwaitRelease -- except that lives in detectTapGestures, and a
+                // real DRAG is consumed by the neighbouring detectTransformGestures, which cancels
+                // the tap detector so tryAwaitRelease returns false and the snap never ran. So the
+                // layout looked aligned while editing and reverted to the raw positions on save.
+                //
+                // Snapping at save time makes the saved layout equal what was on screen, whatever
+                // route the widget took to get there.
+                snapLayoutToGrid()
                 TouchControls.saveLiveLayoutToActive()
                 TouchControls.exitEditMode()
             }

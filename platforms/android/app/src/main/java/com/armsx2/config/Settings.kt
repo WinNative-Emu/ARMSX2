@@ -327,6 +327,12 @@ data class Settings(
     val dithering: Int = 2,
     /** EmuCore/GS/VsyncQueueSize — frames the GS thread may queue (0-3). PCSX2 default 2. */
     val vsyncQueueSize: Int = 2,
+    // Output-surface scaling. App-side (no EmuCore key) but PER-GAME scoped: a heavy
+    // game can render its output smaller while the library and lighter games stay
+    // sharp. Were global-only prefs until #-Duda reported that changing them in Game
+    // scope also moved Global — there was no per-game copy to write.
+    val hwScaler: Int = 0,                       // 0 = screen, else 448*n short side
+    val screenResOverride: String = "auto",      // "auto" | "2560x1440" | "1920x1080" | "1280x720"
     /** EmuCore/GS/autoflush_sw — software-renderer auto-flush. PCSX2 default on. */
     val autoFlushSw: Boolean = true,
     /** EmuCore/GS/mipmap — software-renderer mipmapping. PCSX2 default on. */
@@ -876,8 +882,11 @@ data class Settings(
         if (emitSink != null) return
         // Live convenience pokes. Harmless when the GS is closed; commitSettings()
         // below performs the authoritative apply for a cold start / restart.
-        NativeApp.setAspectRatio(aspectRatio.coerceIn(0, 4))
-        NativeApp.setFmvAspectRatio(fmvAspectRatio.coerceIn(0, 4))
+        // 0..5 — the upper bound is the LAST aspect index, so adding a ratio means widening this
+        // too. Left at 4 it silently sent 10:7 to the core no matter what the picker showed, which
+        // is the worst version of this bug: the UI looks correct and nothing happens.
+        NativeApp.setAspectRatio(aspectRatio.coerceIn(0, 5))
+        NativeApp.setFmvAspectRatio(fmvAspectRatio.coerceIn(0, 5))
         NativeApp.renderTvShader(tvShader.coerceIn(0, 7))
         NativeApp.renderShadeBoost(
             shadeBoost,
@@ -1083,6 +1092,7 @@ data class Settings(
                 "4:3" -> 2
                 "16:9" -> 3
                 "10:7" -> 4
+                "21:9" -> 5
                 else -> this.aspectRatio
             },
             fmvAspectRatio = when (strAt("EmuCore/GS/FMVAspectRatioSwitch")) {
@@ -1091,6 +1101,7 @@ data class Settings(
                 "4:3" -> 2
                 "16:9" -> 3
                 "10:7" -> 4
+                "21:9" -> 5
                 else -> this.fmvAspectRatio
             },
             deinterlaceMode = intAt("EmuCore/GS/deinterlace_mode") ?: this.deinterlaceMode,
@@ -1262,19 +1273,21 @@ data class Settings(
      *  [applyGsLive] (running VM). Keep the key list in sync with
      *  Pcsx2Config::GSOptions::LoadSave. */
     private fun writeGsToNative() {
-        val aspectRatioName = when (aspectRatio.coerceIn(0, 4)) {
+        val aspectRatioName = when (aspectRatio.coerceIn(0, 5)) {
             0 -> "Stretch"
             2 -> "4:3"
             3 -> "16:9"
             4 -> "10:7"
+            5 -> "21:9"
             else -> "Auto 4:3/3:2"
         }
         put("EmuCore/GS", "AspectRatio", "string", aspectRatioName)
-        val fmvAspectRatioName = when (fmvAspectRatio.coerceIn(0, 4)) {
+        val fmvAspectRatioName = when (fmvAspectRatio.coerceIn(0, 5)) {
             1 -> "Auto 4:3/3:2"
             2 -> "4:3"
             3 -> "16:9"
             4 -> "10:7"
+            5 -> "21:9"
             else -> "Off"
         }
         put("EmuCore/GS", "FMVAspectRatioSwitch", "string", fmvAspectRatioName)
@@ -1620,6 +1633,8 @@ data class Settings(
         put("cropBottom", cropBottom)
         put("dithering", dithering)
         put("vsyncQueueSize", vsyncQueueSize)
+        put("hwScaler", hwScaler)
+        put("screenResOverride", screenResOverride)
         put("autoFlushSw", autoFlushSw)
         put("mipmapSw", mipmapSw)
         put("swThreads", swThreads)
@@ -1881,6 +1896,8 @@ data class Settings(
                 cropBottom = json.optInt("cropBottom", def.cropBottom),
                 dithering = json.optInt("dithering", def.dithering),
                 vsyncQueueSize = json.optInt("vsyncQueueSize", def.vsyncQueueSize),
+                hwScaler = json.optInt("hwScaler", def.hwScaler),
+                screenResOverride = json.optString("screenResOverride", def.screenResOverride).ifEmpty { def.screenResOverride },
                 autoFlushSw = json.optBoolean("autoFlushSw", def.autoFlushSw),
                 mipmapSw = json.optBoolean("mipmapSw", def.mipmapSw),
                 swThreads = json.optInt("swThreads", def.swThreads),
@@ -2120,6 +2137,8 @@ data class Settings(
             if (current.cropBottom           != base.cropBottom)           j.put("cropBottom", current.cropBottom)
             if (current.dithering            != base.dithering)            j.put("dithering", current.dithering)
             if (current.vsyncQueueSize       != base.vsyncQueueSize)       j.put("vsyncQueueSize", current.vsyncQueueSize)
+            if (current.hwScaler             != base.hwScaler)             j.put("hwScaler", current.hwScaler)
+            if (current.screenResOverride    != base.screenResOverride)    j.put("screenResOverride", current.screenResOverride)
             if (current.autoFlushSw          != base.autoFlushSw)          j.put("autoFlushSw", current.autoFlushSw)
             if (current.mipmapSw             != base.mipmapSw)             j.put("mipmapSw", current.mipmapSw)
             if (current.swThreads            != base.swThreads)            j.put("swThreads", current.swThreads)
@@ -2349,6 +2368,8 @@ data class Settings(
             cropBottom = if (overrides.has("cropBottom")) overrides.getInt("cropBottom") else base.cropBottom,
             dithering = if (overrides.has("dithering")) overrides.getInt("dithering") else base.dithering,
             vsyncQueueSize = if (overrides.has("vsyncQueueSize")) overrides.getInt("vsyncQueueSize") else base.vsyncQueueSize,
+            hwScaler = if (overrides.has("hwScaler")) overrides.getInt("hwScaler") else base.hwScaler,
+            screenResOverride = if (overrides.has("screenResOverride")) overrides.getString("screenResOverride") else base.screenResOverride,
             autoFlushSw = if (overrides.has("autoFlushSw")) overrides.getBoolean("autoFlushSw") else base.autoFlushSw,
             mipmapSw = if (overrides.has("mipmapSw")) overrides.getBoolean("mipmapSw") else base.mipmapSw,
             swThreads = if (overrides.has("swThreads")) overrides.getInt("swThreads") else base.swThreads,

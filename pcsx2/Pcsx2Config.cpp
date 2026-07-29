@@ -650,6 +650,7 @@ const char* Pcsx2Config::GSOptions::AspectRatioNames[(size_t)AspectRatioType::Ma
 	"4:3",
 	"16:9",
 	"10:7",
+	"21:9",
 	nullptr};
 
 const char* Pcsx2Config::GSOptions::FMVAspectRatioSwitchNames[(size_t)FMVAspectRatioSwitchType::MaxCount + 1] = {
@@ -658,6 +659,7 @@ const char* Pcsx2Config::GSOptions::FMVAspectRatioSwitchNames[(size_t)FMVAspectR
 	"4:3",
 	"16:9",
 	"10:7",
+	"21:9",
 	nullptr};
 
 const char* Pcsx2Config::GSOptions::DisplayRotationNames[(size_t)DisplayRotation::MaxCount + 1] = {
@@ -978,6 +980,11 @@ bool Pcsx2Config::GSOptions::RestartOptionsAreEqual(const GSOptions& right) cons
 		   OpEqu(EnableAdrenoFramebufferFetch) &&
 		   OpEqu(ForceMaliFramebufferFetch) &&
 		   OpEqu(OverrideTextureBarriers) &&
+		   // Drivers carrying UseRenderTargetCopyForFeedback only take the RT-copy path when
+		   // replacements are loaded (see GSDeviceVK::CheckFeatures), and that decision picks the
+		   // tfx.glsl RT-read variant at shader-compile time. Toggling this in place would leave
+		   // m_features.texture_barrier and every compiled pipeline disagreeing with the setting.
+		   OpEqu(LoadTextureReplacements) &&
 		   OpEqu(DepthFeedbackMode) &&
 		   OpEqu(BackThreadMode) &&
 		   OpEqu(HWAA1) &&

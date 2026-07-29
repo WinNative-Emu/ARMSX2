@@ -61,6 +61,11 @@ static GSDisplayAlignment s_display_alignment = GSDisplayAlignment::Center;
 // so the bottom of a tall screen is free for touch controls. Applied only when the window
 // is portrait (height > width); read live per-present. Default on; user can switch to Center.
 static bool s_portrait_render_top = true;
+// Pixels to leave clear at the top of a portrait window when top-aligning. Supplied by the Android
+// side from the display cutout, so a punch-hole or notch camera does not sit on top of the image.
+// Zero everywhere else; only consulted on the top-align path, which by definition has spare room
+// below it (that space is what the touch controls occupy).
+static int s_portrait_render_top_inset = 0;
 
 // Defined further down alongside the present path. Forward-declared because Merge() needs the
 // frame's on-screen rect to size the RetroArch shader chain, and it runs before them.
@@ -366,6 +371,8 @@ static float GetCurrentAspectRatioFloat(bool is_progressive)
 			return 16.0f / 9.0f;
 		case AspectRatioType::R10_7:
 			return 10.0f / 7.0f;
+		case AspectRatioType::R21_9:
+			return 21.0f / 9.0f;
 	}
 }
 
@@ -397,6 +404,10 @@ static GSVector4 CalculateDrawDstRect(s32 window_width, s32 window_height, const
 	else if (EmuConfig.CurrentAspectRatio == AspectRatioType::R10_7)
 	{
 		targetAr = 10.0f / 7.0f;
+	}
+	else if (EmuConfig.CurrentAspectRatio == AspectRatioType::R21_9)
+	{
+		targetAr = 21.0f / 9.0f;
 	}
 
 	const float crop_adjust = (static_cast<float>(src_rect.width()) / static_cast<float>(src_size.x)) /
@@ -488,7 +499,12 @@ static GSVector4 CalculateDrawDstRect(s32 window_width, s32 window_height, const
 				break;
 			case GSDisplayAlignment::LeftOrTop:
 			default:
-				target_y = 0.0f;
+				// Push clear of a notch/punch-hole camera when the host asked for it. Only applies
+				// to the top-align case; this branch already knows the render is shorter than the
+				// window, so shifting it down cannot clip the bottom.
+				target_y = (s_portrait_render_top && window_height > window_width)
+					? static_cast<float>(s_portrait_render_top_inset)
+					: 0.0f;
 				break;
 		}
 	}
@@ -1244,6 +1260,11 @@ void GSTranslateWindowToDisplayCoordinates(float window_x, float window_y, float
 void GSSetDisplayAlignment(GSDisplayAlignment alignment)
 {
 	s_display_alignment = alignment;
+}
+
+void GSSetPortraitRenderTopInset(int pixels)
+{
+	s_portrait_render_top_inset = (pixels > 0) ? pixels : 0;
 }
 
 void GSSetPortraitRenderTopAlign(bool enabled)

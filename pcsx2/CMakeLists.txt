@@ -524,6 +524,16 @@ set(pcsx2GSSources
 	GS/Renderers/Common/GSDevice.cpp
 	GS/Renderers/Common/GSDirtyRect.cpp
 	GS/Renderers/Common/GSFunctionMap.cpp
+	# The GPU driver-bug database is keyed on the DRIVER, not the platform: Turnip, PanVK and the
+	# Qualcomm blob all ship outside Android too (ARM Linux handhelds — Rocknix, Batocera). Building
+	# these only under ANDROID made every rule dead on exactly the hardware we test on, which is how
+	# #442 went unmatched. The one Android-only dependency (sys/system_properties.h) is guarded
+	# inside GSGPUProfile.cpp.
+	GS/Renderers/Common/GSGPUDriverProfile.cpp
+	GS/Renderers/Common/GSGPUProfile.cpp
+	GS/Renderers/Common/GSGPUProfileMali.cpp
+	GS/Renderers/Common/GSGPUProfileAdreno.cpp
+	GS/Renderers/Common/GSGPUProfilePowerVR.cpp
 	GS/Renderers/Common/GSPassScheduler.cpp
 	GS/Renderers/Common/GSRenderer.cpp
 	GS/Renderers/Common/GSTexture.cpp
@@ -570,6 +580,8 @@ set(pcsx2GSHeaders
 	GS/Renderers/Common/GSDirtyRect.h
 	GS/Renderers/Common/GSFastList.h
 	GS/Renderers/Common/GSFunctionMap.h
+	GS/Renderers/Common/GSGPUProfile.h
+	GS/Renderers/Common/GSGPUProfilePrivate.h
 	GS/Renderers/Common/GSPassScheduler.h
 	GS/Renderers/Common/GSRenderer.h
 	GS/Renderers/Common/GSShaderEnums.h
@@ -1153,13 +1165,7 @@ if(ARCH_ARM64 OR ANDROID OR ARMSX2_IOS)
 	list(APPEND pcsx2SPU2Sources
 		SPU2/spu2_neon.cpp)
 	list(APPEND pcsx2SPU2Headers
-		SPU2/spu2_neon.h
-		SPU2/spu2_neon_dcfilter.h
-		SPU2/spu2_neon_mixer.h
-		SPU2/spu2_neon_reverb_ex.h
-		SPU2/spu2_optimize.h
-		SPU2/spu2_sve2_fir.h
-		SPU2/spu2_mt6899_tuning.h)
+		SPU2/spu2_neon.h)
 endif()
 
 if(ANDROID)
@@ -1167,27 +1173,13 @@ if(ANDROID)
 		Host/OboeAudioStream.cpp)
 	list(APPEND pcsx2GSSources
 		GS/Renderers/OpenGL/GLContextEGL.cpp
-		GS/Renderers/OpenGL/GLContextEGLAndroid.cpp
-		GS/Renderers/Common/GSGPUDriverProfile.cpp
-	GS/Renderers/Common/GSGPUProfile.cpp
-		GS/Renderers/Common/GSGPUProfileMali.cpp
-		GS/Renderers/Common/GSGPUProfileAdreno.cpp
-		GS/Renderers/Common/GSGPUProfilePowerVR.cpp)
+		GS/Renderers/OpenGL/GLContextEGLAndroid.cpp)
 	list(APPEND pcsx2GSHeaders
 		GS/Renderers/OpenGL/GLContextEGL.h
-		GS/Renderers/OpenGL/GLContextEGLAndroid.h
-		GS/Renderers/Common/GSGPUProfile.h
-		GS/Renderers/Common/GSGPUProfilePrivate.h)
+		GS/Renderers/OpenGL/GLContextEGLAndroid.h)
 	list(APPEND pcsx2Sources
 		Android/AndroidStubs.cpp
-		Android/AndroidPcapStubs.cpp
-		VU1Fingerprint.cpp
-		EEDiffVerify.cpp)
-	list(APPEND pcsx2Headers
-		VU1Fingerprint.h
-		EEDiffVerify.h
-		AndroidPerfBuckets.h
-		PS1DrvTrace.h)
+		Android/AndroidPcapStubs.cpp)
 	# Oboe is the Android audio backend consumed by Host/OboeAudioStream.cpp.
 	# The `oboe` target (created in SearchForStuff.cmake) exports its `include/`
 	# dir as PUBLIC, so linking it into PCSX2_FLAGS propagates <oboe/Oboe.h> to
@@ -1200,15 +1192,9 @@ endif()
 if(ARMSX2_IOS)
 	list(APPEND pcsx2Sources
 		MacOSStubs.cpp
-		QAProbe.cpp
-		TestHarness.cpp
 		# iOS has no libpcap, so pcap_io.cpp is excluded above; reuse the (platform-
 		# agnostic) Android stub to supply the PCAPAdapter definitions DEV9 references.
 		Android/AndroidPcapStubs.cpp)
-	list(APPEND pcsx2Headers
-		QAProbe.h
-		TestHarness.h
-		SifRingBuffer.h)
 endif()
 
 # These ones benefit a lot from LTO

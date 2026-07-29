@@ -19,6 +19,8 @@ enum class EmulationMenuTab(val titleKey: String) {
     Controls("tab.controls"),
     Options("action.settings"),
     Achievements("ra.title"),
+    // No Friends tab. It lived at the end of a rail that scrolls, so reaching it meant knowing it
+    // was there and then hunting for it — it is a header button with its own overlay instead.
 }
 
 data class EmulationMenuUiState(
@@ -42,6 +44,8 @@ data class EmulationMenuUiState(
     // RetroAchievements rich-presence line ("what you're doing right now"); shown in the
     // pause-menu header when a set is loaded. Empty when RA is off / no set.
     val richPresence: String = "",
+    // Current boot ELF CRC — the value that goes in a <SERIAL>_<CRC>.pnach filename.
+    val gameCRC: String = "",
 )
 
 class EmulationMenuViewModel(application: Application) : AndroidViewModel(application) {
@@ -59,6 +63,12 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
         val items = runCatching { parseAchievementItems(raJson) }.getOrDefault(emptyList())
         val raRoot = runCatching { org.json.JSONObject(raJson) }.getOrNull()
         val richPresence = runCatching { NativeApp.getRichPresence().orEmpty() }.getOrDefault("")
+        // Cheap: getGameCRC is a plain read of VMManager::GetCurrentCRC(), and with no VM it
+        // reports 00000000 — which the filter below drops rather than showing as a real CRC.
+        val gameCRC = runCatching { NativeApp.getGameCRC().orEmpty().trim().uppercase() }
+            .getOrDefault("")
+            .takeIf { it.matches(com.armsx2.DiscIdentity.CRC_PATTERN) && it != "00000000" }
+            .orEmpty()
         val summary = if (items.isNotEmpty()) {
             "${items.count { it.unlocked }} / ${items.size}"
         } else {
@@ -80,6 +90,7 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
             raAvatarUrl = raRoot?.optString("avatarUrl").orEmpty(),
             achievements = items,
             richPresence = richPresence,
+            gameCRC = gameCRC,
         )
     }
 
@@ -214,7 +225,7 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
         NativeApp.renderUpscalemultiplier(normalized)
     }
 
-    fun setAspectRatio(value: Int) = updateSettings { it.copy(aspectRatio = value.coerceIn(0, 4)) }
+    fun setAspectRatio(value: Int) = updateSettings { it.copy(aspectRatio = value.coerceIn(0, 5)) }
 
     fun setTextureFiltering(value: Int) = updateSettings { it.copy(textureFiltering = value.coerceIn(0, 3)) }
 
@@ -342,7 +353,9 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
     }
 
     private fun actionCount(tab: EmulationMenuTab): Int = when (tab) {
-        EmulationMenuTab.Session -> 4
+        // MUST match SessionPane's action list length. This was 4 against a list of 5, so the pad
+        // could never reach Close at all.
+        EmulationMenuTab.Session -> 5
         EmulationMenuTab.Graphics -> 4
         EmulationMenuTab.Fixes -> 0
         EmulationMenuTab.Performance -> 3
@@ -366,6 +379,15 @@ object EmulationMenuInputController {
     // confirm). B (or Left off the first control) returns to the tab column.
     val inContent = androidx.compose.runtime.mutableStateOf(false)
     private val nav get() = com.armsx2.ui.settings.SettingsControllerNav
+
+    // Set by a modal panel drawn OVER the menu (Friends) for as long as it is open; the lambda
+    // closes it.
+    //
+    // Without this the pad kept driving the menu underneath: move() falls through to the tab
+    // column whenever inContent is false, so the D-pad walked tabs behind the panel and the
+    // panel's own buttons — which are in the same registry — could never be reached. The overlay
+    // is on top visually, so it has to be on top for input too.
+    var overlayDismiss: (() -> Unit)? = null
 
     fun bind(viewModel: EmulationMenuViewModel) {
         owner = viewModel
@@ -397,6 +419,14 @@ object EmulationMenuInputController {
     }
 
     fun move(dx: Int, dy: Int): Boolean {
+        // A panel is over the menu: everything is registry nav, there is no tab column to walk.
+        if (overlayDismiss != null) {
+            when {
+                dy != 0 -> nav.moveSpatial(0, dy)
+                dx != 0 -> if (!nav.adjust(dx)) nav.moveSpatial(dx, 0)
+            }
+            return true
+        }
         val viewModel = owner ?: return false
         if (!inContent.value) {
             // Tab column (vertical): Up/Down switch tabs; Right steps into content.
@@ -418,6 +448,9 @@ object EmulationMenuInputController {
 
     /** L1 / R1 always cycle tabs, snapping back to the tab column. */
     fun tab(delta: Int): Boolean {
+        // Swallowed while a panel is up: the tabs are behind it, and silently switching the pane
+        // you cannot see is worse than doing nothing.
+        if (overlayDismiss != null) return true
         val viewModel = owner ?: return false
         if (inContent.value) exitContent()
         viewModel.cycleTab(delta)
@@ -425,6 +458,7 @@ object EmulationMenuInputController {
     }
 
     fun confirm(): Boolean {
+        if (overlayDismiss != null) { nav.confirm(); return true }
         owner ?: return false
         if (!inContent.value) { enterContent(); return true }
         nav.confirm()
@@ -432,6 +466,8 @@ object EmulationMenuInputController {
     }
 
     fun back(): Boolean {
+        // Back closes the panel, not the menu behind it.
+        overlayDismiss?.let { dismiss -> dismiss(); return true }
         if (inContent.value) { exitContent(); return true }
         owner?.resume() ?: return false
         return true

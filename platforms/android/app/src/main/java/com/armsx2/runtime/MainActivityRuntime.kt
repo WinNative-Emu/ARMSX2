@@ -54,7 +54,6 @@ import com.armsx2.EmuState
 import com.armsx2.FilenameParser
 import com.armsx2.GameInfo
 import com.armsx2.PlayTime
-import com.armsx2.events.TestResult
 import com.armsx2.input.ControllerMappings
 import com.armsx2.input.SoftKeyboard
 import com.armsx2.runtime.MainActivityRuntime.Companion.internalBiosDir
@@ -117,13 +116,6 @@ private const val NAV_REPEAT_INTERVAL_MS = 110L
 // emit two codes per button) rather than a deliberate modifier+key combo.
 // A real combo is a held first button + a later second press, well past this.
 private const val COMBO_MIN_GAP_MS = 40L
-
-val codeGenTests = mutableStateOf("")
-val patchTests = mutableStateOf("")
-val vuJitTests = mutableStateOf("")
-val eeJitTests = mutableStateOf("")
-val vifTests = mutableStateOf("")
-val eeSeqTests = mutableStateOf("")
 
 open class MainActivityRuntime : ComponentActivity() {
     private var lastUiNavCode = 0
@@ -426,18 +418,6 @@ open class MainActivityRuntime : ComponentActivity() {
         // nativeReady. Fixes the first-cold-launch / DeX crash: applyRendererPrefs
         // pushed GS settings before the base settings layer existed → native SIGSEGV.
         private val pendingLaunch = mutableStateOf<Pair<String, GameInfo?>?>(null)
-
-        fun onTestResults(result: TestResult) {
-            when (result.name) {
-                "VuJitTests" -> vuJitTests.value = "${result.passed}/${result.total}"
-                "PatchTests" -> patchTests.value = "${result.passed}/${result.total}"
-                "CodegenTests" -> codeGenTests.value = "${result.passed}/${result.total}"
-                "EeJitTests" -> eeJitTests.value = "${result.passed}/${result.total}"
-                "VifTests" -> vifTests.value = "${result.passed}/${result.total}"
-                "EeSeqTests" -> eeSeqTests.value = "${result.passed}/${result.total}"
-                else -> println("Test:${result.name}: ${result.passed}/${result.total}")
-            }
-        }
 
         fun invoke(task: suspend () -> Unit) {
             eScope.launch {
@@ -1808,11 +1788,6 @@ open class MainActivityRuntime : ComponentActivity() {
 
             println("PCSX2_INIT")
 
-            // Tests that need VTLB/eeMem — run after init
-            NativeApp.runEeJitTests()
-            NativeApp.runEeSeqTests()
-            NativeApp.runVifTests()
-
             // Debug-build auto-boot to BIOS. Lets us drop straight into the
             // BIOS shell on app launch for perfape baseline captures —
             // skips tapping through the library. One-shot via latch so
@@ -2007,6 +1982,11 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.HiddenGames.load()
         com.armsx2.LibraryTitles.load()
         com.armsx2.LibraryRecentShelf.load()
+        // Discord needs an Activity to launch its sign-in browser and has no other way to obtain
+        // one. Handing it over costs nothing when the user has not opted in — start() returns
+        // immediately unless the feature is enabled AND a token is stored.
+        com.armsx2.DiscordPresence.attachActivity(this)
+        com.armsx2.DiscordPresence.start()
         com.armsx2.LibraryView.load()
         com.armsx2.ui.UiScale.load()
         com.armsx2.ui.theme.ThemePreferences.load()
@@ -2490,6 +2470,20 @@ open class MainActivityRuntime : ComponentActivity() {
                         }
                     }
                 }
+            }
+
+            // "<friend> is now online", over whatever is on screen.
+            //
+            // At the Compose root rather than inside the library's nav host, because in a game
+            // the library is not composed at all — the same banner has to serve both. This
+            // replaces the emulator OSD message that used to handle the in-game case: the OSD is
+            // text only, so it could never show an avatar, and it looked nothing like the
+            // library's version of the same event.
+            androidx.compose.foundation.layout.Box(
+                Modifier.fillMaxSize(),
+                contentAlignment = Alignment.TopCenter,
+            ) {
+                com.armsx2.ui.friends.FriendOnlineBanner()
             }
             }
         }
@@ -3496,7 +3490,11 @@ open class MainActivityRuntime : ComponentActivity() {
     private val joyconLoggedDevices = HashSet<Int>()
     private var lastJoyconMotionLogMs = 0L
     private fun joyconLogEnabled(): Boolean =
-        BuildConfig.DEBUG && prefs.getBoolean("debug.joyconLog", false)
+        // Pref-gated, NOT BuildConfig.DEBUG-gated. The old `BuildConfig.DEBUG && pref` form
+        // made this permanently unreachable in a release build — i.e. unreachable for exactly
+        // the testers whose controllers we need to identify. It cost a round trip on the
+        // 8BitDo/Switch-Pro trigger report. Default off; costs one boolean read per event.
+        prefs.getBoolean("debug.joyconLog", false)
 
     /** Emit a diagnostic line to BOTH logcat (adb `-s ARMSX2_JOYCON`) AND the emulog (in-app
      *  Save Log — so a handheld tester with no PC can capture it). NativeApp.emulog no-ops
@@ -4429,7 +4427,33 @@ open class MainActivityRuntime : ComponentActivity() {
         apply(19, up)    // D-pad up
     }
 
+    /** Does this device actually report the given motion axis? InputDevice.getDevice is a
+     *  binder call and motion events arrive far too often to query per event, hence the cache. */
+    private val axisPresenceCache = HashMap<Long, Boolean>()
+    private fun deviceHasAxis(deviceId: Int, axis: Int): Boolean {
+        if (axis < 0) return false
+        return axisPresenceCache.getOrPut((deviceId.toLong() shl 32) or (axis.toLong() and 0xffffffffL)) {
+            runCatching { InputDevice.getDevice(deviceId)?.getMotionRange(axis) }.getOrNull() != null
+        }
+    }
+
     private fun sendTrigger(event: MotionEvent, axisA: Int, axisB: Int, code: Int, port: Int, axisC: Int = -1) {
+        // A pad with NO analog trigger axis at all — a Nintendo Switch Pro Controller, or an
+        // 8BitDo Pro in Switch mode, which enumerates as one (vendor 0x057e) — delivers L2/R2
+        // ONLY as KEYCODE_BUTTON_L2/R2 key events. Its axis list is just X/Y, Z/RZ and the HAT.
+        //
+        // Reading the absent trigger axes yields 0.0, so the lines below wrote "trigger
+        // released" on EVERY motion event. Hold R2 and move the stick and the stick's own
+        // motion event cancelled the held trigger — "R2 and the stick can't be used at the
+        // same time", which kills racing games. Buttons were unaffected because nothing on the
+        // motion path writes them; only L2/R2 have a motion-side writer. Same shape as the
+        // D-pad "last write wins" bug handled in dispatchDpadCombined.
+        //
+        // When the device has none of these axes, leave the key path in sole charge.
+        if (!deviceHasAxis(event.deviceId, axisA) && !deviceHasAxis(event.deviceId, axisB) &&
+            !deviceHasAxis(event.deviceId, axisC))
+            return
+
         // Pads report L2/R2 on AXIS_*TRIGGER or on AXIS_BRAKE/GAS — take the higher of
         // the two, clamping negatives (some non-Xbox pads idle an unused trigger axis at
         // -1). Then apply the SMALL trigger deadzone and re-normalize the remaining range

@@ -641,6 +641,12 @@ fun HomeScreen(
     }
 
     menuGame?.let { game ->
+        // Tri-state on purpose: null while identifying, blank when the image cannot be identified.
+        // produceState alone cannot tell those apart — both are null — so an unidentifiable game
+        // would sit on "…" forever, reading as still-loading when it is actually unknown.
+        val menuCRC by androidx.compose.runtime.produceState<String?>(initialValue = null, game.uri) {
+            value = com.armsx2.DiscIdentity.resolve(game.uri, game.serial) ?: ""
+        }
         ModalBottomSheet(onDismissRequest = { menuGame = null }) {
             Column(
                 Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start = 8.dp, end = 8.dp, bottom = 20.dp),
@@ -652,6 +658,21 @@ fun HomeScreen(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                )
+                // Serial and CRC — the two halves of a <SERIAL>_<CRC>.pnach filename.
+                val identity = buildList {
+                    game.serial?.takeIf { it.isNotBlank() }?.let(::add)
+                    add("CRC " + when (menuCRC) {
+                        null -> "…"   // still identifying
+                        "" -> "—"     // identified as unknown
+                        else -> menuCRC
+                    })
+                }.joinToString("  ·  ")
+                Text(
+                    identity,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 8.dp),
                 )
                 GameMenuAction("▶", str("action.play")) {
                     menuGame = null
@@ -810,6 +831,25 @@ private fun LibraryOverflowMenu(
                 closeThen(onClearBackground)
             }
         }
+        OverflowSeparator()
+        // Exit, back where it used to live. It moved to the drawer, which put it below every other
+        // destination -- so quitting, one of the most frequent things anyone does here, meant
+        // opening the drawer and scrolling to the bottom every time (issue #460, and shinobumaehara
+        // is right that frequency should decide placement). It stays in the drawer too; this is the
+        // short path, not a replacement.
+        //
+        // The confirmation is the point of the row and travels with it: quitting mid-session
+        // without one loses whatever is not saved.
+        // onExitApp was still a parameter and its confirmation dialog was still wired up — only
+        // the row that reached them had been removed. So this restores the item, not the feature.
+        LibraryOverflowItem(
+            glyph = "⏻",
+            label = str("games.toolbar.exit"),
+            iconRes = com.armsx2.R.drawable.ic_power,
+            iconTint = Color(0xFFE60012),
+        ) {
+            closeThen(onExitApp)
+        }
     }
 }
 
@@ -827,6 +867,10 @@ private fun LibraryOverflowItem(
     label: String,
     selected: Boolean = false,
     trailing: String? = null,
+    // A real drawable instead of a text glyph. Exit needs this: the power symbol (U+23FB) is not
+    // in the bundled font and rendered as a tofu box. Null keeps the glyph path for every other row.
+    iconRes: Int? = null,
+    iconTint: Color? = null,
     onClick: () -> Unit,
 ) {
     DropdownMenuItem(
@@ -847,12 +891,21 @@ private fun LibraryOverflowItem(
                 color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
             ) {
                 Box(contentAlignment = Alignment.Center) {
-                    Text(
-                        text = glyph,
-                        fontSize = if (glyph.length > 2) 11.sp else 17.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
-                    )
+                    if (iconRes != null) {
+                        androidx.compose.material3.Icon(
+                            painter = androidx.compose.ui.res.painterResource(iconRes),
+                            contentDescription = null,
+                            tint = iconTint ?: MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.size(19.dp),
+                        )
+                    } else {
+                        Text(
+                            text = glyph,
+                            fontSize = if (glyph.length > 2) 11.sp else 17.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
                 }
             }
         },
@@ -896,14 +949,8 @@ private fun GameGridCard(
             game,
             Modifier
                 .fillMaxWidth()
-                .aspectRatio(0.72f)
-                .border(
-                    BorderStroke(
-                        if (selected) 2.dp else 1.dp,
-                        if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.42f),
-                    ),
-                    RoundedCornerShape(12.dp),
-                ),
+                .aspectRatio(coverAspectRatio())
+                .coverFrame(selected, 2.dp, MaterialTheme.colorScheme.primary),
         )
         if (GridLabels.show.value) {
             Spacer(Modifier.height(4.dp))
@@ -931,7 +978,7 @@ private fun GameListCard(game: GameInfo, selected: Boolean, onClick: () -> Unit,
         ),
     ) {
         Row(Modifier.padding(7.dp), verticalAlignment = Alignment.CenterVertically) {
-            GameCover(game, Modifier.width(54.dp).aspectRatio(0.72f))
+            GameCover(game, Modifier.width(54.dp).aspectRatio(coverAspectRatio()))
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(game.displayTitle(EnglishTitles.enabled.value), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -953,11 +1000,8 @@ private fun RecentGameCard(game: GameInfo, selected: Boolean = false, onClick: (
     ) {
         GameCover(
             game,
-            Modifier.fillMaxWidth().aspectRatio(0.72f).border(
-                if (selected) 2.5.dp else 1.dp,
-                if (selected) Color(0xFF3DA5FF) else MaterialTheme.colorScheme.outline.copy(alpha = 0.42f),
-                RoundedCornerShape(12.dp),
-            ),
+            Modifier.fillMaxWidth().aspectRatio(coverAspectRatio())
+                .coverFrame(selected, 2.5.dp, Color(0xFF3DA5FF)),
         )
         Spacer(Modifier.height(5.dp))
         Text(game.displayTitle(EnglishTitles.enabled.value), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -1022,6 +1066,36 @@ private fun GameMetadata(game: GameInfo) {
                 )
             }
         }
+    }
+}
+
+/**
+ * Aspect ratio of a cover slot, matched to the artwork actually served.
+ *
+ * xlenore's 3D case renders are 567x878 (0.646) while the flat 2D scans are 512x736 (0.696). The
+ * slot was hardcoded to 0.72 for both, so with ContentScale.Fit the 3D art — being narrower than
+ * its slot — sat with transparent margins down each side: the "poorly filled square" that 2D does
+ * not show, because 0.696 all but fills 0.72. Reported by Isshin.
+ */
+@Composable
+private fun coverAspectRatio(): Float = if (CoverArtStyle.use3d.value) 0.646f else 0.72f
+
+/**
+ * Frame around a cover slot.
+ *
+ * The idle 1dp frame only makes sense for the flat 2D scans, which fill their slot as a rectangle
+ * so the frame hugs the artwork. A 3D case render is transparent around the angled case, so the
+ * same frame draws a rounded rectangle through empty space beside it — the stray outline and edge
+ * lines reported in grid view. The shelf never showed them because it frames only the selected
+ * cover; do the same here, so 3D gets a selection frame and nothing else.
+ */
+@Composable
+private fun Modifier.coverFrame(selected: Boolean, selectedWidth: Dp, selectedColor: Color): Modifier {
+    val idle = !CoverArtStyle.use3d.value
+    return when {
+        selected -> this.border(selectedWidth, selectedColor, RoundedCornerShape(12.dp))
+        idle -> this.border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.42f), RoundedCornerShape(12.dp))
+        else -> this
     }
 }
 

@@ -526,7 +526,7 @@ object TouchControls {
         val active = MainActivityRuntime.prefs.getString(KEY_ACTIVE, list.first().name) ?: list.first().name
         activeProfileName.value = active
         val match = list.firstOrNull { it.name == active } ?: list.first()
-        activeLayout.value = match.layout.copy()
+        activeLayout.value = match.layoutFor(portrait.value).copy()
         opacity.floatValue = MainActivityRuntime.prefs.getFloat(KEY_OPACITY, 0.55f).coerceIn(0.0f, 1.0f)
         pressurePercent.intValue = MainActivityRuntime.prefs.getInt(KEY_PRESSURE_PERCENT, 50).coerceIn(5, 95)
         faceMultiTouch.value = MainActivityRuntime.prefs.getBoolean(KEY_FACE_MULTI, true)
@@ -657,6 +657,17 @@ object TouchControls {
      *  stops one game's edit from bleeding into the next. When no game is running
      *  (library/global edit), fall back to overwriting the active profile so the
      *  global Default still reflects the edit. */
+    /** Re-read the active PROFILE for the current orientation.
+     *
+     *  The in-game path re-applies on rotate via applyForSerial, but that only runs while a VM is
+     *  up — so a global-scope edit kept whichever orientation's layout happened to be loaded when
+     *  the screen opened, and rotating showed the wrong one. */
+    fun applyActiveProfileForOrientation() {
+        val match = profiles.firstOrNull { it.name == activeProfileName.value } ?: return
+        activeLayout.value = match.layoutFor(portrait.value).copy()
+        selectedButton.value = null
+    }
+
     fun saveLiveLayoutToActive() {
         // gameIsRunning() is the OUTER gate. The per-serial/CRC isolation paths
         // must only run when a VM is actually up — keying off a merely-non-null
@@ -699,7 +710,9 @@ object TouchControls {
             // active profile.
             val idx = profiles.indexOfFirst { it.name == activeProfileName.value }
             if (idx >= 0) {
-                profiles[idx] = profiles[idx].copy(layout = activeLayout.value.copy())
+                // Only the orientation currently being edited. Writing .copy(layout = ...) here
+                // unconditionally is what made landscape and portrait clobber each other.
+                profiles[idx] = profiles[idx].withLayoutFor(portrait.value, activeLayout.value.copy())
                 persist()
             }
         }
@@ -758,7 +771,9 @@ object TouchControls {
     }
 
     fun resetActiveToDefault() {
-        activeLayout.value = TouchLayout.default()
+        // Per-orientation: resetting in portrait must not hand back the landscape arrangement,
+        // whose fractions put the sticks and face buttons over the picture.
+        activeLayout.value = TouchLayout.defaultFor(portrait.value)
     }
 
     /** True when a VM is up (RUNNING or PAUSED) — i.e. an in-game edit, where we
@@ -1040,6 +1055,11 @@ enum class TouchButtonId(val label: String, val keycode: Int, val kind: Kind) {
     // as the SAVE_STATE/LOAD_STATE hotkeys. Opt-in (disabled in the default layout).
     SAVE_STATE("SAVE", 0, Kind.STATEACTION),
     LOAD_STATE("LOAD", 0, Kind.STATEACTION),
+    // Screenshot, same shape as the save/load buttons. Lives here rather than in the pause menu:
+    // the core writes the PNG and confirms on the OSD, which is hidden while the menu is up, so a
+    // menu entry left you staring at nothing until you backed out and wondered if it had worked.
+    // On the overlay the confirmation appears immediately, where you are already looking.
+    SCREENSHOT("SHOT", 0, Kind.STATEACTION),
 
     // Macro / combo buttons: each fires a user-chosen SET of pad buttons at once
     // (e.g. R1+R2+R3). Emits no keycode of its own; the set is configured per macro
@@ -1120,6 +1140,62 @@ data class TouchLayout(val buttons: List<TouchButtonCfg>) {
             return TouchLayout(merged)
         }
 
+        /** The default for [portrait], or the landscape one otherwise. Positions are screen
+         *  fractions, so the landscape layout does not merely look cramped in portrait — it lands
+         *  in the wrong half of a much taller window, on top of the game. */
+        fun defaultFor(portrait: Boolean): TouchLayout =
+            if (portrait) defaultPortrait() else default()
+
+        /**
+         * Portrait default: controls in the lower ~60% with the game above them.
+         *
+         * Laid out to a proposal from Isshin — shoulders paired at the top of the control area,
+         * left stick and the face diamond in the middle band, D-pad and right stick along the
+         * bottom, Select/Start centred between them and L3/R3 in the outer corners. Reproducing a
+         * real pad's geography rather than compressing the landscape arrangement, which put the
+         * sticks and face buttons over the picture.
+         *
+         * Everything sits at y >= 0.35 so nothing overlaps a top-aligned portrait render, and
+         * nothing goes past y 0.95, which is where the system gesture bar lives.
+         */
+        fun defaultPortrait(): TouchLayout = TouchLayout(
+            buttons = listOf(
+                // Shoulders: paired top-left and top-right of the control area, L2/R2 above L1/R1.
+                TouchButtonCfg(TouchButtonId.L2,       0.13f, 0.37f, 56f),
+                TouchButtonCfg(TouchButtonId.L1,       0.13f, 0.46f, 56f),
+                TouchButtonCfg(TouchButtonId.R2,       0.87f, 0.37f, 56f),
+                TouchButtonCfg(TouchButtonId.R1,       0.87f, 0.46f, 56f),
+                // Left stick mid-left; face diamond mid-right.
+                TouchButtonCfg(TouchButtonId.L_STICK,  0.19f, 0.62f, 150f),
+                TouchButtonCfg(TouchButtonId.TRIANGLE, 0.75f, 0.55f, 58f),
+                TouchButtonCfg(TouchButtonId.SQUARE,   0.61f, 0.62f, 58f),
+                TouchButtonCfg(TouchButtonId.CIRCLE,   0.89f, 0.62f, 58f),
+                TouchButtonCfg(TouchButtonId.CROSS,    0.75f, 0.69f, 58f),
+                // D-pad bottom-left, right stick bottom-right — the reverse of the band above, so
+                // neither thumb has to cross the other.
+                TouchButtonCfg(TouchButtonId.DPAD,     0.21f, 0.81f, 150f),
+                TouchButtonCfg(TouchButtonId.R_STICK,  0.72f, 0.81f, 150f),
+                // Select / Start centred at the bottom, L3 / R3 tucked into the outer corners.
+                TouchButtonCfg(TouchButtonId.SELECT,   0.41f, 0.94f, 48f),
+                TouchButtonCfg(TouchButtonId.START,    0.57f, 0.94f, 48f),
+                TouchButtonCfg(TouchButtonId.L3,       0.10f, 0.94f, 44f),
+                TouchButtonCfg(TouchButtonId.R3,       0.90f, 0.94f, 44f),
+                // Opt-in extras keep the landscape default's disabled state and park in the gap
+                // between the render and the shoulders, where they are grabbable in the editor.
+                TouchButtonCfg(TouchButtonId.FAST_FORWARD, 0.30f, 0.36f, 44f, enabled = false),
+                TouchButtonCfg(TouchButtonId.MACRO1, 0.40f, 0.36f, 42f, enabled = false),
+                TouchButtonCfg(TouchButtonId.MACRO2, 0.48f, 0.36f, 42f, enabled = false),
+                TouchButtonCfg(TouchButtonId.MACRO3, 0.56f, 0.36f, 42f, enabled = false),
+                TouchButtonCfg(TouchButtonId.MACRO4, 0.64f, 0.36f, 42f, enabled = false),
+            ).let { placed ->
+                // Splice in anything the landscape default has that this list does not (pause,
+                // pressure, save/load-state buttons...) so a new widget never goes missing in
+                // portrait just because this table was written before it existed.
+                val have = placed.map { it.id }.toSet()
+                placed + default().buttons.filter { it.id !in have }
+            },
+        )
+
         /** Landscape-tuned default. Coordinates assume a 16:9-ish layout
          *  and are clamped to safe areas on edges. The user can drag in
          *  edit mode to fit their device — this is just the starting
@@ -1160,6 +1236,7 @@ data class TouchLayout(val buttons: List<TouchButtonCfg>) {
                 // Quick save/load-state buttons — also OPT-IN (disabled). Second row.
                 TouchButtonCfg(TouchButtonId.SAVE_STATE, 0.30f, 0.54f, 44f, enabled = false),
                 TouchButtonCfg(TouchButtonId.LOAD_STATE, 0.38f, 0.54f, 44f, enabled = false),
+                TouchButtonCfg(TouchButtonId.SCREENSHOT, 0.46f, 0.54f, 44f, enabled = false),
                 // Analog sticks — bottom inside, between DPad/face cluster
                 // and the center, so thumb travel is short.
                 TouchButtonCfg(TouchButtonId.L_STICK,  0.28f, 0.80f, 130f),
@@ -1184,10 +1261,32 @@ data class TouchLayout(val buttons: List<TouchButtonCfg>) {
     }
 }
 
-data class TouchProfile(val name: String, val layout: TouchLayout) {
+/** [layout] is the LANDSCAPE authoring; [portraitLayout] is portrait's own, null until the user
+ *  saves one. Per-game layouts got this via the ".portrait" key suffix (see orient()), but global
+ *  profiles held a single layout — so editing in one orientation overwrote the other, which is
+ *  exactly the "they are connected when they should be independent" report from Piixel and Isshin,
+ *  and why it worked per-game and not globally.
+ *
+ *  Null portraitLayout falls back to landscape when read, matching readGameLayoutJson's seeding: a
+ *  profile authored before this still shows something sensible in portrait, and the first portrait
+ *  Save splits them for good. Absent from the JSON when null, so old profiles load unchanged. */
+data class TouchProfile(
+    val name: String,
+    val layout: TouchLayout,
+    val portraitLayout: TouchLayout? = null,
+) {
+    /** The authoring for [portrait], falling back to landscape when portrait has none yet. */
+    fun layoutFor(portrait: Boolean): TouchLayout =
+        if (portrait) (portraitLayout ?: layout) else layout
+
+    /** Replace only the orientation being edited, leaving the other one alone. */
+    fun withLayoutFor(portrait: Boolean, updated: TouchLayout): TouchProfile =
+        if (portrait) copy(portraitLayout = updated) else copy(layout = updated)
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("name", name)
         put("layout", layout.toJson())
+        portraitLayout?.let { put("portraitLayout", it.toJson()) }
     }
 
     companion object {
@@ -1196,6 +1295,7 @@ data class TouchProfile(val name: String, val layout: TouchLayout) {
                 name = json.optString("name", "Profile"),
                 layout = json.optJSONObject("layout")?.let { TouchLayout.fromJson(it) }
                     ?: TouchLayout.default(),
+                portraitLayout = json.optJSONObject("portraitLayout")?.let { TouchLayout.fromJson(it) },
             )
         }
     }

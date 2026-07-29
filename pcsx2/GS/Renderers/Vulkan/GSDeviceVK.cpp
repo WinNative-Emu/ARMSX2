@@ -717,6 +717,87 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fragment_shader_interlock_ext_feature = {
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
 
+	// An advertised EXTENSION does not guarantee its FEATURE bit, and asking for a feature the
+	// driver does not have fails vkCreateDevice outright with VK_ERROR_FEATURE_NOT_PRESENT —
+	// killing Vulkan entirely instead of quietly doing without one optional nicety. PowerVR
+	// BXM-8-256 does exactly this: it exposes the extensions below, reports at least one of their
+	// features as false, and the renderer then refuses to start at all with "Failed to create
+	// render device".
+	//
+	// ProcessDeviceExtensions performs this same reconcile, but it runs AFTER vkCreateDevice, so it
+	// can only ever describe the failure rather than prevent it. Probe every feature we are about to
+	// request, up front, and drop the ones that are not really there. This subsumes the depth-ROAA
+	// probe that used to be the only instance of this check.
+	{
+		VkPhysicalDeviceProvokingVertexFeaturesEXT probe_pv = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
+		VkPhysicalDeviceLineRasterizationFeaturesEXT probe_line = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT};
+		VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT probe_roaa = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT};
+		VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT probe_afl = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
+		VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR probe_sm1 = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
+		VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT probe_fsi = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+
+		// Only chain what we would actually enable: querying a struct whose extension is absent is
+		// not something the spec promises anything about.
+		VkPhysicalDeviceFeatures2 probe = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+		if (m_optional_extensions.vk_ext_provoking_vertex)
+			Vulkan::AddPointerToChain(&probe, &probe_pv);
+		if (m_optional_extensions.vk_ext_line_rasterization)
+			Vulkan::AddPointerToChain(&probe, &probe_line);
+		if (m_optional_extensions.vk_ext_rasterization_order_attachment_access)
+			Vulkan::AddPointerToChain(&probe, &probe_roaa);
+		if (m_optional_extensions.vk_ext_attachment_feedback_loop_layout)
+			Vulkan::AddPointerToChain(&probe, &probe_afl);
+		if (m_optional_extensions.vk_swapchain_maintenance1)
+			Vulkan::AddPointerToChain(&probe, &probe_sm1);
+		if (m_optional_extensions.vk_ext_fragment_shader_interlock)
+			Vulkan::AddPointerToChain(&probe, &probe_fsi);
+		vkGetPhysicalDeviceFeatures2(m_physical_device, &probe);
+
+		// Returns the flag rather than taking it by reference: m_optional_extensions members are
+		// bit-fields, which cannot bind to bool&.
+		const auto keep = [](const char* name, bool advertised, bool supported) -> bool {
+			if (advertised && !supported)
+			{
+				// Logged, because "Vulkan works but this one thing is off" is a very different
+				// bug report from "Vulkan does not start", and the next person needs to know
+				// which feature the driver advertised without supporting.
+				Console.Warning(fmt::format(
+					"VK: {} advertised but its feature is unsupported — not requesting it.", name));
+				return false;
+			}
+			return advertised;
+		};
+		m_optional_extensions.vk_ext_provoking_vertex = keep("VK_EXT_provoking_vertex",
+			m_optional_extensions.vk_ext_provoking_vertex, probe_pv.provokingVertexLast == VK_TRUE);
+		m_optional_extensions.vk_ext_line_rasterization = keep("VK_EXT_line_rasterization",
+			m_optional_extensions.vk_ext_line_rasterization, probe_line.bresenhamLines == VK_TRUE);
+		m_optional_extensions.vk_ext_rasterization_order_attachment_access =
+			keep("VK_EXT_rasterization_order_attachment_access",
+				m_optional_extensions.vk_ext_rasterization_order_attachment_access,
+				probe_roaa.rasterizationOrderColorAttachmentAccess == VK_TRUE);
+		m_optional_extensions.vk_ext_attachment_feedback_loop_layout =
+			keep("VK_EXT_attachment_feedback_loop_layout",
+				m_optional_extensions.vk_ext_attachment_feedback_loop_layout,
+				probe_afl.attachmentFeedbackLoopLayout == VK_TRUE);
+		m_optional_extensions.vk_swapchain_maintenance1 = keep("VK_EXT_swapchain_maintenance1",
+			m_optional_extensions.vk_swapchain_maintenance1, probe_sm1.swapchainMaintenance1 == VK_TRUE);
+		m_optional_extensions.vk_ext_fragment_shader_interlock = keep("VK_EXT_fragment_shader_interlock",
+			m_optional_extensions.vk_ext_fragment_shader_interlock,
+			probe_fsi.fragmentShaderPixelInterlock == VK_TRUE);
+
+		// Depth ROAA is an optional sub-feature: a driver can offer the extension and colour
+		// access yet not depth.
+		m_optional_extensions.vk_ext_roaa_depth =
+			m_optional_extensions.vk_ext_rasterization_order_attachment_access &&
+			probe_roaa.rasterizationOrderDepthAttachmentAccess == VK_TRUE;
+	}
+
 	if (m_optional_extensions.vk_ext_provoking_vertex)
 	{
 		provoking_vertex_feature.provokingVertexLast = VK_TRUE;
@@ -730,21 +811,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	if (m_optional_extensions.vk_ext_rasterization_order_attachment_access)
 	{
 		rasterization_order_access_feature.rasterizationOrderColorAttachmentAccess = VK_TRUE;
-
-		// Tile-native ordered DEPTH feedback ("mobile ROV"): the depth aspect of ROAA is an
-		// OPTIONAL sub-feature — a driver may expose the extension and color access yet not
-		// depth. The full feature reconcile (ProcessDeviceExtensions) runs only AFTER
-		// vkCreateDevice, too late to gate this, and requesting an unsupported feature fails
-		// device creation with VK_ERROR_FEATURE_NOT_PRESENT. So probe the depth bit up-front
-		// and only request it when the device actually advertises it.
-		VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT roaa_probe = {
-			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT};
-		VkPhysicalDeviceFeatures2 roaa_probe2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &roaa_probe};
-		vkGetPhysicalDeviceFeatures2(m_physical_device, &roaa_probe2);
-		m_optional_extensions.vk_ext_roaa_depth = (roaa_probe.rasterizationOrderDepthAttachmentAccess == VK_TRUE);
 		if (m_optional_extensions.vk_ext_roaa_depth)
 			rasterization_order_access_feature.rasterizationOrderDepthAttachmentAccess = VK_TRUE;
-
 		Vulkan::AddPointerToChain(&device_info, &rasterization_order_access_feature);
 	}
 	if (m_optional_extensions.vk_ext_attachment_feedback_loop_layout)
@@ -3265,18 +3333,26 @@ bool GSDeviceVK::CheckFeatures()
 	// their driver. Declared outside the Android block so it stays a harmless false on
 	// desktop. Populated from the resolved mobile profile just below.
 	bool force_xclipse_profile = false;
-#if defined(__ANDROID__)
-	// MediaTek (Dimensity/Helio) Mali Vulkan stacks return zero/stale destination color
-	// through ROAA (black / missing textures) across GPU generations, so detect the SoC
-	// here and disable fbfetch below. Ported from sashkinbro/EmuCoreX. Detection reads the
-	// ro.soc.* props already folded into the profile hints (no new JNI needed).
-	//
+
 	// The driver context feeds the driver-bug database (ported from EmuCoreX/sashkinbro with his
 	// approval). Vulkan is the good case: VkPhysicalDeviceDriverProperties names the blob outright,
 	// which is what the r44p1 DEVICE_LOST and 8-Elite push-descriptor fixes both learned the hard
 	// way — gate on driverID, never on vendorID, or Turnip/PanVK inherit proprietary workarounds.
 	// ProcessDeviceExtensions() has already filled m_device_driver_properties by the time we get
 	// here (CreateDeviceAndSwapChain runs before CheckFeatures), so one resolve sees everything.
+	//
+	// Resolved on EVERY platform, not just Android: the database is keyed on the DRIVER, and the
+	// same drivers ship off Android. Turnip on an ARM Linux handheld (Rocknix/Batocera) is the
+	// same Mesa stack with the same defects as Turnip on a phone, and it was the #442 reproducer.
+	// Gating this on __ANDROID__ made every rule silently dead on exactly the devices we test on.
+	// Resolution is pure data — a rule only changes behaviour where something queries HasBug()/
+	// UsesWorkaround(), and every such query is an explicit, per-defect decision.
+	//
+	// The MOBILE-SPECIFIC consequences below stay Android-only on purpose:
+	//   - SetRuntimeGPUProfile(): off Android the GL detector classifies every non-Mali GPU as
+	//     Adreno, so publishing the runtime profile here would hand desktop callers a wrong answer.
+	//   - GS tuning / GPU identity: their only consumers are themselves __ANDROID__-gated, and
+	//     changing desktop texture-pool sizing is not this code's business.
 	MobileDriverContext driver_context;
 	driver_context.api = MobileGpuApi::Vulkan;
 	driver_context.vendor_id = m_device_properties.vendorID;
@@ -3293,6 +3369,13 @@ bool GSDeviceVK::CheckFeatures()
 	const GpuProfileSelection mobile_profile = GpuProfileDetector::Resolve(
 		GSConfig.AndroidGpuProfileOverride, std::string_view(), m_device_properties.deviceName,
 		driver_context);
+	SetMobileDriverProfile(mobile_profile.driver);
+#if defined(__ANDROID__)
+	// MediaTek (Dimensity/Helio) Mali Vulkan stacks return zero/stale destination color
+	// through ROAA (black / missing textures) across GPU generations, so detect the SoC
+	// here and disable fbfetch below. Ported from sashkinbro/EmuCoreX. Detection reads the
+	// ro.soc.* props already folded into the profile hints (no new JNI needed).
+	//
 	// ★ Vulkan resolved mobile_profile and pushed every OTHER piece of it into the device
 	// (MediaTek SoC, GPU identity, GS tuning) but never the runtime profile itself, so
 	// IsMaliGPUProfile()/IsAdrenoGPUProfile() answered from the default for the entire Vulkan
@@ -3308,7 +3391,7 @@ bool GSDeviceVK::CheckFeatures()
 	// This is what constrains texture/target caching on weaker Mali (e.g. G615). From EmuCoreX.
 	SetMobileGPUIdentity(mobile_profile.gpu);
 	SetMobileGSTuning(mobile_profile.gs_tuning);
-	SetMobileDriverProfile(mobile_profile.driver);
+#endif
 	Console.WriteLn("VK: GPU profile override='%s' resolved='%s' driver='%s' version=%u.%u.%u "
 					"raw=%08x rules=%u bugs=%016llx workarounds=%016llx.",
 		GpuProfileDetector::OverrideToConfigString(mobile_profile.override_mode),
@@ -3322,7 +3405,28 @@ bool GSDeviceVK::CheckFeatures()
 		static_cast<unsigned long long>(mobile_profile.driver.bugs),
 		static_cast<unsigned long long>(mobile_profile.driver.workarounds));
 	DevCon.WriteLn("VK: GPU profile hints: %s", mobile_profile.hints.c_str());
-#endif
+
+	// BrokenSubpassFeedback + BrokenAttachmentFeedbackLoopLayout: on these drivers an in-pass
+	// render-target self-read can silently drop the whole draw, in BOTH shapes — the subpassLoad
+	// input attachment and the feedback-loop-layout texelFetch sampler. Reading a separate copy of
+	// the target is the only reliable form.
+	//
+	// ⚠️ Narrowed to replacement textures deliberately. Device A/B on Turnip/Adreno 650:
+	//   - TotA + HD pack, in-tile: text layer gone at 4x AND at 1x (so it is not tile-size related)
+	//   - TotA + HD pack, RT copy: correct
+	//   - NFS Underground, no pack, 608 barrier draws/frame through the same in-tile self-read:
+	//     renders correctly
+	// So the self-read is fine for ordinary blending and only fails when the draw also samples a
+	// replacement. Applying the copy unconditionally cost +38%/+40% frame time at 3x/4x on the
+	// NFSU dump (copies 5 -> 348 per frame, render passes 62 -> 391) for no correctness gain,
+	// which is far too much to charge every Adreno user for a bug none of them can hit without a
+	// texture pack. Pack users pay it and get correct output; everyone else keeps the fast path.
+	//
+	// If a title is ever reported losing draws WITHOUT a pack, widen this to unconditional — the
+	// underlying driver defect is not replacement-specific, only our evidence is.
+	const bool rt_self_read_is_broken =
+		GetMobileDriverProfile().UsesWorkaround(DriverWorkaround::UseRenderTargetCopyForFeedback) &&
+		GSConfig.LoadTextureReplacements;
 
 	// framebuffer_fetch: the tiler-native ordered Cd read (ROAA / subpassLoad in tile
 	// memory). It lets DetermineBarriers() (GSRendererHW.cpp) drop every per-primitive
@@ -3334,21 +3438,30 @@ bool GSDeviceVK::CheckFeatures()
 	// unit; without fbfetch the per-PRIMITIVE texture-barrier path tanks blend-heavy games
 	// (GT4 = 10-20fps slideshow). No-op on any Mali lacking the extension.
 	//
-	// ADRENO / other non-Mali: OPT-IN only (EnableAdrenoFramebufferFetch, default off).
+	// ADRENO / other non-Mali: opt-in via EnableAdrenoFramebufferFetch — but that is true only
+	// where the Pcsx2Config default (false) actually holds, i.e. DESKTOP. The Android build ships
+	// the key ON; see the vendor_allows_fbfetch note below before reasoning about who gets fbfetch.
 	// ROV is the wrong primitive on a tiler (fragment_shader_interlock serializes same-pixel
 	// fragments + bypasses tile memory), so on Adreno fbfetch is the way to make accurate
 	// blending fast. Historically kept off because the Adreno-840 PROPRIETARY driver returned
 	// STALE ROAA reads above Basic blending (alpha cutouts / invisible floors, A/B 2026-06-10);
-	// that was never confirmed on other Adreno gens or on Turnip/Mesa, so this is gated behind
-	// a toggle to ship dark and be A/B-verified per device+driver. Gated on ROAA presence, so
+	// that was never confirmed on other Adreno gens or on Turnip/Mesa, which is why it started
+	// life as a ship-dark toggle to be A/B-verified per device+driver. Gated on ROAA presence, so
 	// it is a no-op on any device that does not expose the extension.
 	const bool is_mali_vk = (m_device_properties.vendorID == 0x13B5u);
 	const bool is_adreno = IsDeviceAdreno();
 	// Turnip/Mesa is the open Adreno driver and does NOT exhibit the proprietary
 	// blob's stale-ROAA reads (the reason Adreno fbfetch shipped opt-in), so default
 	// it ON there — the fast blend path on a tiler that drops the per-primitive
-	// barriers spiking GS on transparency-heavy scenes. Proprietary Adreno stays
-	// opt-in via EnableAdrenoFramebufferFetch; DisableFramebufferFetch still overrides.
+	// barriers spiking GS on transparency-heavy scenes. Proprietary Adreno is opt-in
+	// via EnableAdrenoFramebufferFetch on desktop only (Android ships that key on);
+	// DisableFramebufferFetch still overrides everywhere.
+	//
+	// ⚠️ In practice this is currently moot on Adreno: UseRenderTargetCopyForFeedback turns texture
+	// barriers off below, and "fbfetch needs barriers" then clears framebuffer_fetch regardless of
+	// what this resolves to. Framebuffer fetch IS the in-tile self-read, so a driver that cannot
+	// do that read cannot have it. Kept as-is so a driver that stops carrying the bug recovers the
+	// fast path for free.
 	const bool is_turnip = (m_device_driver_properties.driverID == VK_DRIVER_ID_MESA_TURNIP);
 	// Samsung Xclipse (Exynos AMD-RDNA2) has no working ROAA-based framebuffer fetch — force it off
 	// there so we never route the fast-blend path into a broken unit. Inert if the 0x144D vendorID
@@ -3386,22 +3499,53 @@ bool GSDeviceVK::CheckFeatures()
 	// GL_ARM_shader_framebuffer_fetch (GSDeviceOGL) and never touches the Vulkan ROAA path.
 	const bool unreliable_mali_fbfetch =
 		(is_mediatek_mali_vk || is_mali_g57) && !GSConfig.ForceMaliFramebufferFetch;
+	// is_adreno (not just is_turnip): the removed `if (is_adreno)` block used to force fbfetch on
+	// for the whole vendor, so making it opt-in here would silently drop the proprietary blob onto
+	// the per-primitive barrier path — a regression unrelated to #442. Keeping the vendor listed
+	// preserves that default while letting DisableFramebufferFetch actually take effect, which the
+	// old unconditional force ate (see feedback_adreno_fbfetch_ini_override_measurement_trap).
+	//
+	// ⚠️ The EnableAdrenoFramebufferFetch term is NOT a no-op, and the vendor terms below are NOT an
+	// allow-list on Android. That key defaults to false only in Pcsx2Config.cpp (desktop, where this
+	// really does restrict fbfetch to Mali+Adreno). The Android build ships it TRUE
+	// (Settings.kt adrenoFbFetch = true) and force-flips existing saves to true via a one-time
+	// ConfigStore migration, so there the disjunction is (is_mali_vk || is_adreno || true) == true
+	// and the vendor terms restrict NOTHING: every GPU advertising ROAA takes the fbfetch path,
+	// including PowerVR/Broadcom and any vendor not named here. Only the two negative terms still
+	// bite — unreliable_mali_fbfetch and is_xclipse_vk.
+	//
+	// So the effective Android policy is a DENY-list (ROAA is trusted unless the vendor is known to
+	// lie about it), not an allow-list. Do NOT "restore" the allow-list as a tidy-up: that would
+	// REMOVE fbfetch from PowerVR et al. and drop them onto the ~3-4x-slower per-primitive barrier
+	// path, on hardware nobody here can test. The deny-list shape is also the more future-proof one
+	// — a new vendor with working ROAA gets the fast path instead of being stranded until someone
+	// adds it to a list. If a non-Mali/non-Adreno vendor is ever REPORTED returning stale/empty
+	// ROAA, add it alongside is_xclipse_vk rather than re-narrowing this.
 	const bool vendor_allows_fbfetch = !unreliable_mali_fbfetch &&
-		(is_mali_vk || is_turnip || GSConfig.EnableAdrenoFramebufferFetch) && !is_xclipse_vk;
+		(is_mali_vk || is_adreno || GSConfig.EnableAdrenoFramebufferFetch) && !is_xclipse_vk;
 	m_features.framebuffer_fetch = vendor_allows_fbfetch &&
 		m_optional_extensions.vk_ext_rasterization_order_attachment_access && !GSConfig.DisableFramebufferFetch;
 	m_features.texture_barrier = GSConfig.OverrideTextureBarriers != 0;
-	// Qualcomm Adreno (turnip/freedreno) only reads the render target correctly through the coherent
-	// rasterization-order subpassLoad input-attachment path. The feedback-loop-layout sampler drops
-	// content (objects vanish) and the RT-copy fallback miscolours 16-bit fbmask draws, so force the
-	// subpassLoad path on regardless of INI: enable framebuffer fetch (requires the rasterization-order
-	// extension) and texture barriers, and disable the feedback-loop layout so the RT is bound as an
-	// input attachment. See GSTextureVK::Create for the matching image usage.
-	if (is_adreno)
+	// No working in-pass render-target self-read (ARMSX2 #442, Qualcomm/Turnip). Force the RT-COPY
+	// path: with texture barriers off, GSRendererHW reads Cd from a separate copy of the target
+	// (draw_rt_clone) instead of sampling the live attachment, and "fbfetch needs barriers" below
+	// (framebuffer_fetch &= texture_barrier) drops the in-tile read too. Expensive — one RT copy
+	// per feedback draw — but it is the only shape this driver renders correctly.
+	//
+	// tfx.glsl selects the read purely from two defines: DISABLE_TEXTURE_BARRIER (this path) or
+	// HAS_FEEDBACK_LOOP_LAYOUT. Both compile texelFetch; the difference is whether the sampled
+	// image is a copy or the live attachment, and only the copy works here. Turning
+	// framebuffer_fetch off on its own does NOT change the variant — it leaves subpassLoad in
+	// place, which is equally broken.
+	//
+	// Only applied when OverrideTextureBarriers is on auto (-1). An explicit 1 still wins, so the
+	// in-tile path stays reachable for A/B-ing this workaround's cost and for a future driver
+	// revision that fixes the read; an explicit 0 already lands here anyway.
+	if (rt_self_read_is_broken && GSConfig.OverrideTextureBarriers < 0)
 	{
-		m_optional_extensions.vk_ext_attachment_feedback_loop_layout = false;
-		m_features.framebuffer_fetch = m_optional_extensions.vk_ext_rasterization_order_attachment_access;
-		m_features.texture_barrier = true;
+		Console.WriteLn("VK: texture replacements active on a driver with an unreliable in-pass "
+						"render-target self-read — forcing the RT-copy blend path.");
+		m_features.texture_barrier = false;
 	}
 	// Mali r44p1: the attachment-feedback-loop-layout disable in CreateDevice only swapped the
 	// RT-as-texture LAYOUT/descriptor — it never removed the in-tile RT self-read itself, so Maximum
@@ -3429,14 +3573,15 @@ bool GSDeviceVK::CheckFeatures()
 	// Weak mobile parts would rather reuse than grow the pool, and full preloading blows
 	// their texture budget. Both from the resolved GPU profile; sashkinbro/EmuCoreX.
 	m_features.prefer_new_textures = GetMobileGSTuning().prefer_new_textures;
-	if (GetMobileGSTuning().force_partial_texture_preloading &&
-		GSConfig.TexturePreloading == TexturePreloadingLevel::Full)
-	{
-		GSConfig.TexturePreloading = TexturePreloadingLevel::Partial;
-		Console.Warning("VK: Mobile GS %s/%s profile lowered texture preloading to partial.",
-			GpuProfileDetector::RuntimeProfileToString(GetRuntimeGPUProfile()),
-			GetMobileGPUIdentity().name.c_str());
-	}
+	// The profile no longer forces Texture Preloading down to Partial. It silently contradicted an
+	// explicit user setting — our default is Full, and the downgrade fired for every "constrained"
+	// profile, which includes the conservative fallback used by any GPU the table does not
+	// recognise, so the UI said Full while the renderer ran Partial and only a log line said
+	// otherwise. It was also order-dependent: GSConfig is a global reassigned wholesale on each
+	// ApplySettings, while this override only re-runs when the device is recreated, so preloading
+	// could differ between a fresh boot and a mid-session settings change. sashkinbro dropped it
+	// too ("Restore fast mobile GS paths"); Full is upstream's default because it is usually the
+	// faster path, and a pool-size heuristic is not a measurement of texture-memory pressure.
 #endif
 	m_features.provoking_vertex_last = m_optional_extensions.vk_ext_provoking_vertex;
 	m_features.vs_expand = !GSConfig.DisableVertexShaderExpand;
@@ -4918,46 +5063,46 @@ static void AddShaderHeader(std::stringstream& ss)
 		dev->UsesMobileDriverWorkaround(DriverWorkaround::ScalarizeVectorBitwiseAnd) ? 1 : 0);
 	AddMacro(ss, "DRIVER_REWRITE_UNIFORM_INDEXING",
 		dev->UsesMobileDriverWorkaround(DriverWorkaround::RewriteUniformIndexing) ? 1 : 0);
+	// When no workaround is active these MUST expand to the bare operator, not to a function that
+	// happens to return it. Overloads cost an OpFunctionCall in the SPIR-V at every call site --
+	// including inside the texture loop in tfx.glsl and the region-clamp path -- and Qualcomm's
+	// SPIR-V compiler segfaults building a TFX pipeline from that shape (LEGO Batman, Adreno 740,
+	// driver 512.676.53: SIGSEGV inside CreateQGLCProgram, chained to SIGABRT on the GS thread).
+	// OpenGL is unaffected because it hands GLSL straight to the driver and never goes through
+	// SPIR-V, which is why the same build renders that game fine on the GL renderer.
+	//
+	// This also makes good on what the wrappers were introduced promising -- that a driver the
+	// database has no rule for gets unchanged SPIR-V. It did not hold: the function wrapper was
+	// emitted unconditionally, so EVERY driver got new shader structure to please the two that
+	// needed it.
 	ss << R"(
+#if DRIVER_SCALARIZE_VECTOR_BITWISE_AND
 uvec2 gpu_bitwise_and(uvec2 a, uvec2 b)
 {
-#if DRIVER_SCALARIZE_VECTOR_BITWISE_AND
 	return uvec2(a.x & b.x, a.y & b.y);
-#else
-	return a & b;
-#endif
 }
 
 uvec3 gpu_bitwise_and(uvec3 a, uvec3 b)
 {
-#if DRIVER_SCALARIZE_VECTOR_BITWISE_AND
 	return uvec3(a.x & b.x, a.y & b.y, a.z & b.z);
-#else
-	return a & b;
-#endif
 }
 
 uvec4 gpu_bitwise_and(uvec4 a, uvec4 b)
 {
-#if DRIVER_SCALARIZE_VECTOR_BITWISE_AND
 	return uvec4(a.x & b.x, a.y & b.y, a.z & b.z, a.w & b.w);
-#else
-	return a & b;
-#endif
 }
 
 ivec3 gpu_bitwise_and(ivec3 a, ivec3 b)
 {
-#if DRIVER_SCALARIZE_VECTOR_BITWISE_AND
 	return ivec3(a.x & b.x, a.y & b.y, a.z & b.z);
-#else
-	return a & b;
-#endif
 }
+#else
+#define gpu_bitwise_and(a, b) ((a) & (b))
+#endif
 
+#if DRIVER_REWRITE_UNIFORM_INDEXING
 float gpu_matrix_element(mat4 value, int column, int row)
 {
-#if DRIVER_REWRITE_UNIFORM_INDEXING
 	vec4 selected_column;
 	if (column == 0)
 		selected_column = value[0];
@@ -4975,10 +5120,10 @@ float gpu_matrix_element(mat4 value, int column, int row)
 	if (row == 2)
 		return selected_column[2];
 	return selected_column[3];
-#else
-	return value[column][row];
-#endif
 }
+#else
+#define gpu_matrix_element(value, column, row) ((value)[(column)][(row)])
+#endif
 )";
 }
 

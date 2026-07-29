@@ -171,195 +171,6 @@ static void iopClearRecLUT(BASEBLOCK* base, int count);
 
 // recBackpropBSC declared in arm64/iR5900Analysis.h
 
-// =====================================================================================================
-//  Native Codegen Verification Mode
-// =====================================================================================================
-
-#ifdef VERIFY_NATIVE_CODEGEN
-
-// Snapshot of GPR + HI/LO state before the native instruction executes
-static GPR_reg s_verifyGPR[32];
-static GPR_reg s_verifyHI, s_verifyLO;
-static u32 s_verifyMismatchCount = 0;
-
-// VU0 state snapshot for COP2 verification
-static VECTOR s_verifyVF[32];
-static VECTOR s_verifyACC;
-static REG_VI s_verifyVI[32];
-static u32 s_verifyClipFlag;
-
-// Called at runtime BEFORE the native instruction: snapshot all state
-static void verifySnapshotPre(u32 code, u32 instPC)
-{
-	memcpy(s_verifyGPR, cpuRegs.GPR.r, sizeof(s_verifyGPR));
-	s_verifyHI = cpuRegs.HI;
-	s_verifyLO = cpuRegs.LO;
-
-	// COP2: also snapshot VU0 state
-	if ((code >> 26) == 0x12) // COP2 opcode
-	{
-		memcpy(s_verifyVF, VU0.VF, sizeof(s_verifyVF));
-		s_verifyACC = VU0.ACC;
-		memcpy(s_verifyVI, VU0.VI, sizeof(s_verifyVI));
-		s_verifyClipFlag = VU0.clipflag;
-	}
-}
-
-// Called at runtime AFTER the native instruction: re-run via interpreter on the snapshot and compare
-static void verifyCheckPost(u32 code, u32 instPC)
-{
-	const bool isCOP2 = (code >> 26) == 0x12;
-
-	// Save native results
-	GPR_reg nativeGPR[32];
-	GPR_reg nativeHI, nativeLO;
-	memcpy(nativeGPR, cpuRegs.GPR.r, sizeof(nativeGPR));
-	nativeHI = cpuRegs.HI;
-	nativeLO = cpuRegs.LO;
-
-	// Save native VU0 state for COP2
-	VECTOR nativeVF[32];
-	VECTOR nativeACC;
-	REG_VI nativeVI[32];
-	u32 nativeClipFlag = 0;
-	if (isCOP2)
-	{
-		memcpy(nativeVF, VU0.VF, sizeof(nativeVF));
-		nativeACC = VU0.ACC;
-		memcpy(nativeVI, VU0.VI, sizeof(nativeVI));
-		nativeClipFlag = VU0.clipflag;
-	}
-
-	// Restore pre-instruction state
-	memcpy(cpuRegs.GPR.r, s_verifyGPR, sizeof(s_verifyGPR));
-	cpuRegs.HI = s_verifyHI;
-	cpuRegs.LO = s_verifyLO;
-	if (isCOP2)
-	{
-		memcpy(VU0.VF, s_verifyVF, sizeof(s_verifyVF));
-		VU0.ACC = s_verifyACC;
-		memcpy(VU0.VI, s_verifyVI, sizeof(s_verifyVI));
-		VU0.clipflag = s_verifyClipFlag;
-	}
-
-	// Run interpreter
-	const u32 savedCode = cpuRegs.code;
-	cpuRegs.code = code;
-	const R5900::OPCODE& opcode = R5900::GetCurrentInstruction();
-	if (opcode.interpret)
-		opcode.interpret();
-	cpuRegs.code = savedCode;
-
-	// Compare results
-	bool mismatch = false;
-	static const char* gpr_names[] = {
-		"zero","at","v0","v1","a0","a1","a2","a3",
-		"t0","t1","t2","t3","t4","t5","t6","t7",
-		"s0","s1","s2","s3","s4","s5","s6","s7",
-		"t8","t9","k0","k1","gp","sp","fp","ra"
-	};
-
-	for (int i = 1; i < 32; i++) // skip r0
-	{
-		if (cpuRegs.GPR.r[i].UD[0] != nativeGPR[i].UD[0])
-		{
-			if (!mismatch) { Console.Error("VERIFY MISMATCH at pc=0x%08X code=0x%08X:", instPC, code); mismatch = true; }
-			Console.Error("  %s(r%d): native=0x%016llX interp=0x%016llX (pre=0x%016llX)",
-				gpr_names[i], i, nativeGPR[i].UD[0], cpuRegs.GPR.r[i].UD[0], s_verifyGPR[i].UD[0]);
-		}
-	}
-
-	if (cpuRegs.HI.UD[0] != nativeHI.UD[0])
-	{
-		if (!mismatch) { Console.Error("VERIFY MISMATCH at pc=0x%08X code=0x%08X:", instPC, code); mismatch = true; }
-		Console.Error("  HI: native=0x%016llX interp=0x%016llX", nativeHI.UD[0], cpuRegs.HI.UD[0]);
-	}
-	if (cpuRegs.LO.UD[0] != nativeLO.UD[0])
-	{
-		if (!mismatch) { Console.Error("VERIFY MISMATCH at pc=0x%08X code=0x%08X:", instPC, code); mismatch = true; }
-		Console.Error("  LO: native=0x%016llX interp=0x%016llX", nativeLO.UD[0], cpuRegs.LO.UD[0]);
-	}
-
-	// COP2: compare VU0 state (tolerate 1-ULP float differences)
-	if (isCOP2)
-	{
-		auto ulpDiff = [](u32 a, u32 b) -> u32 {
-			return (a > b) ? (a - b) : (b - a);
-		};
-
-		for (int i = 1; i < 32; i++) // skip VF0
-		{
-			bool vfMismatch = false;
-			for (int lane = 0; lane < 4; lane++)
-			{
-				if (ulpDiff(VU0.VF[i].UL[lane], nativeVF[i].UL[lane]) > 100)
-					vfMismatch = true;
-			}
-			if (vfMismatch)
-			{
-				if (!mismatch) { Console.Error("VERIFY MISMATCH at pc=0x%08X code=0x%08X:", instPC, code); mismatch = true; }
-				Console.Error("  VF%d: native=[%08X,%08X,%08X,%08X] interp=[%08X,%08X,%08X,%08X]",
-					i, nativeVF[i].UL[0], nativeVF[i].UL[1], nativeVF[i].UL[2], nativeVF[i].UL[3],
-					VU0.VF[i].UL[0], VU0.VF[i].UL[1], VU0.VF[i].UL[2], VU0.VF[i].UL[3]);
-			}
-		}
-		bool accMismatch = false;
-		for (int lane = 0; lane < 4; lane++)
-		{
-			if (ulpDiff(VU0.ACC.UL[lane], nativeACC.UL[lane]) > 100)
-				accMismatch = true;
-		}
-		if (accMismatch)
-		{
-			if (!mismatch) { Console.Error("VERIFY MISMATCH at pc=0x%08X code=0x%08X:", instPC, code); mismatch = true; }
-			Console.Error("  ACC: native=[%08X,%08X,%08X,%08X] interp=[%08X,%08X,%08X,%08X]",
-				nativeACC.UL[0], nativeACC.UL[1], nativeACC.UL[2], nativeACC.UL[3],
-				VU0.ACC.UL[0], VU0.ACC.UL[1], VU0.ACC.UL[2], VU0.ACC.UL[3]);
-		}
-		// Check MAC and status flags
-		if (VU0.VI[REG_MAC_FLAG].UL != nativeVI[REG_MAC_FLAG].UL)
-		{
-			if (!mismatch) { Console.Error("VERIFY MISMATCH at pc=0x%08X code=0x%08X:", instPC, code); mismatch = true; }
-			Console.Error("  MAC_FLAG: native=0x%04X interp=0x%04X", nativeVI[REG_MAC_FLAG].UL, VU0.VI[REG_MAC_FLAG].UL);
-		}
-		if (VU0.VI[REG_STATUS_FLAG].UL != nativeVI[REG_STATUS_FLAG].UL)
-		{
-			if (!mismatch) { Console.Error("VERIFY MISMATCH at pc=0x%08X code=0x%08X:", instPC, code); mismatch = true; }
-			Console.Error("  STATUS_FLAG: native=0x%04X interp=0x%04X", nativeVI[REG_STATUS_FLAG].UL, VU0.VI[REG_STATUS_FLAG].UL);
-		}
-	}
-
-	if (mismatch)
-	{
-		const u32 op = code >> 26;
-		const u32 rs = (code >> 21) & 0x1f;
-		const u32 rt = (code >> 16) & 0x1f;
-		const u32 rd = (code >> 11) & 0x1f;
-		const u32 sa = (code >> 6) & 0x1f;
-		const u32 funct = code & 0x3f;
-		Console.Error("  Decode: op=%d rs=%d rt=%d rd=%d sa=%d funct=%d",
-			op, rs, rt, rd, sa, funct);
-		s_verifyMismatchCount++;
-		// Don't assert — remaining mismatches are rounding-induced flag diffs
-		// (MAC zero flag differs when result is on the boundary of 0.0).
-		// Log only, no crash.
-	}
-
-	// Restore native results so execution continues with native values
-	memcpy(cpuRegs.GPR.r, nativeGPR, sizeof(nativeGPR));
-	cpuRegs.HI = nativeHI;
-	cpuRegs.LO = nativeLO;
-	if (isCOP2)
-	{
-		memcpy(VU0.VF, nativeVF, sizeof(nativeVF));
-		VU0.ACC = nativeACC;
-		memcpy(VU0.VI, nativeVI, sizeof(nativeVI));
-		VU0.clipflag = nativeClipFlag;
-	}
-}
-
-#endif // VERIFY_NATIVE_CODEGEN
-
 #define GETBLOCK(x) PC_GETBLOCK_(x, recLUT)
 
 // =====================================================================================================
@@ -1425,6 +1236,34 @@ bool recEeBlockIsLoopResident(u32 pc_query)
 {
 	return s_loopResidentBlocks.find(HWADDR(pc_query)) != s_loopResidentBlocks.end();
 }
+
+// SL-03 introspection: the continuation sites a compiled block actually FORMED,
+// keyed by block startpc.
+//
+// Recorded at EMISSION time, not scan time, and the distinction is the whole
+// point: the scanner can record a site that the branch handler then declines —
+// it does exactly that when the delay slot would itself end the block — and only
+// the sites that survive into emission shape the code. A scan-time list reports
+// both alike and so cannot tell a formed superblock from a refused one.
+static std::unordered_map<u32, std::vector<u32>> s_blockContSites;
+static std::vector<u32> s_curBlockContSites;
+
+// How many continuation sites the compiled block at pc_query formed (0 = none,
+// or no such block). Fills `out` with their guest BRANCH pcs, up to out_len.
+u32 recEeBlockContinuationSites(u32 pc_query, u32* out, u32 out_len)
+{
+	const auto it = s_blockContSites.find(HWADDR(pc_query));
+	if (it == s_blockContSites.end())
+		return 0;
+	const std::vector<u32>& v = it->second;
+	if (out)
+	{
+		const u32 n = std::min<u32>(out_len, static_cast<u32>(v.size()));
+		for (u32 i = 0; i < n; i++)
+			out[i] = v[i];
+	}
+	return static_cast<u32>(v.size());
+}
 #endif
 
 // Emit the state transform "compile-state S1 → loop-top state S0" at the
@@ -1733,6 +1572,9 @@ a64::Label* recSuperblockAddSideExit(u32 branch_target, bool need_delay_slot)
 	x.dsPc = pc;
 	x.needDs = need_delay_slot;
 	x.state.capture();
+#ifdef PCSX2_RECOMPILER_TESTS
+	s_curBlockContSites.push_back(pc - 4); // pc is the delay slot; the site is its branch
+#endif
 	return x.label.get();
 }
 
@@ -1874,8 +1716,7 @@ static bool recSuperblockLivenessBarrier(u32 addr)
 //     recCall): kept conservatively — an interp body may raise.
 // NON-raisers (bracket dropped — the 4-insn win on the common ALU/move/shift/
 // lui fillers): integer overflow is never raised by the rec (plain Add/Sub,
-// same as x86; only the debug-only FORCE_INTERP_* builds could see interp
-// overflow raise with a weakened BD — accepted), FPU/COP2 have no bd path,
+// same as x86), FPU/COP2 have no bd path,
 // INTC/DMAC/TIMR fire only at event tests (block boundary, branch==0 there),
 // and AdEL (RaiseAddressError) is a stub. Pinned by ee_rec_traps_tests.cpp
 // delay-slot raiser tests + AluDelaySlotBranchSemanticsSurviveWithoutBracket.
@@ -1885,6 +1726,92 @@ namespace EERecFallback
 {
 	u32 g_groups = 0;
 	u32 g_cop2RegMask[kCop2MoveOpCount] = {~0u, ~0u, ~0u, ~0u};
+	u64 g_cop2VuMask[kCop2VuIdCount / 64] = {~0ull, ~0ull, ~0ull, ~0ull};
+
+	// Mnemonics parallel to recCOP2_BC2t / recCOP2SPECIAL1t / recCOP2SPECIAL2t
+	// (iR5900Misc-arm64.cpp). nullptr marks a hole in the encoding.
+	static const char* const kBc2Names[4] = {"vbc2f", "vbc2t", "vbc2fl", "vbc2tl"};
+
+	static const char* const kSpec1Names[64] = {
+		"vaddx",   "vaddy",    "vaddz",   "vaddw",   "vsubx",   "vsuby",   "vsubz",   "vsubw",
+		"vmaddx",  "vmaddy",   "vmaddz",  "vmaddw",  "vmsubx",  "vmsuby",  "vmsubz",  "vmsubw",
+		"vmaxx",   "vmaxy",    "vmaxz",   "vmaxw",   "vminix",  "vminiy",  "vminiz",  "vminiw",
+		"vmulx",   "vmuly",    "vmulz",   "vmulw",   "vmulq",   "vmaxi",   "vmuli",   "vminii",
+		"vaddq",   "vmaddq",   "vaddi",   "vmaddi",  "vsubq",   "vmsubq",  "vsubi",   "vmsubi",
+		"vadd",    "vmadd",    "vmul",    "vmax",    "vsub",    "vmsub",   "vopmsub", "vmini",
+		"viadd",   "visub",    "viaddi",  nullptr,   "viand",   "vior",    nullptr,   nullptr,
+		"vcallms", "vcallmsr", nullptr,   nullptr,   nullptr,   nullptr,   nullptr,   nullptr,
+	};
+
+	static const char* const kSpec2Names[128] = {
+		"vaddax",  "vadday",  "vaddaz",  "vaddaw",  "vsubax",  "vsubay",  "vsubaz",  "vsubaw",
+		"vmaddax", "vmadday", "vmaddaz", "vmaddaw", "vmsubax", "vmsubay", "vmsubaz", "vmsubaw",
+		"vitof0",  "vitof4",  "vitof12", "vitof15", "vftoi0",  "vftoi4",  "vftoi12", "vftoi15",
+		"vmulax",  "vmulay",  "vmulaz",  "vmulaw",  "vmulaq",  "vabs",    "vmulai",  "vclip",
+		"vaddaq",  "vmaddaq", "vaddai",  "vmaddai", "vsubaq",  "vmsubaq", "vsubai",  "vmsubai",
+		"vadda",   "vmadda",  "vmula",   nullptr,   "vsuba",   "vmsuba",  "vopmula", "vnop",
+		"vmove",   "vmr32",   nullptr,   nullptr,   "vlqi",    "vsqi",    "vlqd",    "vsqd",
+		"vdiv",    "vsqrt",   "vrsqrt",  "vwaitq",  "vmtir",   "vmfir",   "vilwr",   "viswr",
+		"vrnext",  "vrget",   "vrinit",  "vrxor",   nullptr,   nullptr,   nullptr,   nullptr,
+		// 0x48-0x7F are holes.
+	};
+
+	int Cop2VuOpId(u32 code)
+	{
+		if ((code >> 26) != 0x12)
+			return -1;
+		const u32 rs = (code >> 21) & 0x1F;
+		if (rs == 0x08) // BC2
+			return static_cast<int>((code >> 16) & 0x1F);
+		if (rs < 0x10) // QMFC2/CFC2/QMTC2/CTC2 and holes are not VU macro ops
+			return -1;
+
+		const u32 funct = code & 0x3F;
+		if (funct >= 0x3C) // SPECIAL2 escape
+			return 0x80 + static_cast<int>((code & 0x3) | ((code >> 4) & 0x7C));
+		return 0x40 + static_cast<int>(funct);
+	}
+
+	const char* Cop2VuOpName(int id)
+	{
+		if (id < 0 || id >= kCop2VuIdCount)
+			return nullptr;
+		if (id < 0x20)
+			return (id < 4) ? kBc2Names[id] : nullptr;
+		if (id >= 0x40 && id < 0x80)
+			return kSpec1Names[id - 0x40];
+		if (id >= 0x80)
+			return kSpec2Names[id - 0x80];
+		return nullptr;
+	}
+
+	static u32 s_cop2VuCensus[kCop2VuIdCount];
+
+	void NoteCop2VuCompiled(u32 code)
+	{
+		const int id = Cop2VuOpId(code);
+		if (id >= 0)
+			s_cop2VuCensus[id]++;
+	}
+
+	std::string DescribeCop2VuCensus()
+	{
+		std::string s;
+		u32 total = 0;
+		for (int id = 0; id < kCop2VuIdCount; id++)
+		{
+			if (s_cop2VuCensus[id] == 0)
+				continue;
+			total += s_cop2VuCensus[id];
+			const char* name = Cop2VuOpName(id);
+			if (!s.empty())
+				s += " ";
+			s += fmt::format("{}={}", name ? name : fmt::format("id0x{:02x}", id), s_cop2VuCensus[id]);
+		}
+		if (s.empty())
+			return "no VU macro ops compiled";
+		return fmt::format("{} (total {})", s, total);
+	}
 
 	bool Selected(u32 code)
 	{
@@ -1963,6 +1890,15 @@ namespace EERecFallback
 				break;
 		}
 
+		if (group == Cop2Vu)
+		{
+			// Per-op filter: an unnamed/unmapped encoding is never selected, so a
+			// mnemonic filter can't accidentally widen to the whole group.
+			const int id = Cop2VuOpId(code);
+			if (id < 0 || (g_cop2VuMask[id >> 6] & (1ull << (id & 63))) == 0)
+				return false;
+		}
+
 		return group != 0 && (g_groups & group) != 0;
 	}
 
@@ -1987,10 +1923,13 @@ namespace EERecFallback
 		}
 	}
 
-	bool ParseGroups(const std::string_view& list, u32* out, u32* reg_masks, std::string* error)
+	bool ParseGroups(const std::string_view& list, u32* out, u32* reg_masks,
+		u64* cop2vu_mask, std::string* error)
 	{
 		u32 local_reg_masks[kCop2MoveOpCount] = {~0u, ~0u, ~0u, ~0u};
 		bool reg_filtered[kCop2MoveOpCount] = {false, false, false, false};
+		u64 local_vu_mask[kCop2VuIdCount / 64] = {~0ull, ~0ull, ~0ull, ~0ull};
+		bool vu_filtered = false;
 		u32 mask = 0;
 		size_t pos = 0;
 		while (pos <= list.size())
@@ -2032,7 +1971,47 @@ namespace EERecFallback
 						found = true;
 						mask |= g.bit;
 
-						if (!regs.empty())
+						if (!regs.empty() && g.bit == Cop2Vu)
+						{
+							// "cop2vu:vmulaw:vmaddaz" — narrow to named macro ops.
+							size_t rp = 0;
+							while (rp <= regs.size())
+							{
+								const size_t rc = regs.find(':', rp);
+								const size_t rend = (rc == std::string_view::npos) ? regs.size() : rc;
+								const std::string_view mnem = regs.substr(rp, rend - rp);
+								int id = -1;
+								for (int i = 0; i < kCop2VuIdCount; i++)
+								{
+									const char* n = Cop2VuOpName(i);
+									if (n && mnem == n)
+									{
+										id = i;
+										break;
+									}
+								}
+								if (id < 0)
+								{
+									if (error)
+									{
+										*error = fmt::format("unknown VU macro op '{}' in EE rec fallback "
+											"filter '{}'", std::string(mnem), std::string(tok));
+									}
+									return false;
+								}
+								if (!vu_filtered)
+								{
+									for (auto& w : local_vu_mask)
+										w = 0;
+									vu_filtered = true;
+								}
+								local_vu_mask[id >> 6] |= (1ull << (id & 63));
+								if (rc == std::string_view::npos)
+									break;
+								rp = rc + 1;
+							}
+						}
+						else if (!regs.empty())
 						{
 							const int slot = MoveOpSlotForGroup(g.bit);
 							if (slot < 0)
@@ -2040,7 +2019,8 @@ namespace EERecFallback
 								if (error)
 								{
 									*error = fmt::format("EE rec fallback group '{}' does not take a register "
-										"filter (only qmfc2/cfc2/qmtc2/ctc2 do)", std::string(name));
+										"filter (only qmfc2/cfc2/qmtc2/ctc2 take ':<reg>', cop2vu takes "
+										"':<mnemonic>')", std::string(name));
 								}
 								return false;
 							}
@@ -2081,7 +2061,8 @@ namespace EERecFallback
 							*error = fmt::format("unknown EE rec fallback group '{}'; valid: none, all, "
 								"fpu, cop2, mmi, multdiv, shift, arith, loadstore, move, cop0, branch, "
 								"cop2move, cop2vu, cop2ls, qmfc2, cfc2, qmtc2, ctc2 (the last four accept "
-								"a ':<reg>' filter, e.g. ctc2:27)",
+								"a ':<reg>' filter, e.g. ctc2:27; cop2vu accepts a ':<mnemonic>' filter, "
+								"e.g. cop2vu:vmaddaw)",
 								std::string(name));
 						}
 						return false;
@@ -2097,6 +2078,8 @@ namespace EERecFallback
 		*out = mask;
 		for (int i = 0; i < kCop2MoveOpCount; i++)
 			reg_masks[i] = local_reg_masks[i];
+		for (int i = 0; i < kCop2VuIdCount / 64; i++)
+			cop2vu_mask[i] = local_vu_mask[i];
 		return true;
 	}
 
@@ -2290,66 +2273,24 @@ void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
 		const R5900::OPCODE& opcode = R5900::GetCurrentInstruction();
 		s_nBlockCycles += opcode.cycles * (2 - ((cpuRegs.CP0.n.Config >> 18) & 0x1));
 
-#ifdef VERIFY_NATIVE_CODEGEN
-		// Verification mode: verify native codegen against interpreter for
-		// instructions in categories that have native codegen enabled.
-		// Skip COP0/Memory/FPU which are interpreter-only and may have
-		// timing-sensitive behaviour (MFC0 Count reads cycle counter).
-		const u32 verifyOp = cpuRegs.code >> 26;
-		const bool isVerifiableCategory =
-			// Verify COP2 instructions (opcode 18 = 0x12)
-			(verifyOp == 0x12);
-
-		if (isVerifiableCategory && opcode.recompile && opcode.interpret)
+		// Guard: branch/jump in a delay slot would cause infinite
+		// compile-time recursion. Use interpreter for the instruction.
+		const bool isBranchInDelaySlot = delayslot && (opcode.flags & IS_BRANCH);
+#ifdef PCSX2_RECOMPILER_TESTS
+		// Harness-only: --rec-fallback bisect switch (see EERecFallback).
+		const bool forcedInterp = EERecFallback::Selected(cpuRegs.code);
+#else
+		constexpr bool forcedInterp = false;
+#endif
+		if (isBranchInDelaySlot || !opcode.recompile || forcedInterp)
 		{
-			// Step 1: Flush all registers to cpuRegs BEFORE native codegen
-			iFlushCall(FLUSH_EVERYTHING);
-
-			// Step 2: Emit call to snapshot pre-instruction state
-			armAsm->Mov(a64::w0, cpuRegs.code);
-			armAsm->Mov(a64::w1, pc - 4); // current instruction PC
-			armFlushEEGPRPins(); // lazy-dirty seam: snapshot READS guest GPR memory
-			armEmitCall((void*)verifySnapshotPre);
-			// The hook is GPR-read-only but clobbers the caller-saved pins,
-			// and the native codegen emitted next reads guest state through
-			// them.
-			armReloadEEClobberedPins();
-
-			// Step 3: Run the native codegen
-			opcode.recompile();
-
-			// Step 4: Flush native results to cpuRegs
-			iFlushCall(FLUSH_EVERYTHING);
-
-			// Step 5: Emit call to verify against interpreter
-			armAsm->Mov(a64::w0, cpuRegs.code);
-			armAsm->Mov(a64::w1, pc - 4);
-			armFlushEEGPRPins(); // lazy-dirty seam: verify READS guest GPR memory
-			armEmitCall((void*)verifyCheckPost);
-			armReloadEEClobberedPins(); // see verifySnapshotPre above
+			if ((opcode.flags & IS_BRANCH) && !isBranchInDelaySlot)
+				recBranchCall(opcode.interpret);
+			else
+				recCall(opcode.interpret);
 		}
 		else
-#endif
-		{
-			// Guard: branch/jump in a delay slot would cause infinite
-			// compile-time recursion. Use interpreter for the instruction.
-			const bool isBranchInDelaySlot = delayslot && (opcode.flags & IS_BRANCH);
-#ifdef PCSX2_RECOMPILER_TESTS
-			// Harness-only: --rec-fallback bisect switch (see EERecFallback).
-			const bool forcedInterp = EERecFallback::Selected(cpuRegs.code);
-#else
-			constexpr bool forcedInterp = false;
-#endif
-			if (isBranchInDelaySlot || !opcode.recompile || forcedInterp)
-			{
-				if ((opcode.flags & IS_BRANCH) && !isBranchInDelaySlot)
-					recBranchCall(opcode.interpret);
-				else
-					recCall(opcode.interpret);
-			}
-			else
-				opcode.recompile();
-		}
+			opcode.recompile();
 	}
 
 	// SP misalignment check disabled: MMI/COP2 instructions legitimately use
@@ -3037,6 +2978,8 @@ static void recResetRaw()
 
 #ifdef PCSX2_RECOMPILER_TESTS
 	s_loopResidentBlocks.clear();
+	s_blockContSites.clear();
+	s_curBlockContSites.clear();
 #endif
 
 	// COP2 macro-mode emitters read their clamp/mask constants from the pack
@@ -3725,6 +3668,9 @@ static void recRecompile(const u32 startpc)
 	s_branchTo = -1;
 	s_branchLoopable = false;
 	s_numContSites = 0;
+#ifdef PCSX2_RECOMPILER_TESTS
+	s_curBlockContSites.clear();
+#endif
 
 	// Timeout loop detection (matches x86 recSkipTimeoutLoop pattern):
 	//   addiu reg,reg,-N / nop*N / bne reg,zero,loop / nop
@@ -4159,6 +4105,9 @@ StartRecomp:
 	}
 
 	pxAssert((pc - startpc) >> 2 <= 0xffff);
+#ifdef PCSX2_RECOMPILER_TESTS
+	s_blockContSites[HWADDR(startpc)] = s_curBlockContSites;
+#endif
 	s_pCurBlockEx->size = (pc - startpc) >> 2;
 
 	// High-water mark of any compiled block's guest extent, for the

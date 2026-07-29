@@ -6,12 +6,6 @@
 #include <stdio.h>
 #include <mutex>
 #include "PrecompiledHeader.h"
-#include "tests/arm64/run_tests.h"
-#include "tests/core/run_patch_tests.h"
-#include "tests/mvu/run_mvu_tests.h"
-#include "tests/ee/run_ee_tests.h"
-#include "tests/ee/run_ee_seq_tests.h"
-#include "tests/vif/run_vif_tests.h"
 #include "common/StringUtil.h"
 #include "common/FileSystem.h"
 #include "common/ZipHelpers.h"
@@ -24,7 +18,6 @@
 #include "SIO/Sio.h" // MemcardBusy — save-state refusal reason
 #include "pcsx2/Patch.h"
 #include "pcsx2/R5900.h"
-#include "pcsx2/EEDiffVerify.h" // @@EEDIFF@@ diff-verifier toggle
 #include <atomic>
 #include <chrono> // shader-cache flush throttle
 #include <thread>
@@ -242,23 +235,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_saveScreenshot(JNIEnv* env, jclass, jstring
     Host::RunOnGSThread([target = std::move(target)]() { GSQueueSnapshot(target, 0); });
 }
 
-// @@EEDIFF@@ Toggle the EE recompiler-vs-interpreter differential verifier (throwaway
-// diagnostic — see EEDiffVerify.h). Sets the enable flag AND clears the EE block cache so
-// blocks recompile WITH (enabled) or WITHOUT (disabled) the per-op verify hooks. With it
-// on, load True Crime NYC and watch logcat for "@@EEDIFF@@ ... DIVERGE ..." — the first
-// line names the exact guest instruction that miscompiles.
-extern "C"
-JNIEXPORT void JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_setEeDiffVerify(JNIEnv*, jclass, jboolean enabled) {
-    eeDiffSetEnabled(enabled == JNI_TRUE);
-    Console.WriteLnFmt("EE diff verify {}", enabled == JNI_TRUE ? "ENABLED" : "disabled");
-    // Reset the EE recompiler so every block recompiles with the new hook state. Cpu is
-    // the active R5900 provider (the mac ARM64 rec on Android); Reset -> recResetEE, which
-    // defers safely to the dispatcher if a block is currently executing.
-    if (Cpu)
-        Cpu->Reset();
-}
-
 // ADPF (PerformanceHintManager): hint the OS scheduler to raise the EE/GS/MTVU threads' CPU
 // frequency toward the frame deadline instead of the DVFS governor under-clocking emulation's
 // bursty load. Basic API-33 path — CPU scheduling only, no explicit GPU timing. Applies live;
@@ -280,15 +256,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_emulog(JNIEnv *env, jclass, jstring p_msg) 
     const std::string msg = GetJavaString(env, p_msg);
     if (!msg.empty())
         Console.WriteLnFmt("{}", msg);
-}
-
-// Read the real flag so the UI can reflect it. The toggle previously kept its
-// state in a Compose `remember`, so navigating away reset the switch to off while the native
-// flag stayed on — the switch was lying about whether the diagnostic was armed.
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_isEeDiffVerify(JNIEnv*, jclass) {
-    return eeDiffGetEnabled() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C"
@@ -993,7 +960,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setAspectRatio(JNIEnv *env, jclass clazz,
 // FMV Aspect Ratio override — applied only while an FMV/MPEG is playing (Counters.cpp
 // swaps EmuConfig.CurrentAspectRatio to this on FMV state transitions, restoring the
 // generic AspectRatio when the FMV ends). 0 Off (use the generic aspect) · 1 Auto
-// 4:3/3:2 · 2 4:3 · 3 16:9 · 4 10:7. Mirrors setAspectRatio; updates EmuConfig.GS live
+// 4:3/3:2 · 2 4:3 · 3 16:9 · 4 10:7 · 5 21:9. Mirrors setAspectRatio; updates EmuConfig.GS live
 // so the next FMV transition honours a change made mid-session.
 extern "C"
 JNIEXPORT void JNICALL
@@ -1169,6 +1136,16 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setPortraitRenderTop(JNIEnv*, jclass, jbool
     // so the bottom is free for touch controls. Sets a GS static read live per-present;
     // safe to call with or without a running VM.
     GSSetPortraitRenderTopAlign(top == JNI_TRUE);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setPortraitRenderTopInset(JNIEnv*, jclass, jint pixels) {
+    // Height of the display cutout (punch-hole / notch camera), in surface pixels. Top-aligning a
+    // portrait render put the image directly under the camera, which sat on the game. Reported by
+    // Isshin. Only the top-align path uses it, and that path always has spare room below, so the
+    // image shifts down rather than being cropped.
+    GSSetPortraitRenderTopInset(static_cast<int>(pixels));
 }
 
 extern "C"
@@ -2346,20 +2323,6 @@ bool FileSystem::CreateFileViaJava(const char* path)
     }
     env->DeleteLocalRef(NativeApp);
     return ok;
-}
-
-void ReportTestResults(const char* label, int passed, int total)
-{
-    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
-    if (!env) return;
-    jclass clazz = env->FindClass("kr/co/iefriends/pcsx2/NativeApp");
-    if (!clazz) return;
-    jmethodID mid = env->GetStaticMethodID(clazz, "onTestResults", "(Ljava/lang/String;II)V");
-    if (!mid) { env->DeleteLocalRef(clazz); return; }
-    jstring jlabel = env->NewStringUTF(label);
-    env->CallStaticVoidMethod(clazz, mid, jlabel, (jint)passed, (jint)total);
-    env->DeleteLocalRef(jlabel);
-    env->DeleteLocalRef(clazz);
 }
 
 extern "C"
@@ -4024,19 +3987,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_gameIniCommitWrite(JNIEnv*, jclass) {
         Console.ErrorFmt("@@ANDROID_GAMEINI@@ commit failed: {}", error.GetDescription());
     return ok ? JNI_TRUE : JNI_FALSE;
 }
-
-extern "C" JNIEXPORT void JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_runCodegenTests(JNIEnv*, jclass) { RunArmCodegenTests(); }
-extern "C" JNIEXPORT void JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_runPatchTests(JNIEnv*, jclass) { RunPatchTests(); }
-extern "C" JNIEXPORT void JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_runVuJitTests(JNIEnv*, jclass) { RunVuJitTests(); }
-extern "C" JNIEXPORT void JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_runEeJitTests(JNIEnv*, jclass) { RunEeJitTests(); }
-extern "C" JNIEXPORT void JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_runVifTests(JNIEnv*, jclass) { RunVifTests(); }
-extern "C" JNIEXPORT void JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_runEeSeqTests(JNIEnv*, jclass) { RunEeSeqTests(); }
 
 // ---------------------------------------------------------------------------
 // PS2 disc serial probe via ISO9660 directory walk.
