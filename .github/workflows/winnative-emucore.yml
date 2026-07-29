@@ -2,6 +2,11 @@ name: emucore
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch to build
+        required: false
+        default: winnative
   schedule:
     - cron: "0 21 * * *"
   push:
@@ -28,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: winnative
+          ref: ${{ github.event.inputs.ref || 'winnative' }}
           fetch-depth: 0
 
       - name: Sync upstream
@@ -92,7 +97,7 @@ jobs:
           echo "source    $src"
           echo "published ${prev:-<none>}"
           echo "$src" > source.sha
-          if [ "$src" = "$prev" ]; then
+          if [ "$src" = "$prev" ] && [ "${{ github.event.inputs.ref || 'winnative' }}" = "winnative" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "This source has already been built and released; nothing to do."
           else
@@ -148,7 +153,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish release
-        if: steps.src.outputs.changed == 'true'
+        if: steps.src.outputs.changed == 'true' && (github.event.inputs.ref || 'winnative') == 'winnative'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
