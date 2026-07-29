@@ -5,9 +5,17 @@ import SwiftUI
 
 struct GraphicsSettingsView: View {
     @State private var settings = SettingsStore.shared
+    @State private var appState = AppState.shared
     @State private var showShaderCacheClearConfirm = false
     @State private var shaderCacheResult: String?
     @State private var showShaderCacheResult = false
+
+    // Returning to the menu only pauses the VM, so a game can still be loaded
+    // while this screen is open. Switching renderer then sends the next settings
+    // apply through a full GS teardown under that game.
+    private var gameIsLoaded: Bool {
+        appState.runningGameName != nil
+    }
 
     private var manualAdvancedHacks: Bool {
         !settings.enableGameDBHardwareFixes
@@ -34,6 +42,24 @@ struct GraphicsSettingsView: View {
 
     var body: some View {
         Form {
+            Section {
+                intPicker("GS Back Thread", selection: $settings.backThreadMode, options: [
+                    ("Disabled (Default)", 0),
+                    ("Inline Records (Debug)", 1),
+                    ("Lockstep (Debug)", 2),
+                    ("Pipelined (Second GS Thread)", 3),
+                ])
+                if settings.backThreadMode == 1 || settings.backThreadMode == 2 {
+                    Text(settings.localized("Debug mode — much slower than the default. Do not use for play."))
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            } header: {
+                Text(settings.localized("Performance"))
+            } footer: {
+                Text(settings.localized("Pipelined splits GS emulation across two threads on multi-core systems and competes for cores with EE/VU threads. The debug modes are much slower — do not use them for play."))
+            }
+
             Section(settings.localized("Renderer")) {
                 Picker(settings.localized("Renderer"), selection: $settings.renderer) {
                     Text(settings.localized("Metal (Hardware)")).tag(17)
@@ -41,6 +67,12 @@ struct GraphicsSettingsView: View {
                     Text(settings.localized("Software")).tag(13)
                     Text(settings.localized("Null (No Output)")).tag(11)
 #endif
+                }
+                .disabled(gameIsLoaded)
+                if gameIsLoaded {
+                    Text(settings.localized("Close the running game to change the renderer."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 #if targetEnvironment(macCatalyst)
                 Text(settings.localized("Metal is required for the Mac Catalyst build. Requires restart."))
@@ -176,12 +208,11 @@ struct GraphicsSettingsView: View {
                 Toggle(settings.localized("Anti-Blur"), isOn: $settings.pcrtcAntiBlur)
                 Toggle(settings.localized("Disable Interlace Offset"), isOn: $settings.disableInterlaceOffset)
                 Toggle(settings.localized("Skip Duplicate Frames"), isOn: $settings.skipDuplicateFrames)
-                Toggle(settings.localized("Sync to Host Refresh"), isOn: $settings.syncToHostRefresh)
                 Toggle(settings.localized("Integer Scaling"), isOn: $settings.integerScaling)
             } header: {
                 Text(settings.localized("Screen / PCRTC"))
             } footer: {
-                Text(settings.localized("Display output options. Most apply immediately. Sync to Host Refresh needs a restart to take effect."))
+                Text(settings.localized("Display output options. Most apply immediately."))
             }
 
             Section(settings.localized("Quality")) {
@@ -226,6 +257,13 @@ struct GraphicsSettingsView: View {
                 Text(settings.localized("GameDB Graphics Fixes are safest for most games. Manual Advanced Hacks disable those automatic graphics fixes and allow the sprite, texture-offset, and Skipdraw values below. Reset/relaunch may be needed."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                // MaskUpscalingHacks() zeroes these unless the multiplier is above 1, so the
+                // toggles read on and do nothing.
+                if settings.upscaleMultiplier <= 1.0 {
+                    Text(settings.localized("Half-pixel Offset, Round Sprite, Align Sprite, Merge Sprite, Wild Arms Offset and the texture offsets only apply above 1x Internal Resolution. At 1x or below they are ignored."))
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
 
                 Picker(settings.localized("Trilinear Filtering"), selection: $settings.trilinearFiltering) {
                     Text(settings.localized("Automatic / Default")).tag(-1)
@@ -271,7 +309,7 @@ struct GraphicsSettingsView: View {
 
                 ClampedIntField(title: settings.localized("Skipdraw Start"), value: skipDrawStartBinding, range: SettingsStore.skipDrawRange, isEnabled: manualAdvancedHacks)
                 ClampedIntField(title: settings.localized("Skipdraw End"), value: skipDrawEndBinding, range: SettingsStore.skipDrawRange, isEnabled: manualAdvancedHacks)
-                Text(settings.localized("For Skipdraw 1, use Start 1 and End 1. Changes apply after reset/relaunch."))
+                Text(settings.localized("For Skipdraw 1, use Start 1 and End 1. Applies immediately."))
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -376,18 +414,6 @@ struct GraphicsSettingsView: View {
                     .disabled(!settings.dumpReplaceableTextures)
                 Toggle(settings.localized("Dump Palette Textures"), isOn: $settings.dumpPaletteTextures)
                     .disabled(!settings.dumpReplaceableTextures)
-            }
-
-            Section("VSync") {
-                Stepper("\(settings.localized("Queue Size")): \(settings.vsyncQueueSize)", value: $settings.vsyncQueueSize, in: 2...16)
-                Text(settings.localized("Higher values reduce frame drops but increase latency."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if settings.vsyncQueueSize >= 12 {
-                    Text(settings.localized("Large queues can make controls feel delayed and may increase stutter. The default is 8."))
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
             }
 
             Section {

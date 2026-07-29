@@ -415,6 +415,9 @@ void Pcsx2Config::SpeedhackOptions::LoadSave(SettingsWrapper& wrap)
 Pcsx2Config::ProfilerOptions::ProfilerOptions()
 	: bitset(0xfffffffe)
 {
+	// Default OFF: perf jitdump is opt-in to avoid GB-scale dumps every play
+	// session on USE_PERF_JITDUMP builds.
+	EnablePerfDump = false;
 }
 
 void Pcsx2Config::ProfilerOptions::LoadSave(SettingsWrapper& wrap)
@@ -426,6 +429,7 @@ void Pcsx2Config::ProfilerOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(RecBlocks_IOP);
 	SettingsWrapBitBool(RecBlocks_VU0);
 	SettingsWrapBitBool(RecBlocks_VU1);
+	SettingsWrapBitBool(EnablePerfDump);
 }
 
 bool Pcsx2Config::ProfilerOptions::operator!=(const ProfilerOptions& right) const
@@ -454,6 +458,7 @@ Pcsx2Config::RecompilerOptions::RecompilerOptions()
 	EnableVU1 = true;
 	EnableFastmem = true;
 	PauseOnTLBMiss = false;
+	EnableVUProgramCache = false; // default off; opt-in until the on-disk cache is validated on the target hardware
 
 	// vu and fpu clamping default to standard overflow.
 	vu0Overflow = true;
@@ -468,6 +473,7 @@ Pcsx2Config::RecompilerOptions::RecompilerOptions()
 	fpuOverflow = true;
 	//fpuExtraOverflow = false;
 	//fpuFullMode = false;
+	fpuGuardedAddSub = true; // PS2-accurate add/sub guard-bit emulation; opt-out for perf on titles verified not to need it.
 }
 
 void Pcsx2Config::RecompilerOptions::ApplySanityCheck()
@@ -532,6 +538,7 @@ void Pcsx2Config::RecompilerOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(EnableVU1);
 	SettingsWrapBitBool(EnableFastmem);
 	SettingsWrapBitBool(PauseOnTLBMiss);
+	SettingsWrapBitBool(EnableVUProgramCache);
 
 	SettingsWrapBitBool(vu0Overflow);
 	SettingsWrapBitBool(vu0ExtraOverflow);
@@ -545,6 +552,7 @@ void Pcsx2Config::RecompilerOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(fpuOverflow);
 	SettingsWrapBitBool(fpuExtraOverflow);
 	SettingsWrapBitBool(fpuFullMode);
+	SettingsWrapBitBool(fpuGuardedAddSub);
 }
 
 u32 Pcsx2Config::RecompilerOptions::GetEEClampMode() const
@@ -642,6 +650,7 @@ const char* Pcsx2Config::GSOptions::AspectRatioNames[(size_t)AspectRatioType::Ma
 	"4:3",
 	"16:9",
 	"10:7",
+	"21:9",
 	nullptr};
 
 const char* Pcsx2Config::GSOptions::FMVAspectRatioSwitchNames[(size_t)FMVAspectRatioSwitchType::MaxCount + 1] = {
@@ -650,6 +659,14 @@ const char* Pcsx2Config::GSOptions::FMVAspectRatioSwitchNames[(size_t)FMVAspectR
 	"4:3",
 	"16:9",
 	"10:7",
+	"21:9",
+	nullptr};
+
+const char* Pcsx2Config::GSOptions::DisplayRotationNames[(size_t)DisplayRotation::MaxCount + 1] = {
+	"0",
+	"90",
+	"180",
+	"270",
 	nullptr};
 
 const char* Pcsx2Config::GSOptions::BlendingLevelNames[] = {
@@ -721,7 +738,9 @@ Pcsx2Config::GSOptions::GSOptions()
 	UseBlitSwapChain = false;
 	DisableShaderCache = false;
 	DisableFramebufferFetch = false;
-	DisableVertexShaderExpand = false;	EnableAdrenoFramebufferFetch = false;
+	DisablePS2DepthQuantization = false;
+	DisableVertexShaderExpand = false;
+	EnableAdrenoFramebufferFetch = false;
 	ForceMaliFramebufferFetch = false;
 	SkipDuplicateFrames = true;
 	OsdMessagesPos = OsdOverlayPos::TopLeft;
@@ -760,6 +779,7 @@ Pcsx2Config::GSOptions::GSOptions()
 	HWROV = false;
 	HWROVLogging = false;
 	HWROVBarriersVK = false;
+	CoalesceRenderPasses = false;
 
 	ManualUserHacks = false;
 	UserHacks_AlignSpriteX = false;
@@ -802,6 +822,7 @@ bool Pcsx2Config::GSOptions::operator==(const GSOptions& right) const
 
 		OpEqu(AspectRatio) &&
 		OpEqu(FMVAspectRatioSwitch) &&
+		OpEqu(Rotation) &&
 
 		OptionsAreEqual(right));
 }
@@ -865,6 +886,7 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
 		OpEqu(UserHacks_BilinearHack) &&
 		OpEqu(OverrideTextureBarriers) &&
 		OpEqu(DepthFeedbackMode) &&
+		OpEqu(BackThreadMode) &&
 
 		OpEqu(CAS_Sharpness) &&
 		OpEqu(ShadeBoost_Brightness) &&
@@ -910,18 +932,61 @@ bool Pcsx2Config::GSOptions::operator!=(const GSOptions& right) const
 	return !operator==(right);
 }
 
+bool Pcsx2Config::GSOptions::IsRestartOption(const char* ini_key)
+{
+	// INI key names for the fields compared in RestartOptionsAreEqual below; keep the
+	// two in sync. Names match the field names except BackThreadMode, which is stored
+	// as "GSBackThreadMode".
+	static constexpr const char* keys[] = {
+		"Renderer",
+		"Adapter",
+		"UseDebugDevice",
+		"DebugLabels",
+		"UseBlitSwapChain",
+		"DisableShaderCache",
+		"DisableFramebufferFetch",
+		"DisablePS2DepthQuantization",
+		"DisableVertexShaderExpand",
+		"EnableAdrenoFramebufferFetch",
+		"ForceMaliFramebufferFetch",
+		"OverrideTextureBarriers",
+		"DepthFeedbackMode",
+		"GSBackThreadMode",
+		"HWAA1",
+		"ExclusiveFullscreenControl",
+	};
+
+	for (const char* key : keys)
+	{
+		if (StringUtil::Strcasecmp(key, ini_key) == 0)
+			return true;
+	}
+	return false;
+}
+
 bool Pcsx2Config::GSOptions::RestartOptionsAreEqual(const GSOptions& right) const
 {
 	return OpEqu(Renderer) &&
 		   OpEqu(Adapter) &&
 		   OpEqu(UseDebugDevice) &&
+		   // Selects the VK_EXT_debug_utils instance extension, which is fixed at
+		   // instance creation -- toggling it in place would silently do nothing.
+		   OpEqu(DebugLabels) &&
 		   OpEqu(UseBlitSwapChain) &&
 		   OpEqu(DisableShaderCache) &&
 		   OpEqu(DisableFramebufferFetch) &&
-		   OpEqu(DisableVertexShaderExpand) &&		   OpEqu(EnableAdrenoFramebufferFetch) &&
+		   OpEqu(DisablePS2DepthQuantization) &&
+		   OpEqu(DisableVertexShaderExpand) &&
+		   OpEqu(EnableAdrenoFramebufferFetch) &&
 		   OpEqu(ForceMaliFramebufferFetch) &&
 		   OpEqu(OverrideTextureBarriers) &&
+		   // Drivers carrying UseRenderTargetCopyForFeedback only take the RT-copy path when
+		   // replacements are loaded (see GSDeviceVK::CheckFeatures), and that decision picks the
+		   // tfx.glsl RT-read variant at shader-compile time. Toggling this in place would leave
+		   // m_features.texture_barrier and every compiled pipeline disagreeing with the setting.
+		   OpEqu(LoadTextureReplacements) &&
 		   OpEqu(DepthFeedbackMode) &&
+		   OpEqu(BackThreadMode) &&
 		   OpEqu(HWAA1) &&
 		   OpEqu(ExclusiveFullscreenControl);
 }
@@ -945,6 +1010,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 
 	SettingsWrapEnumEx(AspectRatio, "AspectRatio", AspectRatioNames);
 	SettingsWrapEnumEx(FMVAspectRatioSwitch, "FMVAspectRatioSwitch", FMVAspectRatioSwitchNames);
+	SettingsWrapEnumEx(Rotation, "DisplayRotation", DisplayRotationNames);
 	SettingsWrapIntEnumEx(ScreenshotSize, "ScreenshotSize");
 	SettingsWrapIntEnumEx(ScreenshotFormat, "ScreenshotFormat");
 	SettingsWrapEntry(ScreenshotQuality);
@@ -964,10 +1030,14 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBoolEx(PCRTCOverscan, "pcrtc_overscan");
 	SettingsWrapBitBool(IntegerScaling);
 	SettingsWrapBitBool(UseDebugDevice);
+	SettingsWrapBitBool(DebugLabels);
+	SettingsWrapBitBool(DumpDrawLog);
 	SettingsWrapBitBool(UseBlitSwapChain);
 	SettingsWrapBitBool(DisableShaderCache);
 	SettingsWrapBitBool(DisableFramebufferFetch);
-	SettingsWrapBitBool(DisableVertexShaderExpand);	SettingsWrapBitBool(EnableAdrenoFramebufferFetch);
+	SettingsWrapBitBool(DisablePS2DepthQuantization);
+	SettingsWrapBitBool(DisableVertexShaderExpand);
+	SettingsWrapBitBool(EnableAdrenoFramebufferFetch);
 	SettingsWrapBitBool(ForceMaliFramebufferFetch);
 	SettingsWrapBitBool(SkipDuplicateFrames);
 	SettingsWrapBitBool(OsdShowSpeed);
@@ -1061,6 +1131,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(HWROV);
 	SettingsWrapBitBool(HWROVLogging);
 	SettingsWrapBitBool(HWROVBarriersVK);
+	SettingsWrapBitBool(CoalesceRenderPasses);
 	SettingsWrapIntEnumEx(AccurateBlendingUnit, "accurate_blending_unit");
 	SettingsWrapIntEnumEx(TextureFiltering, "filter");
 	SettingsWrapIntEnumEx(TexturePreloading, "texture_preloading");
@@ -1090,6 +1161,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapIntEnumEx(TriFilter, "TriFilter");
 	SettingsWrapBitfieldEx(OverrideTextureBarriers, "OverrideTextureBarriers");
 	SettingsWrapIntEnumEx(DepthFeedbackMode, "DepthFeedbackMode");
+	SettingsWrapIntEnumEx(BackThreadMode, "GSBackThreadMode");
 
 	SettingsWrapBitfield(ShadeBoost_Brightness);
 	SettingsWrapBitfield(ShadeBoost_Contrast);
@@ -1290,6 +1362,7 @@ void Pcsx2Config::SPU2Options::LoadSave(SettingsWrapper& wrap)
 		SettingsWrapEntry(StandardVolume);
 		SettingsWrapEntry(FastForwardVolume);
 		SettingsWrapEntry(OutputMuted);
+		SettingsWrapEntry(LightweightMode);
 		SettingsWrapParsedEnum(Backend, "Backend", &AudioStream::ParseBackendName, &AudioStream::GetBackendName);
 		SettingsWrapParsedEnum(SyncMode, "SyncMode", &ParseSyncMode, &GetSyncModeName);
 		SettingsWrapEntry(DriverName);
@@ -1309,6 +1382,7 @@ bool Pcsx2Config::SPU2Options::operator==(const SPU2Options& right) const
 		   OpEqu(StandardVolume) &&
 		   OpEqu(FastForwardVolume) &&
 		   OpEqu(OutputMuted) &&
+		   OpEqu(LightweightMode) &&
 		   OpEqu(Backend) &&
 		   OpEqu(StreamParameters) &&
 		   OpEqu(DriverName) &&
@@ -1321,6 +1395,7 @@ const char* Pcsx2Config::DEV9Options::NetApiNames[] = {
 	"PCAP Switched",
 	"TAP",
 	"Sockets",
+	"Local Link",
 	nullptr};
 
 const char* Pcsx2Config::DEV9Options::DnsModeNames[] = {
@@ -1343,6 +1418,11 @@ void Pcsx2Config::DEV9Options::LoadSave(SettingsWrapper& wrap)
 		SettingsWrapEntry(EthDevice);
 		SettingsWrapEntry(EthLogDHCP);
 		SettingsWrapEntry(EthLogDNS);
+		SettingsWrapEntry(LocalLinkHost);
+		SettingsWrapEntry(LocalLinkAddress);
+		SettingsWrapEntry(LocalLinkPort);
+		SettingsWrapEntry(LocalLinkPeerId);
+		SettingsWrapEntry(LocalLinkRoomCode);
 
 		SettingsWrapEntry(InterceptDHCP);
 
@@ -1437,6 +1517,11 @@ bool Pcsx2Config::DEV9Options::operator==(const DEV9Options& right) const
 		   OpEqu(EthDevice) &&
 		   OpEqu(EthLogDHCP) &&
 		   OpEqu(EthLogDNS) &&
+		   OpEqu(LocalLinkHost) &&
+		   OpEqu(LocalLinkAddress) &&
+		   OpEqu(LocalLinkPort) &&
+		   OpEqu(LocalLinkPeerId) &&
+		   OpEqu(LocalLinkRoomCode) &&
 
 		   OpEqu(InterceptDHCP) &&
 		   (*(int*)PS2IP == *(int*)right.PS2IP) &&
@@ -2233,7 +2318,7 @@ bool EmuFolders::SetDataDirectory(Error* error)
 		if (EmuConfig.CustomDataPath.empty())
 		{
 #if defined(_WIN32)
-			// On Windows, use My Documents\PCSX2 to match old installs.
+			// On Windows, use My Documents\ARMSX2.
 			PWSTR documents_directory;
 			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, NULL, &documents_directory)))
 			{
@@ -2242,7 +2327,7 @@ bool EmuFolders::SetDataDirectory(Error* error)
 				CoTaskMemFree(documents_directory);
 			}
 #elif defined(__linux__) || defined(__FreeBSD__)
-			// Use $XDG_CONFIG_HOME/PCSX2 if it exists.
+			// Use $XDG_CONFIG_HOME/ARMSX2 if it exists.
 			const char* xdg_config_home = getenv("XDG_CONFIG_HOME");
 			if (xdg_config_home && Path::IsAbsolute(xdg_config_home))
 			{
@@ -2250,7 +2335,7 @@ bool EmuFolders::SetDataDirectory(Error* error)
 			}
 			else
 			{
-				// Use ~/PCSX2 for non-XDG, and ~/.config/PCSX2 for XDG.
+				// Use ~/ARMSX2 for non-XDG, and ~/.config/ARMSX2 for XDG.
 				const char* home_dir = getenv("HOME");
 				if (home_dir)
 				{

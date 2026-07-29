@@ -30,6 +30,7 @@ object TouchControls {
     private const val KEY_PROFILES = "touch.profiles"
     private const val KEY_ACTIVE = "touch.active"
     private const val KEY_OPACITY = "touch.opacity"
+    private const val KEY_PRESSURE_PERCENT = "touch.pressurePercent"
     // #357: pause button is now a visible top-right single-tap button; this toggles its glyph
     // (off = invisible but still tappable). The migration key one-shot relocates the old
     // invisible center pause hotspot to the new top-right spot for existing layouts.
@@ -57,6 +58,8 @@ object TouchControls {
     private const val KEY_MULTI_RADIUS = "touch.multiRadius"
     private const val KEY_DPAD_SPACING = "touch.dpadSpacing"
     private const val KEY_FLOATING_STICK = "touch.floatingStick"
+    private const val KEY_FULL_HALF_STICKS = "touch.fullHalfSticks"
+    private const val KEY_GRID_SNAP = "touch.gridSnap"
     private const val KEY_VIS_MODE = "touch.visibilityMode"
     // One-shot 2.4.7 defaults migration for EXISTING users (saved prefs/layouts
     // predate the default changes, so the new defaults wouldn't otherwise apply).
@@ -134,7 +137,10 @@ object TouchControls {
         MainActivityRuntime.prefs.getString(orient(baseKey), null)
             ?: MainActivityRuntime.prefs.getString(baseKey, null)
 
-    /** Master opacity 0.20..1.00. Persisted. */
+    /** Master opacity 0.00..1.00. Persisted. 0 = fully invisible controls, which stay touchable —
+     *  requested by players who know the layout by feel (#428), and matches PPSSPP/Dolphin/Citra.
+     *  The floor used to be 0.20; the per-widget legibility floors in TouchControlsOverlay now fade
+     *  out below that instead of bottoming out, so 0 really means invisible. */
     val opacity = mutableFloatStateOf(0.55f)
 
     /** #357: "tap to reveal" mode for the on-screen pause button. Off (default) = the ⏸ glyph
@@ -180,14 +186,64 @@ object TouchControls {
     // under KEY_FLOATING_STICK.
     val floatingStick = mutableStateOf(false)
 
+    // Full-half invisible analog sticks (RPCSX-style): the entire LEFT half of the screen acts as
+    // the left stick and the RIGHT half as the right stick, with nothing drawn — each finger drives
+    // its stick from wherever it touches down (floating origin). The normal L/R stick widgets are
+    // hidden while this is on. Global; persisted under KEY_FULL_HALF_STICKS.
+    val fullHalfSticks = mutableStateOf(false)
+
+    // Editor-only: while ON, dragging a widget in edit mode snaps its centre anchor to the
+    // nearest cross of a square grid (see GRID_COLS in TouchControlsOverlay). Lets the user
+    // align buttons precisely instead of eyeballing them "slightly off from one another".
+    // Global; persisted under KEY_GRID_SNAP.
+    val gridSnap = mutableStateOf(false)
+
+    // Editor panel (EditToolbar) placement — SESSION ONLY, and PER-ORIENTATION. Portrait and
+    // landscape keep SEPARATE placements (like the touch layout itself): the panel lives at very
+    // different screen coordinates in each, so a portrait offset applied in landscape would shove it
+    // off-screen. Lets the user drag the settings panel out of the way and resize it so it stops
+    // covering the buttons. Not persisted: raw-px offsets don't survive a resolution change.
+    private val editorPanelDxP = mutableFloatStateOf(0f)
+    private val editorPanelDyP = mutableFloatStateOf(0f)
+    private val editorPanelScaleP = mutableFloatStateOf(1f)
+    private val editorPanelDxL = mutableFloatStateOf(0f)
+    private val editorPanelDyL = mutableFloatStateOf(0f)
+    private val editorPanelScaleL = mutableFloatStateOf(1f)
+
+    fun editorPanelDx(landscape: Boolean) = if (landscape) editorPanelDxL else editorPanelDxP
+    fun editorPanelDy(landscape: Boolean) = if (landscape) editorPanelDyL else editorPanelDyP
+    fun editorPanelScale(landscape: Boolean) = if (landscape) editorPanelScaleL else editorPanelScaleP
+
+    fun resetEditorPanel(landscape: Boolean) {
+        editorPanelDx(landscape).floatValue = 0f
+        editorPanelDy(landscape).floatValue = 0f
+        editorPanelScale(landscape).floatValue = 1f
+    }
+
     /** Held-state for the DS2 pressure-sensitivity modifier. While true, the
      *  pressure-capable buttons report ~50% pressure (PCSX2's
      *  DEFAULT_PRESSURE_MODIFIER) for soft presses (MGS, GTA). Driven by the
      *  on-screen PRESSURE button and the bound physical button. */
     val pressureModifierHeld = mutableStateOf(false)
 
-    /** ~50% of the native 0..32767 range → state≈0.5 in setPadButton. */
-    const val PRESSURE_HALF_RANGE = 16383
+    /** Full native press range. setPadButton maps 0..PRESSURE_FULL_RANGE onto state 0..1, and
+     *  treats a range of exactly 0 as "no modifier — full press". */
+    const val PRESSURE_FULL_RANGE = 32767
+
+    /** How hard the modifier presses, as a percentage of a full press. 50 reproduces the value
+     *  that used to be hardcoded (PCSX2's DEFAULT_PRESSURE_MODIFIER), which is why the on-screen
+     *  PRESSURE button was stuck at exactly half. Clamped away from BOTH ends deliberately: 0
+     *  would collide with the "full press" sentinel above, and 100 is indistinguishable from not
+     *  holding the modifier at all — neither is a usable setting. Persisted. */
+    val pressurePercent = mutableIntStateOf(50)
+
+    fun setPressurePercent(v: Int) {
+        val c = v.coerceIn(5, 95)
+        pressurePercent.intValue = c
+        // Persisted immediately rather than waiting for the layout save() — this is driven from a
+        // settings slider, not from the layout editor, so save() may never be called.
+        runCatching { MainActivityRuntime.prefs.edit().putInt(KEY_PRESSURE_PERCENT, c).apply() }
+    }
 
     // PS2 DualShock2 pressure-sensitive inputs (keycodes match native-lib.cpp's
     // setPadButton map): d-pad, face buttons, L1/L2/R1/R2. Start/Select/L3/R3 are
@@ -202,7 +258,9 @@ object TouchControls {
      *  (soft) range while the modifier is held on a pressure-capable button,
      *  else 0 (full press). */
     fun pressureRangeFor(keycode: Int): Int =
-        if (pressureModifierHeld.value && keycode in PRESSURE_KEYCODES) PRESSURE_HALF_RANGE else 0
+        if (pressureModifierHeld.value && keycode in PRESSURE_KEYCODES)
+            (PRESSURE_FULL_RANGE * pressurePercent.intValue / 100).coerceAtLeast(1)
+        else 0
 
     /** On-screen touch controls visibility. 0 = Never show (for physical-
      *  controls devices like the RP6 — also hides the settings cog so nothing
@@ -297,6 +355,7 @@ object TouchControls {
         val wanted = codes.toSet()
         val csv = macroAssignableTargets.map { it.code }.filter { it in wanted }.joinToString(",")
         MainActivityRuntime.prefs.edit { putString(KEY_MACRO_PREFIX + id.name, csv) }
+        invalidateRuntimeMacroCache()
         macroBindTick.intValue++
     }
 
@@ -311,6 +370,7 @@ object TouchControls {
 
     fun setMacroPhysicalCode(id: TouchButtonId, keycode: Int) {
         MainActivityRuntime.prefs.edit { putInt(KEY_MACRO_PHYS_PREFIX + id.name, keycode)}
+        invalidateRuntimeMacroCache()
         macroBindTick.intValue++
     }
 
@@ -400,12 +460,35 @@ object TouchControls {
 
     /** The macro a physical [keycode] triggers — only if it's bound AND has buttons
      *  configured. Checked in the gameplay key path (Main) before normal pad routing. */
+    @Volatile private var runtimeMacroMap: Map<Int, TouchButtonId>? = null
+
+    fun invalidateRuntimeMacroCache() {
+        runtimeMacroMap = null
+    }
+
+    private fun runtimeMacroMap(): Map<Int, TouchButtonId> =
+        runtimeMacroMap ?: synchronized(this) {
+            runtimeMacroMap ?: buildMap {
+                listOf(TouchButtonId.MACRO1, TouchButtonId.MACRO2, TouchButtonId.MACRO3, TouchButtonId.MACRO4)
+                    .forEach { id ->
+                        val physical = macroPhysicalCode(id)
+                        if (physical != KeyEvent.KEYCODE_UNKNOWN &&
+                            macroCodes(id).isNotEmpty() &&
+                            !containsKey(physical)
+                        ) {
+                            put(physical, id)
+                        }
+                    }
+            }.also { runtimeMacroMap = it }
+        }
+
+    fun warmRuntimeMacroCache() {
+        runtimeMacroMap()
+    }
+
     fun macroForPhysicalCode(keycode: Int): TouchButtonId? {
         if (keycode == KeyEvent.KEYCODE_UNKNOWN) return null
-        for (id in listOf(TouchButtonId.MACRO1, TouchButtonId.MACRO2, TouchButtonId.MACRO3, TouchButtonId.MACRO4)) {
-            if (macroPhysicalCode(id) == keycode && macroCodes(id).isNotEmpty()) return id
-        }
-        return null
+        return runtimeMacroMap()[keycode]
     }
 
     /** Set true once load() has run — used to avoid clobbering disk state
@@ -443,14 +526,17 @@ object TouchControls {
         val active = MainActivityRuntime.prefs.getString(KEY_ACTIVE, list.first().name) ?: list.first().name
         activeProfileName.value = active
         val match = list.firstOrNull { it.name == active } ?: list.first()
-        activeLayout.value = match.layout.copy()
-        opacity.floatValue = MainActivityRuntime.prefs.getFloat(KEY_OPACITY, 0.55f).coerceIn(0.20f, 1.0f)
+        activeLayout.value = match.layoutFor(portrait.value).copy()
+        opacity.floatValue = MainActivityRuntime.prefs.getFloat(KEY_OPACITY, 0.55f).coerceIn(0.0f, 1.0f)
+        pressurePercent.intValue = MainActivityRuntime.prefs.getInt(KEY_PRESSURE_PERCENT, 50).coerceIn(5, 95)
         faceMultiTouch.value = MainActivityRuntime.prefs.getBoolean(KEY_FACE_MULTI, true)
         touchGliding.value = MainActivityRuntime.prefs.getBoolean(KEY_TOUCH_GLIDING, false)
         touchHaptics.value = MainActivityRuntime.prefs.getBoolean(KEY_TOUCH_HAPTICS, true)
         multiTouchRadius.floatValue = MainActivityRuntime.prefs.getFloat(KEY_MULTI_RADIUS, 0.62f).coerceIn(0.50f, 0.95f)
         dpadSpacing.floatValue = MainActivityRuntime.prefs.getFloat(KEY_DPAD_SPACING, 0.0f).coerceIn(0.0f, 0.35f)
         floatingStick.value = MainActivityRuntime.prefs.getBoolean(KEY_FLOATING_STICK, false)
+        fullHalfSticks.value = MainActivityRuntime.prefs.getBoolean(KEY_FULL_HALF_STICKS, false)
+        gridSnap.value = MainActivityRuntime.prefs.getBoolean(KEY_GRID_SNAP, false)
         visibilityMode.intValue = MainActivityRuntime.prefs.getInt(KEY_VIS_MODE, 11).coerceIn(0, 11)
         if (visibilityMode.intValue == 0) visible.value = false
         // #357: show/hide became tap-to-reveal (inverted). Seed the new pref from the old one so
@@ -540,6 +626,8 @@ object TouchControls {
                 .putFloat(KEY_MULTI_RADIUS, multiTouchRadius.floatValue)
                 .putFloat(KEY_DPAD_SPACING, dpadSpacing.floatValue)
                 .putBoolean(KEY_FLOATING_STICK, floatingStick.value)
+                .putBoolean(KEY_FULL_HALF_STICKS, fullHalfSticks.value)
+                .putBoolean(KEY_GRID_SNAP, gridSnap.value)
                 .putInt(KEY_VIS_MODE, visibilityMode.intValue)
                 .putBoolean(KEY_PAUSE_TAP_REVEAL, pauseTapToReveal.value)
         }
@@ -569,6 +657,17 @@ object TouchControls {
      *  stops one game's edit from bleeding into the next. When no game is running
      *  (library/global edit), fall back to overwriting the active profile so the
      *  global Default still reflects the edit. */
+    /** Re-read the active PROFILE for the current orientation.
+     *
+     *  The in-game path re-applies on rotate via applyForSerial, but that only runs while a VM is
+     *  up — so a global-scope edit kept whichever orientation's layout happened to be loaded when
+     *  the screen opened, and rotating showed the wrong one. */
+    fun applyActiveProfileForOrientation() {
+        val match = profiles.firstOrNull { it.name == activeProfileName.value } ?: return
+        activeLayout.value = match.layoutFor(portrait.value).copy()
+        selectedButton.value = null
+    }
+
     fun saveLiveLayoutToActive() {
         // gameIsRunning() is the OUTER gate. The per-serial/CRC isolation paths
         // must only run when a VM is actually up — keying off a merely-non-null
@@ -611,7 +710,9 @@ object TouchControls {
             // active profile.
             val idx = profiles.indexOfFirst { it.name == activeProfileName.value }
             if (idx >= 0) {
-                profiles[idx] = profiles[idx].copy(layout = activeLayout.value.copy())
+                // Only the orientation currently being edited. Writing .copy(layout = ...) here
+                // unconditionally is what made landscape and portrait clobber each other.
+                profiles[idx] = profiles[idx].withLayoutFor(portrait.value, activeLayout.value.copy())
                 persist()
             }
         }
@@ -670,7 +771,9 @@ object TouchControls {
     }
 
     fun resetActiveToDefault() {
-        activeLayout.value = TouchLayout.default()
+        // Per-orientation: resetting in portrait must not hand back the landscape arrangement,
+        // whose fractions put the sticks and face buttons over the picture.
+        activeLayout.value = TouchLayout.defaultFor(portrait.value)
     }
 
     /** True when a VM is up (RUNNING or PAUSED) — i.e. an in-game edit, where we
@@ -839,7 +942,7 @@ object TouchControls {
     }
 
     fun setOpacity(o: Float) {
-        opacity.floatValue = o.coerceIn(0.20f, 1.0f)
+        opacity.floatValue = o.coerceIn(0.0f, 1.0f)
         persist()
     }
 
@@ -875,6 +978,16 @@ object TouchControls {
 
     fun setFloatingStick(enabled: Boolean) {
         floatingStick.value = enabled
+        persist()
+    }
+
+    fun setFullHalfSticks(enabled: Boolean) {
+        fullHalfSticks.value = enabled
+        persist()
+    }
+
+    fun setGridSnap(enabled: Boolean) {
+        gridSnap.value = enabled
         persist()
     }
 
@@ -942,6 +1055,11 @@ enum class TouchButtonId(val label: String, val keycode: Int, val kind: Kind) {
     // as the SAVE_STATE/LOAD_STATE hotkeys. Opt-in (disabled in the default layout).
     SAVE_STATE("SAVE", 0, Kind.STATEACTION),
     LOAD_STATE("LOAD", 0, Kind.STATEACTION),
+    // Screenshot, same shape as the save/load buttons. Lives here rather than in the pause menu:
+    // the core writes the PNG and confirms on the OSD, which is hidden while the menu is up, so a
+    // menu entry left you staring at nothing until you backed out and wondered if it had worked.
+    // On the overlay the confirmation appears immediately, where you are already looking.
+    SCREENSHOT("SHOT", 0, Kind.STATEACTION),
 
     // Macro / combo buttons: each fires a user-chosen SET of pad buttons at once
     // (e.g. R1+R2+R3). Emits no keycode of its own; the set is configured per macro
@@ -1022,6 +1140,62 @@ data class TouchLayout(val buttons: List<TouchButtonCfg>) {
             return TouchLayout(merged)
         }
 
+        /** The default for [portrait], or the landscape one otherwise. Positions are screen
+         *  fractions, so the landscape layout does not merely look cramped in portrait — it lands
+         *  in the wrong half of a much taller window, on top of the game. */
+        fun defaultFor(portrait: Boolean): TouchLayout =
+            if (portrait) defaultPortrait() else default()
+
+        /**
+         * Portrait default: controls in the lower ~60% with the game above them.
+         *
+         * Laid out to a proposal from Isshin — shoulders paired at the top of the control area,
+         * left stick and the face diamond in the middle band, D-pad and right stick along the
+         * bottom, Select/Start centred between them and L3/R3 in the outer corners. Reproducing a
+         * real pad's geography rather than compressing the landscape arrangement, which put the
+         * sticks and face buttons over the picture.
+         *
+         * Everything sits at y >= 0.35 so nothing overlaps a top-aligned portrait render, and
+         * nothing goes past y 0.95, which is where the system gesture bar lives.
+         */
+        fun defaultPortrait(): TouchLayout = TouchLayout(
+            buttons = listOf(
+                // Shoulders: paired top-left and top-right of the control area, L2/R2 above L1/R1.
+                TouchButtonCfg(TouchButtonId.L2,       0.13f, 0.37f, 56f),
+                TouchButtonCfg(TouchButtonId.L1,       0.13f, 0.46f, 56f),
+                TouchButtonCfg(TouchButtonId.R2,       0.87f, 0.37f, 56f),
+                TouchButtonCfg(TouchButtonId.R1,       0.87f, 0.46f, 56f),
+                // Left stick mid-left; face diamond mid-right.
+                TouchButtonCfg(TouchButtonId.L_STICK,  0.19f, 0.62f, 150f),
+                TouchButtonCfg(TouchButtonId.TRIANGLE, 0.75f, 0.55f, 58f),
+                TouchButtonCfg(TouchButtonId.SQUARE,   0.61f, 0.62f, 58f),
+                TouchButtonCfg(TouchButtonId.CIRCLE,   0.89f, 0.62f, 58f),
+                TouchButtonCfg(TouchButtonId.CROSS,    0.75f, 0.69f, 58f),
+                // D-pad bottom-left, right stick bottom-right — the reverse of the band above, so
+                // neither thumb has to cross the other.
+                TouchButtonCfg(TouchButtonId.DPAD,     0.21f, 0.81f, 150f),
+                TouchButtonCfg(TouchButtonId.R_STICK,  0.72f, 0.81f, 150f),
+                // Select / Start centred at the bottom, L3 / R3 tucked into the outer corners.
+                TouchButtonCfg(TouchButtonId.SELECT,   0.41f, 0.94f, 48f),
+                TouchButtonCfg(TouchButtonId.START,    0.57f, 0.94f, 48f),
+                TouchButtonCfg(TouchButtonId.L3,       0.10f, 0.94f, 44f),
+                TouchButtonCfg(TouchButtonId.R3,       0.90f, 0.94f, 44f),
+                // Opt-in extras keep the landscape default's disabled state and park in the gap
+                // between the render and the shoulders, where they are grabbable in the editor.
+                TouchButtonCfg(TouchButtonId.FAST_FORWARD, 0.30f, 0.36f, 44f, enabled = false),
+                TouchButtonCfg(TouchButtonId.MACRO1, 0.40f, 0.36f, 42f, enabled = false),
+                TouchButtonCfg(TouchButtonId.MACRO2, 0.48f, 0.36f, 42f, enabled = false),
+                TouchButtonCfg(TouchButtonId.MACRO3, 0.56f, 0.36f, 42f, enabled = false),
+                TouchButtonCfg(TouchButtonId.MACRO4, 0.64f, 0.36f, 42f, enabled = false),
+            ).let { placed ->
+                // Splice in anything the landscape default has that this list does not (pause,
+                // pressure, save/load-state buttons...) so a new widget never goes missing in
+                // portrait just because this table was written before it existed.
+                val have = placed.map { it.id }.toSet()
+                placed + default().buttons.filter { it.id !in have }
+            },
+        )
+
         /** Landscape-tuned default. Coordinates assume a 16:9-ish layout
          *  and are clamped to safe areas on edges. The user can drag in
          *  edit mode to fit their device — this is just the starting
@@ -1062,6 +1236,7 @@ data class TouchLayout(val buttons: List<TouchButtonCfg>) {
                 // Quick save/load-state buttons — also OPT-IN (disabled). Second row.
                 TouchButtonCfg(TouchButtonId.SAVE_STATE, 0.30f, 0.54f, 44f, enabled = false),
                 TouchButtonCfg(TouchButtonId.LOAD_STATE, 0.38f, 0.54f, 44f, enabled = false),
+                TouchButtonCfg(TouchButtonId.SCREENSHOT, 0.46f, 0.54f, 44f, enabled = false),
                 // Analog sticks — bottom inside, between DPad/face cluster
                 // and the center, so thumb travel is short.
                 TouchButtonCfg(TouchButtonId.L_STICK,  0.28f, 0.80f, 130f),
@@ -1086,10 +1261,32 @@ data class TouchLayout(val buttons: List<TouchButtonCfg>) {
     }
 }
 
-data class TouchProfile(val name: String, val layout: TouchLayout) {
+/** [layout] is the LANDSCAPE authoring; [portraitLayout] is portrait's own, null until the user
+ *  saves one. Per-game layouts got this via the ".portrait" key suffix (see orient()), but global
+ *  profiles held a single layout — so editing in one orientation overwrote the other, which is
+ *  exactly the "they are connected when they should be independent" report from Piixel and Isshin,
+ *  and why it worked per-game and not globally.
+ *
+ *  Null portraitLayout falls back to landscape when read, matching readGameLayoutJson's seeding: a
+ *  profile authored before this still shows something sensible in portrait, and the first portrait
+ *  Save splits them for good. Absent from the JSON when null, so old profiles load unchanged. */
+data class TouchProfile(
+    val name: String,
+    val layout: TouchLayout,
+    val portraitLayout: TouchLayout? = null,
+) {
+    /** The authoring for [portrait], falling back to landscape when portrait has none yet. */
+    fun layoutFor(portrait: Boolean): TouchLayout =
+        if (portrait) (portraitLayout ?: layout) else layout
+
+    /** Replace only the orientation being edited, leaving the other one alone. */
+    fun withLayoutFor(portrait: Boolean, updated: TouchLayout): TouchProfile =
+        if (portrait) copy(portraitLayout = updated) else copy(layout = updated)
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("name", name)
         put("layout", layout.toJson())
+        portraitLayout?.let { put("portraitLayout", it.toJson()) }
     }
 
     companion object {
@@ -1098,6 +1295,7 @@ data class TouchProfile(val name: String, val layout: TouchLayout) {
                 name = json.optString("name", "Profile"),
                 layout = json.optJSONObject("layout")?.let { TouchLayout.fromJson(it) }
                     ?: TouchLayout.default(),
+                portraitLayout = json.optJSONObject("portraitLayout")?.let { TouchLayout.fromJson(it) },
             )
         }
     }

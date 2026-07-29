@@ -18,7 +18,6 @@ import android.view.Surface;
 import com.armsx2.BiosInfo;
 import com.armsx2.EmuState;
 import com.armsx2.runtime.MainActivityRuntime;
-import com.armsx2.events.TestResult;
 
 import java.io.File;
 import java.lang.ref.WeakReference;
@@ -122,12 +121,13 @@ public class NativeApp {
 	// Save a GS dump (.gs of GPU commands) to the snaps folder for diagnosing
 	// rendering bugs. frames <= 0 captures a single frame.
 	public static native void captureGsDump(int frames);
+	/** PNG screenshot into the snapshots folder. No-op with no VM. */
+	public static native void saveScreenshot(String pngPath);
 
-	// @@EEDIFF@@ Toggle the EE recompiler-vs-interpreter differential verifier (throwaway
-	// diagnostic). Enabling clears the EE block cache so blocks recompile with per-op
-	// verify hooks; the first miscompiling guest instruction logs "@@EEDIFF@@ ... DIVERGE".
-	// Off by default = zero overhead / normal speed. Debug tool only — heavy slowdown when on.
-	public static native void setEeDiffVerify(boolean enabled);
+	// ADPF (PerformanceHintManager): hint the OS to clock the EE/GS threads' cores up toward
+	// the frame deadline instead of the DVFS governor under-clocking emulation. Applies live;
+	// no-op below API 33. Persisted app-side (pref "ui.adpf") and re-applied at startup.
+	public static native void setAdpfEnabled(boolean enabled);
 
 	/** Real state of the diagnostic flag (the UI toggle must not keep its own copy). */
 	public static native boolean isEeDiffVerify();
@@ -154,6 +154,10 @@ public class NativeApp {
 	 */
 	public static native void commitSettings();
 
+	/** Diagnostic: write a line to the native emulog (Console) so it shows in the in-app
+	 *  Save Log export. Used by the Joy-Con input diagnostic; no-ops if the console isn't open. */
+	public static native void emulog(String msg);
+
 	/**
 	 * Live GS-only reconfigure for a running VM. Reloads the whole EmuCore/GS
 	 * section from the base settings layer and pushes it to the GS thread via
@@ -178,6 +182,8 @@ public class NativeApp {
 	public static native String getGameSerial();
 	public static native String getGameCRC();
 	public static native float getFPS();
+	/** Current game's nominal emulated refresh (~59.94 NTSC / 50 PAL), or 0 without a VM. */
+	public static native float getNominalFrameRate();
 
 	/** Build version string from BuildVersion::GitRev — formatted as
 	 *  "GitTagHi.GitTagMid.GitTagLo.ARMSX2Build-SNAPSHOT". Used by the
@@ -193,6 +199,13 @@ public class NativeApp {
 	 *  in the C++ side for the schema. Returns the empty-state payload
 	 *  (active=false, items=[]) when no game is loaded or not logged in. */
 	public static native String getAchievementsJSON();
+
+	/** RetroAchievements hash for a disc image, computed without booting it — the key used to look a
+	 *  game up in RA's game list so the library can show progress for games never played. Empty
+	 *  string if the image is unreadable, has no PS2 boot ELF, or a VM is currently running (it
+	 *  repoints the global CDVD, so it declines rather than disturb a live game). Reads the disc:
+	 *  call off the UI thread. */
+	public static native String getAchievementsHashForPath(String imagePath);
 
 	/** Live RetroAchievements rich-presence string. Recomputed every
 	 *  second on the native side from the game's RAM. Empty when no game,
@@ -228,6 +241,8 @@ public class NativeApp {
 	 *  Persists + applies live; current values are reported in
 	 *  {@link #getAchievementsJSON}. */
 	public static native void setAchievementsOption(String key, boolean enabled);
+
+	public static native void setAchievementsOptionInt(String key, int value);
 
 	// Custom achievement-unlock sound. `path` is an app-private absolute file the
 	// MediaPlayer can read; an empty string clears it back to the bundled default.
@@ -288,6 +303,11 @@ public class NativeApp {
 	 *  PCSX2's desktop UI). Stream: gameIniBeginWrite() once, gameIniPut() per
 	 *  override key, gameIniCommitWrite() to save (or delete when empty). */
 	public static native boolean gameIniBeginWrite();
+	/** VM-less variant of {@link #gameIniBeginWrite()}: targets a game's INI by serial (globbing
+	 *  gamesettings/&lt;serial&gt;_*.ini) when nothing is running, so a per-game Reset from the
+	 *  library can still clear a stale, in-game-written override file. Returns false when no such
+	 *  file exists — there is then nothing to rewrite and the caller should skip the put/commit. */
+	public static native boolean gameIniBeginWriteForSerial(String serial);
 	public static native void gameIniPut(String section, String key, String value);
 	public static native boolean gameIniCommitWrite();
 
@@ -375,8 +395,17 @@ public class NativeApp {
 	private static final java.util.Set<android.media.MediaPlayer> sActiveSounds =
 			java.util.Collections.synchronizedSet(new java.util.HashSet<>());
 
+	/** Volume (0..1) for RA unlock / info / leaderboard-submit sounds. Set from Kotlin
+	 *  (AchievementsViewModel.setSoundVolume) so a slider tames the effect without editing the
+	 *  .wav. 1.0 = the sound as authored. */
+	public static volatile float sSoundVolume = 1.0f;
+
 	public static void playSound(String path) {
 		if (path == null || path.isEmpty()) return;
+		// An RA sound means the set just changed state, so re-read the counts now rather than waiting
+		// for the slow poll — this is what makes the library's progress figure move as you play.
+		// Off-thread because it builds and parses the set JSON, and this call is on the emu thread.
+		new Thread(com.armsx2.AchievementsProgress::snapshotCurrentGame, "ach-progress").start();
 		// Cap concurrent players — a burst of simultaneous unlocks (combo/milestone) could
 		// otherwise exhaust the device's MediaPlayer/codec pool and make start() no-op.
 		if (sActiveSounds.size() >= 4) return;
@@ -385,7 +414,11 @@ public class NativeApp {
 			try {
 				mp = new android.media.MediaPlayer();
 				mp.setAudioAttributes(new android.media.AudioAttributes.Builder()
-						.setUsage(android.media.AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+						// USAGE_GAME, not ASSISTANCE_SONIFICATION: the unlock jingle is game audio and
+						// must play on the media/game path. SONIFICATION is a UI/system-feedback usage
+						// that Do Not Disturb silences — which is why cheevo sounds went quiet with DND
+						// on. Game/media audio is exempt from DND, so this plays regardless.
+						.setUsage(android.media.AudioAttributes.USAGE_GAME)
 						.setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
 						.build());
 				mp.setDataSource(path);
@@ -393,6 +426,7 @@ public class NativeApp {
 				mp.setOnErrorListener((m, what, extra) -> { sActiveSounds.remove(m); try { m.release(); } catch (Throwable ignore) {} return true; });
 				sActiveSounds.add(mp);
 				mp.prepare();
+				mp.setVolume(sSoundVolume, sSoundVolume);
 				mp.start();
 			} catch (Throwable t) {
 				if (mp != null) { sActiveSounds.remove(mp); try { mp.release(); } catch (Throwable ignore) {} }
@@ -445,9 +479,16 @@ public class NativeApp {
 		}
 	}
 
+	/** User-set haptic strength multiplier (0..2, default 1.0 = as authored). Scales EVERY
+	 *  vibration — controller rumble AND touch ticks both funnel through rumbleOne — so one
+	 *  "Vibration Strength" slider tames or boosts all of it. Set from Kotlin
+	 *  (ControllerMappings.setHapticIntensity) live and at app start. */
+	public static volatile float sHapticScale = 1.0f;
+
 	/** @return true if [v] is a real, usable vibrator that was driven (or cancelled). */
 	private static boolean rumbleOne(Vibrator v, float intensity, int ms) {
 		if (v == null || !v.hasVibrator()) return false;
+		intensity *= sHapticScale;
 		if (intensity <= 0f) {
 			try { v.cancel(); } catch (Throwable ignored) {}
 			return true;
@@ -557,6 +598,9 @@ public class NativeApp {
 	public static native void setAspectRatio(int type);
 	public static native void setFmvAspectRatio(int type);
 	public static native void speedhackLimitermode(int value);
+	/** Fast-forward speed multiplier (Turbo scalar, 0.05-10.0). Set before engaging
+	 *  Turbo (speedhackLimitermode(1)); the FF-speed slider uses Unlimited (mode 3) at its top. */
+	public static native void setTurboScalar(float scalar);
 	/** Custom speed / FPS cap as a percent of native (100 = full speed).
 	 *  Applies live to the running VM's frame pacer. */
 	public static native void setNominalSpeed(int percent);
@@ -571,6 +615,14 @@ public class NativeApp {
 	/** Frame skip: present 1 frame, skip the next N (0 = off). Display-only
 	 *  throttle; applies live. */
 	public static native void setFrameSkip(int skip);
+
+	/** GitHub #375: top-align the render in portrait (true) vs vertical-center (false). */
+	public static native void setPortraitRenderTop(boolean top);
+
+	/** Pixels to keep clear at the top of a PORTRAIT render for a punch-hole/notch camera. Taken
+	 *  from the window's display cutout; 0 on devices without one. Only affects portrait
+	 *  top-aligned output. */
+	public static native void setPortraitRenderTopInset(int pixels);
 	/** SPU2 output volume, percent (0..200). Applies live + persists. */
 	public static native void setAudioVolume(int volume);
 	/** Mute/unmute SPU2 output. Applies live + persists. */
@@ -590,6 +642,11 @@ public class NativeApp {
 	public static native void renderOpenGL();
 	public static native void renderVulkan();
 	public static native void renderAuto();
+	// When true, the Auto renderer resolves to Vulkan HW instead of OpenGL (set for Adreno devices).
+	public static native void setPreferVulkan(boolean enabled);
+	/** Affinity Control Mode: 0 off (scheduler decides), 1-6 EE/VU/GS priority orders,
+	 *  7 Performance Cores. Read when the VM boots — set it before runVMThread. */
+	public static native void setAffinityMode(int mode);
 	public static native void renderPreloading(int value);
 
 	/** Flip texture dumping on/off live (PCSX2's ToggleTextureDumping hotkey).
@@ -609,6 +666,10 @@ public class NativeApp {
 	public static native boolean runVMThread(String path);
 	public static native void pause();
 	public static native void resume();
+	// Keep the audio device alive across a menu/overlay pause (no reclaim, no
+	// resume rebuild). Set true right before pauseForOverlay's pause(); resume()
+	// clears it. See native setOutputPauseSuppressed / SPU2::SetOutputPauseSuppressed.
+	public static native void setOutputPauseSuppressed(boolean suppressed);
 	public static native void shutdown();
 	public static native boolean hasActiveVM();
 
@@ -618,29 +679,6 @@ public class NativeApp {
 	 *  the cache before Android can reap the process. Safe to call when no
 	 *  Vulkan device is active (becomes a no-op). */
 	public static native void flushShaderCache();
-
-	/** Runs ARM64 codegen tests and prints PASS/FAIL to logcat (tag: ARM64CodegenTest). */
-	public static native void runCodegenTests();
-
-	/** Runs Patch::ApplyPatches tests and prints PASS/FAIL to logcat (tag: PatchTests). */
-	public static native void runPatchTests();
-
-	/** Runs microVU JIT integer-instruction tests and prints PASS/FAIL to logcat (tag: VuJitTests). */
-	public static native void runVuJitTests();
-
-	/** Runs R5900 EE interpreter instruction tests and prints PASS/FAIL to logcat (tag: EeJitTests). */
-	public static native void runEeJitTests();
-
-	/** Runs VIF UNPACK C++ template tests and prints PASS/FAIL to logcat (tag: VifTests). */
-	public static native void runVifTests();
-
-	/** Runs EE multi-instruction sequence tests and prints PASS/FAIL to logcat (tag: EeSeqTests). */
-	public static native void runEeSeqTests();
-
-	/** Called from native when a test suite finishes.  Override or observe to surface results in UI. */
-	public static void onTestResults(String label, int passed, int total) {
-		MainActivityRuntime.Companion.onTestResults(new TestResult(label, passed, total));
-	}
 
 	/**
 	 * Probe a file descriptor for PS2 BIOS metadata. Used by the setup
@@ -684,6 +722,9 @@ public class NativeApp {
 	public static native String getTitlesForSerial(String serial);
 
 	public static native boolean saveStateToSlot(int slot);
+	/** True while the emulated memory card is mid-write, when a state save is refused to protect
+	 *  the card. The counter only ticks down while the VM runs, so it does NOT clear while paused. */
+	public static native boolean isMemcardBusy();
 	public static native boolean loadStateFromSlot(int slot);
 	public static native String getGamePathSlot(int slot);
 	public static native byte[] getImageSlot(int slot);
@@ -712,6 +753,11 @@ public class NativeApp {
 	// once the renderer is actually presenting — otherwise the restored frame never reaches the
 	// surface and the screen stays black.
 	public static native int getPresentedFrameCount();
+
+	// Discord lives in the :discord process now, not in emucore — see
+	// com.armsx2.discord.DiscordNative. ARMSX2 is GPL-3.0+ and the Social SDK is proprietary, so
+	// the two are kept as separate programs talking over IPC rather than one linked binary.
+	// Re-declaring those natives here would not link: emucore does not contain them.
 
 	public static void vmSetPaused(boolean paused) {
 		new Handler(Looper.getMainLooper()).post(() -> {
@@ -761,6 +807,26 @@ public class NativeApp {
 			if (dir.isDirectory()) return true;
 			dir.mkdirs();
 			return dir.isDirectory();
+		} catch (Throwable t) {
+			return false;
+		}
+	}
+
+	// Fallback file creation for native FileSystem::OpenCFile. On Android 11+
+	// FUSE-emulated external storage a raw libc fopen(O_CREAT) can be denied
+	// (EACCES/EPERM) even though the Java File API succeeds — the same split that
+	// forced createDirectoryPath above. Creating the empty file here lets the
+	// native truncating write ("w"/"wb") that follows open the now-existing file,
+	// which FUSE permits — which is what makes NEW folder-card saves work on a
+	// custom data folder instead of crashing. Returns true if the file exists after.
+	public static boolean createFilePath(String path) {
+		if (path == null || path.isEmpty()) return false;
+		try {
+			java.io.File file = new java.io.File(path);
+			if (file.isFile()) return true;
+			java.io.File parent = file.getParentFile();
+			if (parent != null && !parent.isDirectory()) parent.mkdirs();
+			return file.createNewFile() || file.isFile();
 		} catch (Throwable t) {
 			return false;
 		}

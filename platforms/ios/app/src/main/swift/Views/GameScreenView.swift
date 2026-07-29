@@ -8,6 +8,25 @@ import GameController
 private let runtimeMenuStateChangedNotification = Notification.Name("ARMSX2iOSRuntimeMenuStateChanged")
 private let retroAchievementsToastNotification = Notification.Name("ARMSX2RetroAchievementsNotification")
 
+private extension View {
+    func gameplayLaunchChrome(visible: Bool) -> some View {
+        opacity(visible ? 1 : 0)
+            .allowsHitTesting(visible)
+            .accessibilityHidden(!visible)
+            .animation(.easeOut(duration: 0.30), value: visible)
+    }
+}
+
+private enum EmulationOnlyNativeReleaseFlag {
+    // Keep these bit positions synchronized with VMManager.h.
+    static let patches: UInt = 1 << 0
+    static let discordPresence: UInt = 1 << 1
+    static let pine: UInt = 1 << 2
+    static let achievements: UInt = 1 << 3
+    static let inputRecording: UInt = 1 << 4
+    static let osd: UInt = 1 << 5
+}
+
 private struct RetroAchievementsToast: Equatable {
     let title: String
     let message: String
@@ -81,13 +100,125 @@ private enum OverlayRoute: Equatable {
     case pausedPresenting(QuickMenuDestination)
 }
 
+/// Gameplay presentation used after Emulation-Only Mode finishes startup cleanup.
+/// With every release switch enabled, this keeps only the existing Metal surface.
+struct EmulationOnlyGameView: View {
+    @State private var appState = AppState.shared
+    @State private var dynamicSettings = DynamicThumbstickSettings.shared
+    @State private var touchActionSession = VirtualPadTouchActionSession()
+
+    @ViewBuilder
+    var body: some View {
+        if appState.emulationOnlyPresentation == .minimal {
+            MetalGameView()
+                .ignoresSafeArea()
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Game display")
+                .accessibilityAddTraits(.isImage)
+                .persistentSystemOverlays(.hidden)
+                .onAppear(perform: preparePresentation)
+                .onDisappear(perform: releasePresentation)
+        } else {
+            retainedGameplayView
+                .persistentSystemOverlays(.hidden)
+                .onAppear(perform: preparePresentation)
+                .onDisappear(perform: releasePresentation)
+        }
+    }
+
+    private var retainedGameplayView: some View {
+        GeometryReader { geometry in
+            let isLandscape = geometry.size.width > geometry.size.height
+
+            Group {
+                if appState.emulationOnlyPresentation.showsVirtualControls && !isLandscape {
+                    VStack(spacing: 0) {
+                        let gameHeight = min(geometry.size.width * 3 / 4, geometry.size.height * 0.6)
+                        accessibleMetalSurface
+                            .frame(height: gameHeight)
+                            .clipped()
+                            .overlay { dynamicCrosshairOverlay }
+
+                        ZStack {
+                            Color.black
+                            retainedVirtualControls(isLandscape: false)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                    .ignoresSafeArea(.container, edges: .bottom)
+                } else {
+                    ZStack {
+                        accessibleMetalSurface
+                        if appState.emulationOnlyPresentation.showsVirtualControls {
+                            retainedVirtualControls(isLandscape: true)
+                        }
+                        dynamicCrosshairOverlay
+                    }
+                    .ignoresSafeArea()
+                }
+            }
+        }
+    }
+
+    private var accessibleMetalSurface: some View {
+        MetalGameView()
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Game display")
+            .accessibilityAddTraits(.isImage)
+    }
+
+    private func retainedVirtualControls(isLandscape: Bool) -> some View {
+        VirtualControllerView(
+            isLandscape: isLandscape,
+            layoutSnapshot: appState.emulationOnlyPresentation.padLayoutSnapshot,
+            skinDescriptor: appState.emulationOnlyPresentation.padSkinDescriptor,
+            touchActionSession: touchActionSession
+        )
+        .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
+    }
+
+    private var dynamicCrosshairOverlay: some View {
+        DynamicAimCrosshairOverlay(
+            settings: dynamicSettings,
+            leftRuntime: touchActionSession.left.crosshairState,
+            rightRuntime: touchActionSession.right.crosshairState
+        )
+        .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
+    }
+
+    private func preparePresentation() {
+        appState.hideStatusBar = true
+        appState.hideHomeIndicator = true
+        UIApplication.shared.isIdleTimerDisabled = true
+
+        // GameScreenView's onDisappear can run later in the same SwiftUI update.
+        // Reassert the retained presentation state after that teardown completes.
+        DispatchQueue.main.async {
+            guard appState.isEmulationOnlyMode else { return }
+            appState.hideStatusBar = true
+            appState.hideHomeIndicator = true
+            UIApplication.shared.isIdleTimerDisabled = true
+        }
+    }
+
+    private func releasePresentation() {
+        if case .menu = appState.currentScreen {
+            appState.hideStatusBar = false
+            appState.hideHomeIndicator = false
+        }
+        UIApplication.shared.isIdleTimerDisabled = false
+    }
+}
+
 struct GameScreenView: View {
     // MARK: - State & Constants
 
     @State private var appState = AppState.shared
     @State private var settings = SettingsStore.shared
+    @State private var dynamicSettings = DynamicThumbstickSettings.shared
     @State private var layoutPresets = PadLayoutPresetStore.shared
     @State private var skinLibrary = VPadSkinLibraryStore.shared
+    @State private var touchActionSession = VirtualPadTouchActionSession()
     @State private var userVirtualPadVisible = true
     @State private var externalControllerConnected = false
     @State private var fullScreen = false
@@ -122,6 +253,13 @@ struct GameScreenView: View {
     // from SDL/core. Started when the menu is hidden during gameplay, stopped on restore.
     @State private var menuRestorePollTimer: Timer?
     @State private var lastControllerInputActive = false
+    // Orientation, read from the body GeometryReader. The overlay containers
+    // (pause menu, per-game settings) aren't re-measured on rotation, so we
+    // key them on this to force a fresh layout on a flip.
+    @State private var screenIsLandscape = true
+    @State private var emulationOnlyTransitionTask: Task<Void, Never>?
+    @State private var emulationOnlyActivationInFlight = false
+    @State private var pendingEmulationOnlyPresentation: EmulationOnlyPresentation?
 
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -180,7 +318,6 @@ struct GameScreenView: View {
                         clearCurrentGameCache()
                     },
                     onBackToMenu: {
-                        overlayRoute = .hidden
                         appState.returnToMenu()
                     },
                     onResume: {
@@ -213,11 +350,15 @@ struct GameScreenView: View {
                             VirtualControllerView(
                                 isLandscape: true,
                                 layoutSnapshot: effectivePadLayoutSnapshot,
-                                skinDescriptor: effectivePadSkinDescriptor
+                                skinDescriptor: effectivePadSkinDescriptor,
+                                touchActionSession: touchActionSession
                             )
                             .id(padRebuildToken)
+                            .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
                         }
+                        dynamicCrosshairOverlay
                         menuButtonOverlay(isLandscape: true)
+                            .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
                     }
                     .ignoresSafeArea()
                 } else {
@@ -234,16 +375,23 @@ struct GameScreenView: View {
                             .accessibilityLabel("Game display")
                             .accessibilityAddTraits(.isImage)
                             .accessibilityHint("VoiceOver image recognition can read on-screen text.")
-                            .overlay { AccessibilityHUDMirror() }
+                            .overlay {
+                                ZStack {
+                                    AccessibilityHUDMirror()
+                                    dynamicCrosshairOverlay
+                                }
+                            }
 
                         if effectiveVirtualPadVisible {
                             ZStack {
                                 Color.black
                                 VirtualControllerView(
                                     layoutSnapshot: effectivePadLayoutSnapshot,
-                                    skinDescriptor: effectivePadSkinDescriptor
+                                    skinDescriptor: effectivePadSkinDescriptor,
+                                    touchActionSession: touchActionSession
                                 )
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
                             }
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .id(padRebuildToken)
@@ -254,6 +402,7 @@ struct GameScreenView: View {
                             menuButton()
                                 .padding(.top, 8)
                                 .padding(.trailing, 4)
+                                .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
                         }
                     }
                     .ignoresSafeArea(.container, edges: .bottom)
@@ -261,7 +410,14 @@ struct GameScreenView: View {
             }
             .preference(key: GameScreenSizePreferenceKey.self, value: geo.size)
         }
-        .onPreferenceChange(GameScreenSizePreferenceKey.self) { _ in
+        .onPreferenceChange(GameScreenSizePreferenceKey.self) { size in
+            // The body GeometryReader is re-measured on rotation; the overlay
+            // subtrees aren't, so track orientation here and .id() the overlay
+            // containers off it to rebuild them with the new size.
+            let landscape = size.width > size.height
+            if screenIsLandscape != landscape {
+                screenIsLandscape = landscape
+            }
             syncFullscreenStateFromWindow()
         }
         .sheet(isPresented: childPresentedBinding(.saveStates)) {
@@ -315,10 +471,15 @@ struct GameScreenView: View {
                 GameOverlayContainer(safeAreaInsets: displaySafeAreaEdgeInsets, frameMode: .landscapePanel) { _ in
                     runtimePerGameSettingsContent
                 }
+                .id(screenIsLandscape)
             }
         }
         .overlay {
+            // Rebuild the overlay on a flip so its GeometryReader re-measures;
+            // otherwise the pause menu keeps the stale landscape size and squishes.
+            // Instant swap (no overlayRoute change, no animation).
             pauseMenuOverlay
+                .id(screenIsLandscape)
         }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: overlayRoute)
         .alert(settings.localized("Reset ROM?"), isPresented: childPresentedBinding(.resetROM)) {
@@ -330,6 +491,15 @@ struct GameScreenView: View {
             Text(settings.localized("Restart the current game? Unsaved progress will be lost."))
         }
         .onAppear {
+            let nativeEmulationOnlyMode = ARMSX2Bridge.isEmulationOnlyModeActive()
+            // Returning to the same stripped VM must not recreate services that
+            // Emulation-Only Mode already released.
+            if !appState.isEmulationOnlyMode && nativeEmulationOnlyMode {
+                restoreEmulationOnlyPresentation()
+            } else if !appState.isEmulationOnlyMode {
+                FrameTimeDynamicResolutionController.shared.resumeAfterEmulationOnlyMode()
+                GameEventHaptics.shared.prepareForGameplaySession()
+            }
             enterGameplaySystemChromeMode()
             syncFullscreenStateFromWindow()
             applyInitialFullscreenPreference()
@@ -337,8 +507,10 @@ struct GameScreenView: View {
             refreshRuntimeMenuState()
             consumePendingRetroAchievementsToast()
             startMenuRestorePollingIfNeeded()
+            enterEmulationOnlyModeIfReady()
         }
         .onDisappear {
+            cancelEmulationOnlyTransition()
             statusBanner.cancelDismiss()
             achievementsBanner.cancelDismiss()
             stopMenuRestorePolling()
@@ -384,11 +556,31 @@ struct GameScreenView: View {
                 stopMenuRestorePolling()
             }
         }
+        .onChange(of: settings.emulationOnlyModeEnabled) { _, isEnabled in
+            if isEnabled {
+                enterEmulationOnlyModeIfReady()
+            } else {
+                cancelEmulationOnlyTransition()
+            }
+        }
+        .onChange(of: appState.emulationOnlyStartupReady) { _, isReady in
+            if isReady {
+                enterEmulationOnlyModeIfReady()
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: runtimeMenuStateChangedNotification)) { _ in
             refreshRuntimeMenuState()
         }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: AppState.emulationOnlyResourcesReleasedNotification
+            )
+        ) { _ in
+            finishEmulationOnlyActivation()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidConnect)) { _ in
             refreshExternalControllerConnectionState()
+            enterEmulationOnlyModeIfReady()
         }
         .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidDisconnect)) { _ in
             refreshExternalControllerConnectionState()
@@ -398,9 +590,8 @@ struct GameScreenView: View {
             padRebuildToken &+= 1
             overlayRoute = .paused
         }
-        .onReceive(NotificationCenter.default.publisher(for: retroAchievementsToastNotification)) { notification in
-            _ = ARMSX2Bridge.consumePendingRetroAchievementsNotification()
-            presentRetroAchievementsToast(notification)
+        .onReceive(NotificationCenter.default.publisher(for: retroAchievementsToastNotification)) { _ in
+            consumePendingRetroAchievementsToast()
         }
         .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
             refreshRuntimeMenuState()
@@ -434,6 +625,153 @@ struct GameScreenView: View {
         }
         .accessibilityLabel(settings.localized("Pause Menu"))
         .accessibilityHint(settings.localized("Opens the pause menu"))
+    }
+
+    @MainActor
+    private func enterEmulationOnlyModeIfReady() {
+        guard settings.emulationOnlyModeEnabled,
+              appState.emulationOnlyStartupReady,
+              !appState.isEmulationOnlyMode,
+              ARMSX2Bridge.isVMRunning(),
+              emulationOnlyTransitionTask == nil,
+              !emulationOnlyActivationInFlight
+        else {
+            return
+        }
+
+        let delaySeconds = settings.emulationOnlyModeDelaySeconds
+        guard delaySeconds > 0 else {
+            activateEmulationOnlyModeIfReady()
+            return
+        }
+
+        emulationOnlyTransitionTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled else { return }
+            emulationOnlyTransitionTask = nil
+            activateEmulationOnlyModeIfReady()
+        }
+    }
+
+    @MainActor
+    private func activateEmulationOnlyModeIfReady() {
+        guard settings.emulationOnlyModeEnabled,
+              appState.emulationOnlyStartupReady,
+              !appState.isEmulationOnlyMode,
+              ARMSX2Bridge.isVMRunning(),
+              !emulationOnlyActivationInFlight
+        else {
+            return
+        }
+
+        pendingEmulationOnlyPresentation = makeEmulationOnlyPresentation()
+        emulationOnlyActivationInFlight = true
+        ARMSX2Bridge.releaseNonEmulationResources(emulationOnlyNativeReleaseFlags)
+    }
+
+    @MainActor
+    private func restoreEmulationOnlyPresentation() {
+        guard ARMSX2Bridge.isVMRunning(),
+              ARMSX2Bridge.isEmulationOnlyModeActive(),
+              !appState.isEmulationOnlyMode
+        else {
+            return
+        }
+
+        pendingEmulationOnlyPresentation = makeEmulationOnlyPresentation()
+        emulationOnlyActivationInFlight = true
+        finishEmulationOnlyActivation()
+    }
+
+    @MainActor
+    private func makeEmulationOnlyPresentation() -> EmulationOnlyPresentation {
+        let hasExternalController = !GCController.controllers().isEmpty
+        let keepsVirtualControls =
+            !hasExternalController ||
+            (!settings.emulationOnlyDisableVirtualControls && effectiveVirtualPadVisible)
+        let keepsQuickMenu = !settings.emulationOnlyDisableQuickMenu
+        return EmulationOnlyPresentation(
+            showsVirtualControls: keepsVirtualControls,
+            showsQuickMenu: keepsQuickMenu,
+            padLayoutSnapshot: keepsVirtualControls ? effectivePadLayoutSnapshot : nil,
+            padSkinDescriptor: keepsVirtualControls ? effectivePadSkinDescriptor : nil
+        )
+    }
+
+    @MainActor
+    private func finishEmulationOnlyActivation() {
+        guard emulationOnlyActivationInFlight,
+              let presentation = pendingEmulationOnlyPresentation
+        else {
+            return
+        }
+
+        emulationOnlyActivationInFlight = false
+        pendingEmulationOnlyPresentation = nil
+        guard ARMSX2Bridge.isVMRunning(),
+              appState.emulationOnlyStartupReady
+        else {
+            return
+        }
+
+        overlayRoute = .hidden
+        if presentation.showsQuickMenu {
+            menuButtonHidden = false
+        }
+        statusBanner.cancelDismiss()
+        achievementsBanner.cancelDismiss()
+        stopMenuRestorePolling()
+
+        runtimePerGameSettingsEntry = nil
+        runtimePerGameSettings = nil
+        runtimePadLayoutIdentity = nil
+
+        if !presentation.showsVirtualControls {
+            ARMSX2VirtualPadMaskImageCache.releaseForEmulationOnlyMode()
+            HapticManager.releaseForEmulationOnlyMode()
+        }
+        GameEventHaptics.shared.releaseForEmulationOnlyMode()
+        PatchStore.shared.releasePresentationResources()
+        if settings.emulationOnlyClearNetworkCache {
+            URLCache.shared.removeAllCachedResponses()
+        }
+        if settings.emulationOnlyDisableFramePacing {
+            FrameTimeDynamicResolutionController.shared.suspendForEmulationOnlyMode()
+        }
+
+        ARMSX2Bridge.setVMPaused(false)
+        appState.enterEmulationOnlyMode(presentation: presentation)
+    }
+
+    @MainActor
+    private func cancelEmulationOnlyTransition() {
+        emulationOnlyTransitionTask?.cancel()
+        emulationOnlyTransitionTask = nil
+    }
+
+    private var emulationOnlyNativeReleaseFlags: UInt {
+        var flags: UInt = 0
+        if settings.emulationOnlyDisablePatches { flags |= EmulationOnlyNativeReleaseFlag.patches }
+        if settings.emulationOnlyDisableDiscordPresence { flags |= EmulationOnlyNativeReleaseFlag.discordPresence }
+        if settings.emulationOnlyDisablePINE { flags |= EmulationOnlyNativeReleaseFlag.pine }
+        if settings.emulationOnlyDisableRetroAchievements { flags |= EmulationOnlyNativeReleaseFlag.achievements }
+        if settings.emulationOnlyDisableInputRecording { flags |= EmulationOnlyNativeReleaseFlag.inputRecording }
+        if settings.emulationOnlyDisableOSD { flags |= EmulationOnlyNativeReleaseFlag.osd }
+        return flags
+    }
+
+    private var dynamicCrosshairOverlay: some View {
+        DynamicAimCrosshairOverlay(
+            settings: dynamicSettings,
+            leftRuntime: touchActionSession.left.crosshairState,
+            rightRuntime: touchActionSession.right.crosshairState
+        )
+        .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
     }
 
     @ViewBuilder
@@ -554,8 +892,13 @@ struct GameScreenView: View {
     }
 
     private func leaveGameplaySystemChromeMode() {
-        appState.hideHomeIndicator = previousHideHomeIndicator
-        appState.hideStatusBar = previousHideStatusBar
+        if case .menu = appState.currentScreen {
+            appState.hideHomeIndicator = false
+            appState.hideStatusBar = false
+        } else {
+            appState.hideHomeIndicator = previousHideHomeIndicator
+            appState.hideStatusBar = previousHideStatusBar
+        }
         // Allow the screen to auto-sleep again once gameplay ends.
         UIApplication.shared.isIdleTimerDisabled = false
     }
@@ -728,7 +1071,7 @@ struct GameScreenView: View {
         if gameMenuAvailable != gameReady {
             gameMenuAvailable = gameReady
         }
-        let identity = runtimePadLayoutIdentityForCurrentGame()
+        let identity = gameReady ? runtimePadLayoutIdentityForCurrentGame() : nil
         if runtimePadLayoutIdentity != identity {
             runtimePadLayoutIdentity = identity
         }
@@ -746,6 +1089,14 @@ struct GameScreenView: View {
     private func currentRuntimeGameName() -> String? {
         if let gameName = normalizedRuntimeGameName(appState.runningGameName) {
             return gameName
+        }
+
+        // A BIOS-only session has no game identity. Avoid falling through to the
+        // library-matching path, which synchronously opens every local disc image.
+        // Once a disc is inserted, gameMenuAvailable becomes true and the normal
+        // game-name resolution path resumes.
+        if appState.runningGameName == "BIOS" && !gameMenuAvailable {
+            return nil
         }
 
         if let gameName = normalizedRuntimeGameName(ARMSX2Bridge.currentGameISOName()) {
@@ -1003,32 +1354,34 @@ struct GameScreenView: View {
         presentStatusMessage("OSD: \(label)")
     }
 
-    private func presentRetroAchievementsToast(_ notification: Notification) {
-        if (notification.userInfo?["handledByUIKit"] as? Bool) == true {
-            return
-        }
-
-        let title = ((notification.userInfo?["title"] as? String) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    private func presentRetroAchievementsToast(
+        title rawTitle: String,
+        message rawMessage: String,
+        badgePath rawBadgePath: String,
+        duration: TimeInterval?
+    ) {
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { return }
 
-        let message = ((notification.userInfo?["message"] as? String) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let badgePathValue = ((notification.userInfo?["badgePath"] as? String) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let badgePathValue = rawBadgePath.trimmingCharacters(in: .whitespacesAndNewlines)
         let toast = RetroAchievementsToast(
             title: title,
             message: message,
             badgePath: badgePathValue.isEmpty ? nil : badgePathValue
         )
 
-        achievementsBanner.present(toast)
+        achievementsBanner.present(toast, displayDuration: duration)
     }
 
     private func consumePendingRetroAchievementsToast() {
-        guard let userInfo = ARMSX2Bridge.consumePendingRetroAchievementsNotification(), !userInfo.isEmpty else { return }
-        let notificationUserInfo = Dictionary(uniqueKeysWithValues: userInfo.map { (AnyHashable($0.key), $0.value) })
-        presentRetroAchievementsToast(Notification(name: retroAchievementsToastNotification, object: nil, userInfo: notificationUserInfo))
+        guard let pending = ARMSX2Bridge.consumePendingRetroAchievementsNotification() else { return }
+        presentRetroAchievementsToast(
+            title: pending.title,
+            message: pending.message,
+            badgePath: pending.badgePath,
+            duration: pending.duration > 0 ? pending.duration : nil
+        )
     }
 
     private func presentImportantStatusMessage(_ message: String) {
@@ -1038,7 +1391,12 @@ struct GameScreenView: View {
     // MARK: - Virtual Pad
 
     private var effectiveVirtualPadVisible: Bool {
-        userVirtualPadVisible && (!settings.autoHideVirtualPadWhenControllerConnected || !externalControllerConnected) && overlayRoute != .pausedPresenting(.padLayout)
+        if appState.isEmulationOnlyMode {
+            return appState.emulationOnlyPresentation.showsVirtualControls
+        }
+        return userVirtualPadVisible &&
+            (!settings.autoHideVirtualPadWhenControllerConnected || !externalControllerConnected) &&
+            overlayRoute != .pausedPresenting(.padLayout)
     }
 
     private var effectivePadLayoutSnapshot: PadLayoutSnapshot? {
@@ -1553,52 +1911,6 @@ private struct SpeedControlPanel: View {
                     }
                 }
 
-                Section(settings.localized("Frame Limiter")) {
-                    Toggle(settings.localized("Enable Limiter"), isOn: Binding(
-                        get: { settings.frameLimiterEnabled },
-                        set: { enabled in
-                            settings.frameLimiterEnabled = enabled
-                            enforceHardcoreSpeedFloorIfNeeded()
-                        }
-                    ))
-
-                    if settings.frameLimiterEnabled {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Text(settings.localized("FPS Target"))
-                                Spacer()
-                                Text(Self.formatFPS(settings.targetFPS))
-                                    .foregroundStyle(.secondary)
-                                    .font(.callout.monospacedDigit())
-                            }
-
-                            Slider(
-                                value: Binding(
-                                    get: { settings.targetFPS },
-                                    set: { value in
-                                        settings.targetFPS = value
-                                        enforceHardcoreSpeedFloorIfNeeded()
-                                    }
-                                ),
-                                in: SettingsStore.minTargetFPS...SettingsStore.maxTargetFPS,
-                                step: 1.0
-                            )
-
-                            HStack {
-                                quickTargetButton(30)
-                                quickTargetButton(45)
-                                quickTargetButton(60)
-                                quickTargetButton(90)
-                                quickTargetButton(120)
-                            }
-                        }
-                    } else {
-                        Text(settings.localized("Limiter is OFF. Games can run above normal speed and may draw more power."))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
                 if hardcoreActive {
                     Section(settings.localized("Hardcore Mode")) {
                         Text(settings.localized("Hardcore mode blocks slowdown and frame advance. Fast forward stays available; Normal Speed is locked at 100% or higher."))
@@ -1658,25 +1970,6 @@ private struct SpeedControlPanel: View {
         }
         .buttonStyle(.bordered)
         .font(.caption.monospacedDigit())
-    }
-
-    private func quickTargetButton(_ fps: Float) -> some View {
-        Button(Self.formatCompactFPS(fps)) {
-            settings.frameLimiterEnabled = true
-            settings.targetFPS = fps
-            enforceHardcoreSpeedFloorIfNeeded()
-        }
-        .disabled(hardcoreActive && fps < settings.ntscFramerate)
-        .buttonStyle(.bordered)
-        .font(.caption.monospacedDigit())
-    }
-
-    private static func formatFPS(_ value: Float) -> String {
-        String(format: "%.0f FPS", value)
-    }
-
-    private static func formatCompactFPS(_ value: Float) -> String {
-        String(format: "%.0f", value)
     }
 
     private static func formatPercent(_ scalar: Float) -> String {

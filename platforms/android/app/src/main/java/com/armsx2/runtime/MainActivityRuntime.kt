@@ -40,10 +40,6 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.nativeKeyCode
-import androidx.compose.ui.input.key.onKeyEvent
-import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -58,8 +54,8 @@ import com.armsx2.EmuState
 import com.armsx2.FilenameParser
 import com.armsx2.GameInfo
 import com.armsx2.PlayTime
-import com.armsx2.events.TestResult
 import com.armsx2.input.ControllerMappings
+import com.armsx2.input.SoftKeyboard
 import com.armsx2.runtime.MainActivityRuntime.Companion.internalBiosDir
 import com.armsx2.runtime.MainActivityRuntime.Companion.romsDirs
 import com.armsx2.ui.Colors
@@ -68,7 +64,11 @@ import com.armsx2.ui.WindowImpl
 import compose.icons.LineAwesomeIcons
 import compose.icons.lineawesomeicons.Android
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 import kr.co.iefriends.pcsx2.MainActivity
 import kr.co.iefriends.pcsx2.NativeApp
@@ -116,13 +116,6 @@ private const val NAV_REPEAT_INTERVAL_MS = 110L
 // emit two codes per button) rather than a deliberate modifier+key combo.
 // A real combo is a held first button + a later second press, well past this.
 private const val COMBO_MIN_GAP_MS = 40L
-
-val codeGenTests = mutableStateOf("")
-val patchTests = mutableStateOf("")
-val vuJitTests = mutableStateOf("")
-val eeJitTests = mutableStateOf("")
-val vifTests = mutableStateOf("")
-val eeSeqTests = mutableStateOf("")
 
 open class MainActivityRuntime : ComponentActivity() {
     private var lastUiNavCode = 0
@@ -337,6 +330,30 @@ open class MainActivityRuntime : ComponentActivity() {
         // Use the path that demonstrably works instead of shipping a second one that doesn't.
         const val FF_LIMITER_MODE = 3
 
+        // Fast-forward SPEED slider (in-game pause menu, under Frame Limit). Stored as an integer
+        // multiplier 2..10 (×); FF_SPEED_UNLIMITED = no cap, which reuses the mode-3 uncapped path
+        // above and is the default (unchanged behaviour). Below the top, ffLimiterMode() pushes the
+        // Turbo scalar to native and engages Turbo (mode 1) so fast-forward runs at the chosen speed.
+        const val FF_SPEED_UNLIMITED = 11
+        private const val KEY_FF_SPEED = "ff.speed"
+        fun fastForwardSpeed(): Int =
+            runCatching { prefs.getInt(KEY_FF_SPEED, FF_SPEED_UNLIMITED) }
+                .getOrDefault(FF_SPEED_UNLIMITED).coerceIn(2, FF_SPEED_UNLIMITED)
+
+        fun setFastForwardSpeed(v: Int) {
+            runCatching { prefs.edit().putInt(KEY_FF_SPEED, v.coerceIn(2, FF_SPEED_UNLIMITED)).apply() }
+        }
+
+        /** Limiter mode for engaging fast-forward, honouring the FF-speed slider. Unlimited at the
+         *  top (mode 3); otherwise push the Turbo scalar and return Turbo (mode 1). Call only when
+         *  actually engaging FF — it has the side effect of setting the scalar. */
+        fun ffLimiterMode(): Int {
+            val s = fastForwardSpeed()
+            if (s >= FF_SPEED_UNLIMITED) return FF_LIMITER_MODE
+            runCatching { NativeApp.setTurboScalar(s.toFloat()) }
+            return 1 // Turbo, at the scalar just pushed
+        }
+
         // Latched state for the "Fast Forward (toggle)" hotkey: each press flips between
         // fast-forward and the base limiter mode (vs. the hold variant which is momentary).
         // Reset to false whenever a game starts.
@@ -362,6 +379,28 @@ open class MainActivityRuntime : ComponentActivity() {
         // path doesn't touch ConfigStore.
         @Volatile var usbKeyboardActive = false
 
+        /** TOGGLE_KEYBOARD hotkey: raise or drop the Android IME that feeds the emulated USB
+         *  keyboard. Bound to a spare pad button so chat can be opened mid-game without
+         *  pausing — which is the whole point, and why this isn't a settings toggle.
+         *
+         *  Reports instead of silently doing nothing when the USB keyboard isn't attached:
+         *  the keystrokes would go nowhere and the user would have no way to tell why. */
+        fun toggleSoftKeyboard() {
+            val act = instance ?: return
+            if (eState.value == EmuState.STOPPED) return
+            if (!usbKeyboardActive) {
+                act.runOnUiThread {
+                    android.widget.Toast.makeText(
+                        act,
+                        "Turn on Emulate USB Keyboard (Network settings) first",
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                }
+                return
+            }
+            act.runOnUiThread { SoftKeyboard.toggle(act) }
+        }
+
         // Cached metadata for the currently-running game. Populated when
         // The library opens a card (so we have title, serial, compatibility,
         // extension and the cover URL ready), cleared when the user
@@ -379,18 +418,6 @@ open class MainActivityRuntime : ComponentActivity() {
         // nativeReady. Fixes the first-cold-launch / DeX crash: applyRendererPrefs
         // pushed GS settings before the base settings layer existed → native SIGSEGV.
         private val pendingLaunch = mutableStateOf<Pair<String, GameInfo?>?>(null)
-
-        fun onTestResults(result: TestResult) {
-            when (result.name) {
-                "VuJitTests" -> vuJitTests.value = "${result.passed}/${result.total}"
-                "PatchTests" -> patchTests.value = "${result.passed}/${result.total}"
-                "CodegenTests" -> codeGenTests.value = "${result.passed}/${result.total}"
-                "EeJitTests" -> eeJitTests.value = "${result.passed}/${result.total}"
-                "VifTests" -> vifTests.value = "${result.passed}/${result.total}"
-                "EeSeqTests" -> eeSeqTests.value = "${result.passed}/${result.total}"
-                else -> println("Test:${result.name}: ${result.passed}/${result.total}")
-            }
-        }
 
         fun invoke(task: suspend () -> Unit) {
             eScope.launch {
@@ -455,6 +482,122 @@ open class MainActivityRuntime : ComponentActivity() {
         @JvmStatic
         fun isVmStopInProgress(): Boolean = vmStopInProgress
 
+        /** True from game/BIOS boot until we are back in the library. This — not currentGame —
+         *  decides which rotation tier applyEmulationOrientation() uses: a BIOS boot has no
+         *  GameInfo yet is still emulation, so keying on currentGame made the BIOS follow the
+         *  LAUNCHER rotation (reported as "BIOS ignores the Renderer rotation and goes portrait"). */
+        private var emulationOwnsOrientation = false
+
+        /** The single "we're back in the library" cleanup: drop the current-game pointer (so
+         *  Settings reverts to Global scope) and hand the Activity's rotation back to the
+         *  launcher preference.
+         *
+         *  This MUST run on every terminal path out of the VM. It used to live only inside
+         *  stop()'s post-shutdown branch, which is guarded on `!vmRunLoopActive` — a flag the
+         *  VM thread clears from its own finally. stop() usually evaluates that guard first, so
+         *  the block was skipped and the surviving path never reverted anything: the launcher
+         *  stayed locked in the game's landscape until the process was killed. Idempotent. */
+        private fun onReturnedToLibrary() {
+            currentGame.value = null
+            emulationOwnsOrientation = false
+            // Never leave the device pinned once the game is gone (#425).
+            com.armsx2.ui.ScreenPinning.stop()
+            stopAutoProgressiveScanHold()
+            instance?.runOnUiThread { instance?.applyEmulationOrientation() }
+        }
+
+        // ---- Auto Progressive Scan -------------------------------------------------------
+        // Some PS2 titles (Tekken 4, a number of Criterion games) offer 480p progressive output
+        // only if Triangle+Cross are held while the game boots — on real hardware you hold them
+        // from power-on. We reproduce that as a synthetic pad hold; games without the prompt
+        // simply ignore it. Codes match applyPadButton()'s switch in native-lib.cpp.
+        private const val PAD_CODE_TRIANGLE = 100
+        private const val PAD_CODE_CROSS = 96
+
+        /** How long to keep the combo held. Titles probe it at very different points — some well
+         *  after the PS2 logo — so this deliberately spans the whole boot sequence. */
+        private const val AUTO_PROGRESSIVE_HOLD_MS = 30_000L
+        /// How often the synthetic Triangle+Cross hold is re-pressed. Must be well under a frame
+        /// budget's worth of pad polling so the game never samples a gap, and short enough that a
+        /// pad re-init can't swallow the whole hold.
+        // Achievement-progress capture cadence. The first wait lets RetroAchievements resolve the
+        // set over the network after boot; the poll only exists so a process killed mid-session
+        // still leaves a recent figure in the library. Neither is latency-sensitive.
+        private const val ACHIEVEMENT_SNAPSHOT_FIRST_MS = 15_000L
+        private const val ACHIEVEMENT_SNAPSHOT_POLL_MS = 120_000L
+
+        private const val AUTO_PROGRESSIVE_REASSERT_MS = 200L
+        /// Keep holding this long after the game's ELF starts, then let go — the 480p prompt is
+        /// checked at game start, and holding into the menus would fight the player.
+        private const val AUTO_PROGRESSIVE_POST_ELF_MS = 4_000L
+
+        /** Pad writes are dropped while no VM exists (applyPadButton bails on !HasValidVM), so
+         *  wait for boot rather than pressing into the void. Bounded so a failed boot can't spin. */
+        private const val AUTO_PROGRESSIVE_VM_WAIT_MS = 15_000L
+
+        private var autoProgressiveScanJob: Job? = null
+
+        private fun startAutoProgressiveScanHold() {
+            stopAutoProgressiveScanHold()
+            autoProgressiveScanJob = eScope.launch {
+                var held = false
+                try {
+                    var waited = 0L
+                    while (!NativeApp.hasActiveVM() && waited < AUTO_PROGRESSIVE_VM_WAIT_MS) {
+                        delay(100)
+                        waited += 100
+                    }
+                    if (!NativeApp.hasActiveVM())
+                        return@launch
+                    held = true
+                    // ★ RE-ASSERT, don't set once. setPadButton writes the button state a single
+                    // time, but the pad is (re)initialised during boot — "Pad: DS2 Config Finished"
+                    // lands well after the VM goes active — and that wipes the state we set before
+                    // it existed. So the hold silently evaporated before the game ever sampled it,
+                    // which is exactly the Tekken 4 report: holding Triangle+Cross by hand works,
+                    // the automatic hold does nothing. Re-pressing on a short interval survives any
+                    // number of pad resets.
+                    //
+                    // Release shortly after the game's own ELF starts rather than blocking for the
+                    // full timeout: the 480p prompt is checked at game start, and continuing to jam
+                    // Triangle+Cross into a booted game would fight the player in the menus. CRC
+                    // goes non-zero exactly when the ELF is running, so it is the right edge to
+                    // watch. AUTO_PROGRESSIVE_HOLD_MS remains the hard ceiling.
+                    var elapsed = 0L
+                    var sinceElf = -1L
+                    while (elapsed < AUTO_PROGRESSIVE_HOLD_MS) {
+                        if (!NativeApp.hasActiveVM())
+                            return@launch
+                        NativeApp.setPadButton(PAD_CODE_TRIANGLE, 0, true)
+                        NativeApp.setPadButton(PAD_CODE_CROSS, 0, true)
+                        delay(AUTO_PROGRESSIVE_REASSERT_MS)
+                        elapsed += AUTO_PROGRESSIVE_REASSERT_MS
+                        val elfRunning = runCatching { NativeApp.getGameCRC() }.getOrNull()
+                            ?.let { it.length == 8 && it != "00000000" } ?: false
+                        if (elfRunning) {
+                            if (sinceElf < 0) sinceElf = 0
+                            else sinceElf += AUTO_PROGRESSIVE_REASSERT_MS
+                            if (sinceElf >= AUTO_PROGRESSIVE_POST_ELF_MS)
+                                break
+                        }
+                    }
+                } finally {
+                    // Release on every exit path, cancellation included — a stuck Triangle+Cross
+                    // would make the game unplayable. These are plain JNI calls, not suspends, so
+                    // they still run in a cancelled coroutine.
+                    if (held && NativeApp.hasActiveVM()) {
+                        NativeApp.setPadButton(PAD_CODE_TRIANGLE, 0, false)
+                        NativeApp.setPadButton(PAD_CODE_CROSS, 0, false)
+                    }
+                }
+            }
+        }
+
+        private fun stopAutoProgressiveScanHold() {
+            autoProgressiveScanJob?.cancel()
+            autoProgressiveScanJob = null
+        }
+
         fun start() {
             synchronized(vmLifecycleLock) {
                 if (vmStopInProgress || vmRunLoopActive || eState.value != EmuState.STOPPED) {
@@ -474,7 +617,21 @@ open class MainActivityRuntime : ComponentActivity() {
                     WindowImpl.showLibrary.value = false
                     WindowImpl.overlayVisible.value = false
                     WindowImpl.toolbarVisible.value = false
+                    emulationOwnsOrientation = true
+                    // Opt-in only: blocks a controller's Home button from minimising the game,
+                    // which the app cannot do any other way — HOME never reaches us (#425).
+                    instance?.let { com.armsx2.ui.ScreenPinning.start(it) }
                     applyRendererPrefs()
+                    // Both of these are consumed by native when the VM boots, so they must be
+                    // pushed BEFORE runVMThread (which blocks until the VM exits). One resolve,
+                    // per-game ∘ global.
+                    val bootCfg = com.armsx2.config.ConfigStore
+                        .resolveForGame(currentGame.value?.settingsKey)
+                    // Read by VMManager::SetEmuThreadAffinities during boot.
+                    runCatching { NativeApp.setAffinityMode(bootCfg.affinityMode) }
+                    // The hold itself waits for the VM to come up. BIOS boots skip it.
+                    if (bootCfg.autoProgressiveScan)
+                        startAutoProgressiveScanHold()
                     NativeApp.runVMThread(m_szGamefile)
                 } finally {
                     // runVMThread blocks until the VM exits (Stopping/Shutdown
@@ -498,6 +655,10 @@ open class MainActivityRuntime : ComponentActivity() {
                         WindowImpl.toolbarVisible.value = true
                         WindowImpl.showLibrary.value = false
                         WindowImpl.overlayVisible.value = false
+                        // This is the branch that actually fires on a normal game exit (stop()'s
+                        // equivalent block loses the vmRunLoopActive race), so the return-to-library
+                        // cleanup has to happen here or the launcher keeps the game's rotation.
+                        onReturnedToLibrary()
                         finishToLauncherIfRequested()
                     }
                 }
@@ -518,14 +679,22 @@ open class MainActivityRuntime : ComponentActivity() {
          *  local co-op — 2+ pads → connect Player 2's controller at VM init. */
         private fun connectedGamepadCount(): Int {
             var n = 0
+            var sawJoyCon = false
             for (id in InputDevice.getDeviceIds()) {
                 val dev = InputDevice.getDevice(id) ?: continue
                 if (dev.isVirtual) continue
                 val s = dev.sources
-                if ((s and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
-                    (s and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) n++
+                val isPad = (s and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+                    (s and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+                if (!isPad) continue
+                // Nintendo Joy-Cons (vendor 0x057E) enumerate as two InputDevices per pair
+                // but are combined onto ONE PS2 port (see PadRouter.portForDevice), so count
+                // ALL Nintendo pads as a SINGLE logical controller — a lone pair must not
+                // auto-enable PS2 port 2. Every other vendor is still counted per device.
+                if (dev.vendorId == 0x057E) { sawJoyCon = true; continue }
+                n++
             }
-            return n
+            return n + (if (sawJoyCon) 1 else 0)
         }
 
         private fun applyRendererPrefs() {
@@ -536,6 +705,9 @@ open class MainActivityRuntime : ComponentActivity() {
             // serial-less ELF/homebrew) so ELF per-game settings survive a reboot
             // instead of falling back to global (issue #253).
             var resolved = com.armsx2.config.ConfigStore.resolveForGame(currentGame.value?.settingsKey)
+            // Build immutable input maps before the VM starts so the first ABXY
+            // edge never pays SharedPreferences parsing on the UI thread.
+            ControllerMappings.warmRuntimeCaches()
             // Per-game memory cards (NetherSX2-style): when the global toggle is
             // on, point Slot 1 at a serial-named card (the core auto-creates +
             // formats it at boot) — but ONLY for games still on the factory-default
@@ -588,6 +760,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 else -> NativeApp.renderAuto()
             }
             resolved.applyTo()
+            // applyTo() pushed the per-stat OSD flags (= "Custom"); re-assert the stored OSD
+            // mode on top so a Full / Min / Off choice from the menu or hotkey survives a
+            // relaunch instead of snapping back to the per-stat selection every boot.
+            InGameOverlay.applyStoredOsdMode()
             // Per-game screen orientation: apply THIS title's rotation now that currentGame is
             // set. requestedOrientation is an Activity property → hop to the UI thread (we're on
             // the VM launch thread here). Reverts to global on exit-to-library (see stop()).
@@ -656,7 +832,7 @@ open class MainActivityRuntime : ComponentActivity() {
             // user has to toggle off then on again to resync. Re-assert the latched mode.
             NativeApp.speedhackLimitermode(
                 when {
-                    fastForwardToggleActive -> FF_LIMITER_MODE
+                    fastForwardToggleActive -> ffLimiterMode()
                     slowDownToggleActive -> 2
                     else -> if (limit) 0 else 3
                 }
@@ -680,6 +856,8 @@ open class MainActivityRuntime : ComponentActivity() {
                 println("@@ANDROID_LAUNCH_REJECT@@ reason=blank_uri title=${info?.title ?: ""}")
                 return
             }
+            // Remember the game for a post-exit re-launch from the Save Manager (#374).
+            if (info != null) contextGame.value = info
             println(
                 "@@ANDROID_LAUNCH_GAME@@ title=${info?.title ?: "<direct>"} " +
                     "uri=${uri.take(240)} state=${eState.value} runLoop=$vmRunLoopActive " +
@@ -800,6 +978,9 @@ open class MainActivityRuntime : ComponentActivity() {
                     eState.value = EmuState.RUNNING
                     println("@@ANDROID_START_VM@@ kind=bios path=<empty>")
                     com.armsx2.input.PadRouter.reset()
+                    // The BIOS is emulation too: claim the renderer rotation tier so it honours the
+                    // Renderer page (global, since there is no game) instead of the launcher's.
+                    emulationOwnsOrientation = true
                     applyRendererPrefs()
                     NativeApp.runVMThread(m_szGamefile)
                 } finally {
@@ -816,6 +997,10 @@ open class MainActivityRuntime : ComponentActivity() {
                     }
                     if (restartNow) {
                         start()
+                    } else {
+                        // BIOS exit had no cleanup at all — it relied entirely on stop()'s racy
+                        // branch, so quitting the BIOS also left the launcher stuck in its rotation.
+                        onReturnedToLibrary()
                     }
                 }
             }
@@ -846,6 +1031,29 @@ open class MainActivityRuntime : ComponentActivity() {
         fun pauseForOverlay() {
             if (vmStopInProgress)
                 return
+            // Routed through vmControl exactly like resume(), NOT inline. The comment above the
+            // executor claims pause and resume are serialised against each other; while this
+            // bypassed it they were enqueued from two different Java threads, so a pause raised
+            // while a resume was still in flight could be evaluated first and swallowed (native
+            // pause() only acts when the VM is exactly Running, and never retries) — which leaves
+            // the VM RUNNING in the background after the app is gone.
+            vmControl.execute {
+                if (vmStopInProgress)
+                    return@execute
+                pauseForOverlayOnVmThread()
+            }
+        }
+
+        private fun pauseForOverlayOnVmThread() {
+            // ★ Keep the audio device OPEN across an overlay pause. Otherwise SPU2::SetOutputPaused
+            // pauses the Oboe stream, Android reclaims an idle low-latency stream after a few
+            // seconds (#333), and then the RESUME has to Close/Open/Start it again — inline on the
+            // CPU thread, inside the resume task, AHEAD of Host::OnVMResumed(). That is why coming
+            // back from another app can sit "stuck on pause" for seconds before the game moves.
+            // Suppressed, the stream underruns to silence instead: nothing to reclaim, nothing to
+            // rebuild. native-lib.cpp has always documented pauseForOverlay as the caller that sets
+            // this — it simply never called it.
+            runCatching { NativeApp.setOutputPauseSuppressed(true) }
             NativeApp.pause()
         }
 
@@ -853,8 +1061,12 @@ open class MainActivityRuntime : ComponentActivity() {
             if (vmStopInProgress)
                 return
             vmControl.execute {
-                if (!vmStopInProgress)
+                if (!vmStopInProgress) {
                     NativeApp.resume()
+                    // Cleared only after the resume lands, so a later non-overlay pause (VM stop,
+                    // shutdown) still releases the device normally.
+                    runCatching { NativeApp.setOutputPauseSuppressed(false) }
+                }
             }
         }
 
@@ -881,8 +1093,12 @@ open class MainActivityRuntime : ComponentActivity() {
                     true
                 }
             }
-            if (!shouldStop)
+            if (!shouldStop) {
+                // Nothing left to stop (the VM self-terminated). Still reconcile the library
+                // state — this early return also used to leak a stale per-game rotation.
+                onReturnedToLibrary()
                 return
+            }
 
             WindowImpl.overlayVisible.value = false
             WindowImpl.showLibrary.value = false
@@ -917,15 +1133,9 @@ open class MainActivityRuntime : ComponentActivity() {
                             WindowImpl.showLibrary.value = false
                             WindowImpl.overlayVisible.value = false
                         }
-                        // No game is running any more — clear the current-game pointer so the
-                        // Settings screen reverts to Global scope. Otherwise the last-played game
-                        // lingered here and SettingsScreen's scopeContext (game ?: currentGame)
-                        // kept surfacing per-game scope for it after returning to the library.
-                        currentGame.value = null
-                        // No game running → revert the Activity to the GLOBAL orientation (a
-                        // per-game rotation lock must not linger in the library). currentGame is
-                        // now null so applyEmulationOrientation resolves the global value.
-                        instance?.runOnUiThread { instance?.applyEmulationOrientation() }
+                        // Clear the current-game pointer (so Settings reverts to Global scope) and
+                        // hand rotation back to the launcher. Shared with the other terminal paths.
+                        onReturnedToLibrary()
                         finishToLauncherIfRequested()
                     }
                 }
@@ -976,18 +1186,41 @@ open class MainActivityRuntime : ComponentActivity() {
             val libDir = context.applicationInfo.nativeLibraryDir
             val egl = File(libDir, "libEGL_angle.so")
             val gles = File(libDir, "libGLESv2_angle.so")
+            // gsBackThread rides on every line: GV7's back thread is the OTHER ANGLE suspect
+            // (ANGLE binds an EGL context to a single thread far more strictly than the native
+            // GLES drivers do), so the log has to say whether it was engaged.
+            val ctx = "renderer=${settings?.renderer} useAngle=${settings?.useAngleOpenGL} gsBackThread=${settings?.gsBackThreadMode}"
             try {
                 if (eligible && egl.exists() && gles.exists()) {
                     android.system.Os.setenv("ARMSX2_ANGLE_EGL_LIBRARY", egl.absolutePath, true)
                     android.system.Os.setenv("ARMSX2_ANGLE_GLES_LIBRARY", gles.absolutePath, true)
                     android.util.Log.i("ARMSX2", "ANGLE OpenGL enabled: ${egl.absolutePath}")
+                    angleEmit("enabled $ctx egl=${egl.absolutePath}")
                 } else {
                     runCatching { android.system.Os.unsetenv("ARMSX2_ANGLE_EGL_LIBRARY") }
                     runCatching { android.system.Os.unsetenv("ARMSX2_ANGLE_GLES_LIBRARY") }
+                    // Distinguish "user never picked ANGLE" from "user picked ANGLE but the
+                    // bundled .so isn't in the APK". The latter silently fell back to the system
+                    // GLES driver, which reads to the user as "ANGLE is broken" — that silence
+                    // is exactly why the 2.6.3 ANGLE report couldn't be diagnosed from a log.
+                    if (eligible) {
+                        android.util.Log.e("ARMSX2", "ANGLE selected but libs missing in $libDir")
+                        angleEmit("MISSING_LIBS $ctx dir=$libDir egl=${egl.exists()} gles=${gles.exists()} -> fell back to system GLES")
+                    } else {
+                        angleEmit("off $ctx")
+                    }
                 }
             } catch (e: Exception) {
                 android.util.Log.e("ARMSX2", "applyAngleEnv failed: ${e.message}")
+                angleEmit("error $ctx ${e.javaClass.simpleName}: ${e.message}")
             }
+        }
+
+        /** Mirrors the @@JOYCON@@ diagnostic: logcat AND emulog, so a tester's emulog file
+         *  alone answers "did ANGLE actually load?" without needing a live adb logcat. */
+        private fun angleEmit(msg: String) {
+            android.util.Log.i("ARMSX2", "@@ANGLE@@ $msg")
+            runCatching { NativeApp.emulog("@@ANGLE@@ $msg") }
         }
 
         // Armed per-launch in launchGame when "Auto-load last state on boot" is on;
@@ -999,8 +1232,14 @@ open class MainActivityRuntime : ComponentActivity() {
         @Volatile
         private var pendingSlotLoadOnBoot: Int? = null
 
+        // The last game we booted, retained across exit-to-library so the Save Manager can
+        // re-launch + load a save AFTER the game was exited. Kept SEPARATE from currentGame
+        // (which stop() nulls for settings-scope) so it can't resurrect per-game scope in the
+        // library. GitHub #374 — "exit, press Load → nothing boots" because currentGame was null.
+        val contextGame = mutableStateOf<GameInfo?>(null)
+
         fun launchCurrentGameFromSaveSlot(slot: Int): Boolean {
-            val game = currentGame.value ?: return false
+            val game = currentGame.value ?: contextGame.value ?: return false
             val launchPath = if (game.uri.scheme == "file") {
                 game.uri.path ?: game.uri.toString()
             } else {
@@ -1425,6 +1664,20 @@ open class MainActivityRuntime : ComponentActivity() {
         // settings from the in-folder mirror, or seed from the folder's old PCSX2-Android.ini,
         // BEFORE the core loads/rewrites it. No-op (guarded) for anyone already on the new UI.
         runCatching { com.armsx2.config.ConfigStore.reconcileReusedFolder() }
+        // A genuinely empty install gets capability-aware frame-queue defaults only
+        // after reused-folder recovery had its chance. Capable handhelds start in
+        // low-latency mode (queue 0); low-end devices retain the smoother queue 2.
+        runCatching { com.armsx2.config.ConfigStore.seedFreshInstallDefaults(applicationContext) }
+        // One-time: existing capable devices also get the Low Latency default (matches fresh installs).
+        runCatching { com.armsx2.config.ConfigStore.migrateLowLatencyOff(applicationContext) }
+        // Steer the renderer's Auto resolution to Vulkan HW on Adreno (tile-memory framebuffer-fetch
+        // fast path); Mali/others stay on OpenGL. Sets a native flag GSUtil::GetPreferredRenderer reads
+        // before the GS starts, so an explicit GL/SW pick still wins. Re-asserted each launch.
+        runCatching {
+            kr.co.iefriends.pcsx2.NativeApp.setPreferVulkan(
+                com.armsx2.GpuInfo.rendererName()?.contains("Adreno", ignoreCase = true) == true
+            )
+        }
 
         // Default resources — shaders, GameIndex, fonts, fullscreenui,
         // patches.zip, controller DB. assetCopyRoot resolves to the
@@ -1432,6 +1685,23 @@ open class MainActivityRuntime : ComponentActivity() {
         // finds them at <systemDir>/resources/...
         copyAssetAll(applicationContext, "bios")
         copyAssetAll(applicationContext, "resources")
+
+        // On an app UPDATE (versionCode changed), drop the regenerable GPU caches. Installing a
+        // new build over an old one keeps the compiled GS shader/pipeline cache under
+        // <dataRoot>/cache, and a cache baked by a different core build can render corrupt — the
+        // "scrambled PS2 logo" and post-update graphical glitches users currently fix by
+        // reinstalling clean (#376/#385). The cache is pure derived data (rebuilt on demand),
+        // never user content, so wiping it is always safe. Skipped on first install (no prior
+        // version recorded) — there is nothing stale to clear.
+        runCatching {
+            val prevVc = prefs.getInt("lastRunVersionCode", 0)
+            val curVc = BuildConfig.VERSION_CODE
+            if (prevVc != 0 && prevVc != curVc) {
+                File(assetCopyRoot(applicationContext), "cache").deleteRecursively()
+                android.util.Log.i("ARMSX2", "Update $prevVc -> $curVc: cleared GS shader/pipeline cache")
+            }
+            if (prevVc != curVc) prefs.edit { putInt("lastRunVersionCode", curVc) }
+        }
 
         // Point the ANGLE EGL env vars at the bundled libs (or clear them) before the
         // GS thread ever opens a GL context. Re-applied per launch below too.
@@ -1517,11 +1787,6 @@ open class MainActivityRuntime : ComponentActivity() {
             HIDDeviceManager(applicationContext)
 
             println("PCSX2_INIT")
-
-            // Tests that need VTLB/eeMem — run after init
-            NativeApp.runEeJitTests()
-            NativeApp.runEeSeqTests()
-            NativeApp.runVifTests()
 
             // Debug-build auto-boot to BIOS. Lets us drop straight into the
             // BIOS shell on app launch for perfape baseline captures —
@@ -1612,16 +1877,34 @@ open class MainActivityRuntime : ComponentActivity() {
     /** Apply the user's Emulation Screen Orientation choice, resolved per-game (∘ global).
      *  0=Use Device Setting, 1=Landscape, 2=Portrait, 3=Auto-Rotate. SENSOR_* variants let
      *  the device still flip 180° within the locked axis. Called on launch, on change, at
-     *  game boot (applyRendererPrefs) and on exit-to-library — currentGame decides the tier:
-     *  a running game gets its per-game rotation, the library/menus get the global one. */
+     *  game boot (applyRendererPrefs) and on exit-to-library — emulationOwnsOrientation decides
+     *  the tier: emulation gets the renderer rotation, the library/menus get the launcher one. */
     fun applyEmulationOrientation() {
-        val resolved = com.armsx2.config.ConfigStore.resolveForGame(currentGame.value?.settingsKey)
-        requestedOrientation = when (resolved.orientation) {
+        // Emulation (game OR BIOS) uses the renderer rotation, resolved per-game when there is a
+        // game and global otherwise; the launcher/library uses its own app-level rotation
+        // (AetherSX2-style split). Both share the 0/1/2/3 mapping below.
+        val orientation = if (emulationOwnsOrientation)
+            com.armsx2.config.ConfigStore.resolveForGame(currentGame.value?.settingsKey).orientation
+        else
+            com.armsx2.ui.theme.LauncherOrientationPreferences.mode.value
+        val requested = when (orientation) {
             1 -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             2 -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
             3 -> ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
             else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
+        // ★ Only ASSIGN when it actually changes. Writing requestedOrientation makes Android
+        // re-evaluate orientation even when the value is identical, and with the default
+        // SCREEN_ORIENTATION_UNSPECIFIED there is no lock to hold it — so a handheld device can
+        // resolve portrait for one frame and snap back to landscape, producing TWO configuration
+        // changes. Each one destroys and recreates the Vulkan swapchain and re-uploads every ImGui
+        // resource, which freezes the PICTURE for seconds while the EE keeps running untouched.
+        // Confirmed on a Retroid Pocket 6: two "finishDrawing of orientation change" from
+        // WindowManager landing exactly on two "Creating a swap chain" (1080x1920 then 1920x1080).
+        // This function is called from several paths (boot, settings edits, and a LaunchedEffect
+        // keyed on the resolved settings tier), so redundant calls are normal and must be free.
+        if (requestedOrientation != requested)
+            requestedOrientation = requested
     }
 
     private fun applyEdgeToEdge() {
@@ -1673,9 +1956,23 @@ open class MainActivityRuntime : ComponentActivity() {
         // controller "B"/"Circle" buttons that the OS maps to KEYCODE_BACK
         // (Xbox/DualShock default) from killing the app.
         onBackPressedDispatcher.addCallback(this) {
-            // intentionally empty — pure stay-alive sentinel
+            // #384: the system Back button / gesture opens the in-game menu (Nether/Eden-style) when
+            // a game is running and neither the overlay nor the library is already up. Controller
+            // B/Circle never reach here — dispatchKeyEvent maps + consumes them as the PS2 Circle
+            // button first — so this fires only for the actual system back. Toggle in Hotkeys
+            // (input.backOpensMenu, default on). When off / on the library / with the overlay already
+            // up, it stays a pure stay-alive no-op so the system never falls through to finish().
+            val inGame = eState.value == EmuState.RUNNING || eState.value == EmuState.PAUSED
+            if (inGame &&
+                !WindowImpl.overlayVisible.value &&
+                !WindowImpl.showLibrary.value &&
+                prefs.getBoolean("input.backOpensMenu", true)
+            ) {
+                com.armsx2.ui.InGameOverlay.open()
+            }
         }
         prefs = applicationContext.getSharedPreferences("ARMSX2", MODE_PRIVATE)
+        ControllerMappings.installRuntimeCacheInvalidation()
         com.armsx2.i18n.I18n.init(applicationContext)
         applyEmulationOrientation()
         com.armsx2.CoverArtStyle.load()
@@ -1685,19 +1982,38 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.HiddenGames.load()
         com.armsx2.LibraryTitles.load()
         com.armsx2.LibraryRecentShelf.load()
+        // Discord needs an Activity to launch its sign-in browser and has no other way to obtain
+        // one. Handing it over costs nothing when the user has not opted in — start() returns
+        // immediately unless the feature is enabled AND a token is stored.
+        com.armsx2.DiscordPresence.attachActivity(this)
+        com.armsx2.DiscordPresence.start()
         com.armsx2.LibraryView.load()
         com.armsx2.ui.UiScale.load()
         com.armsx2.ui.theme.ThemePreferences.load()
         com.armsx2.ui.theme.BootLogoPreferences.load()
+        com.armsx2.ui.ScreenPinning.load()
         com.armsx2.ui.theme.ToolbarPositionPreferences.load()
         com.armsx2.ui.theme.LibraryChromePreferences.load()
+        com.armsx2.ui.theme.LauncherOrientationPreferences.load()
+        com.armsx2.ui.theme.LibraryBackgroundColorPreferences.load()
+        com.armsx2.LibraryMusic.load()
+        com.armsx2.MenuSfx.load(applicationContext)
         com.armsx2.ControllerSkinStore.load(applicationContext)
         startAutosaveIntervalJob()
         // Restore the saved rumble master toggle into the native gate (NativeApp.onPadRumble).
         NativeApp.sRumbleEnabled = ControllerMappings.rumbleEnabled()
+        // Push the saved haptic strength + achievement-sound volume into their native gates before
+        // any rumble or unlock sound can fire (both default to 1.0 = as authored until set here).
+        ControllerMappings.syncHapticIntensity()
+        com.armsx2.ui.achievements.AchievementsViewModel.syncSoundVolume()
         // Seed the pad-router's multitap gate before any in-game input is dispatched, so
         // slot routing (2 vs 8 slots) is correct from the first controller event.
         com.armsx2.input.PadRouter.multitapEnabled = ControllerMappings.multitapEnabled()
+        // #394: watch for controller unplug / re-enumeration so a departed pad frees its slot (see
+        // inputDeviceListener). Registered until onDestroy so a sleep/wake remove is caught even
+        // while the activity is paused.
+        getSystemService(android.hardware.input.InputManager::class.java)
+            ?.registerInputDeviceListener(inputDeviceListener, null)
         setupComplete.value = prefs.getBoolean("setupComplete", false)
         systemDir.value = prefs.getString("systemDir", null)
         bios.value = prefs.getString("bios", null)
@@ -1746,14 +2062,17 @@ open class MainActivityRuntime : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = android.graphics.Color.TRANSPARENT
         window.navigationBarColor = android.graphics.Color.TRANSPARENT
-        val initialLightSystemBars = when (com.armsx2.ui.theme.ThemePreferences.mode.value) {
-            com.armsx2.ui.theme.ThemeMode.System ->
+        // Light is the only light theme; System follows the OS and every colour theme is dark.
+        // Written as an else rather than one branch per mode so adding a hue can't silently
+        // give it the wrong system-bar contrast.
+        val startupTheme = com.armsx2.ui.theme.ThemePreferences.mode.value
+        val initialLightSystemBars = when {
+            // System AND Material You both defer light/dark to the OS, so the bars follow it too.
+            startupTheme.followsSystemDarkMode ->
                 resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                     Configuration.UI_MODE_NIGHT_YES
-            com.armsx2.ui.theme.ThemeMode.Light -> true
-            com.armsx2.ui.theme.ThemeMode.Dark,
-            com.armsx2.ui.theme.ThemeMode.Black,
-            com.armsx2.ui.theme.ThemeMode.Oled -> false
+            startupTheme == com.armsx2.ui.theme.ThemeMode.Light -> true
+            else -> false
         }
         WindowInsetsControllerCompat(window, window.decorView).let { controller ->
             controller.show(WindowInsetsCompat.Type.systemBars())
@@ -1773,6 +2092,10 @@ open class MainActivityRuntime : ComponentActivity() {
             prefs.getBoolean("ui.sustainedPerf", false)) {
             runCatching { window.setSustainedPerformanceMode(true) }
         }
+
+        // ADPF CPU clock hint (experimental, default OFF): re-assert the saved state to native
+        // before any game runs. Referencing NativeApp also loads the native lib (static init).
+        runCatching { kr.co.iefriends.pcsx2.NativeApp.setAdpfEnabled(prefs.getBoolean("ui.adpf", false)) }
 
         // Defer asset copy + emucore init until setup is complete. On the
         // first-ever run, `systemDir` isn't picked yet at onCreate time —
@@ -1820,15 +2143,20 @@ open class MainActivityRuntime : ComponentActivity() {
                 setupEditorVisible.value ||
                 eState.value == EmuState.RENDER_UNSUPPORTED ||
                 eState.value == EmuState.EMULATOR_UNSUPPORTED
-            val darkTheme = when (com.armsx2.ui.theme.ThemePreferences.mode.value) {
-                com.armsx2.ui.theme.ThemeMode.System -> androidx.compose.foundation.isSystemInDarkTheme()
-                com.armsx2.ui.theme.ThemeMode.Light -> false
-                com.armsx2.ui.theme.ThemeMode.Dark,
-                com.armsx2.ui.theme.ThemeMode.Black,
-                com.armsx2.ui.theme.ThemeMode.Oled -> true
+            val themeMode = com.armsx2.ui.theme.ThemePreferences.mode.value
+            val darkTheme = when {
+                themeMode.followsSystemDarkMode -> androidx.compose.foundation.isSystemInDarkTheme()
+                themeMode == com.armsx2.ui.theme.ThemeMode.Light -> false
+                else -> true // every colour theme is a dark theme
             }
             androidx.compose.runtime.SideEffect {
                 applySystemBarTheme(darkTheme = darkTheme, showSystemBars = showSystemBars)
+            }
+            // Auto-update-on-launch (github sideload flavor only, opt-in via the App-tab toggle,
+            // default off). Renders nothing unless a newer GitHub release is found on boot, then
+            // pops the update prompt. Play flavor's AutoUpdateGate is a no-op stub.
+            if (com.armsx2.BuildConfig.IN_APP_UPDATER) {
+                com.armsx2.update.AutoUpdateGate()
             }
             // First-time setup deferral: when the wizard finishes and
             // setupComplete flips to true, kick off the heavy emucore
@@ -1880,6 +2208,67 @@ open class MainActivityRuntime : ComponentActivity() {
                     else
                         PlayTime.endSession()
                 }
+                // Capture achievement progress while the game is loaded. Only the achievements panel
+                // used to do this, so the library showed nothing for anyone who never opened it. The
+                // core cannot be asked about a game it has not loaded, so the numbers have to be
+                // taken now: once shortly after the set resolves, then on a slow poll so a killed
+                // process still leaves a recent figure behind, and once more on the way out of
+                // RUNNING (pausing or quitting) to bank whatever was earned since.
+                androidx.compose.runtime.LaunchedEffect(eState.value, currentGame.value?.serial) {
+                    val serial = currentGame.value?.serial
+                    if (eState.value != EmuState.RUNNING) {
+                        // Still paused here, not yet shut down, so the set is still queryable.
+                        withContext(Dispatchers.Default) { com.armsx2.AchievementsProgress.snapshot(serial) }
+                        return@LaunchedEffect
+                    }
+                    // The set is not loaded at the instant the VM starts running; RA resolves it
+                    // over the network a moment later. snapshot() no-ops until it is there.
+                    delay(ACHIEVEMENT_SNAPSHOT_FIRST_MS)
+                    while (true) {
+                        withContext(Dispatchers.Default) { com.armsx2.AchievementsProgress.snapshot(serial) }
+                        delay(ACHIEVEMENT_SNAPSHOT_POLL_MS)
+                    }
+                }
+                // Drop the emulated-keyboard IME when the VM stops. Reactive off eState for the
+                // same reason as the orientation effect below: three separate paths set STOPPED,
+                // and a sink view left holding focus would keep the keyboard over the library.
+                androidx.compose.runtime.LaunchedEffect(eState.value) {
+                    if (eState.value == EmuState.STOPPED) {
+                        SoftKeyboard.release(this@MainActivityRuntime)
+                    }
+                }
+                // Library music follows the same signal from the other side: it plays only
+                // with no VM up, and a booting game silences it. Driven off eState rather
+                // than from the launch/stop call sites for the same reason as the effects
+                // around it — several paths reach each state and one of them always gets
+                // forgotten.
+                androidx.compose.runtime.LaunchedEffect(eState.value, com.armsx2.LibraryMusic.enabled.value) {
+                    if (eState.value == EmuState.STOPPED) {
+                        // RETRY, don't fire once. LibraryMusic defers to whatever is already
+                        // playing, and on a cold boot that is OUR OWN splash: boot_intro.mp4
+                        // carries an audio track and MainActivity is launched from the video's
+                        // completion callback, so the stream is still tearing down when this
+                        // first runs. A single attempt loses that race and never retries —
+                        // eState stays STOPPED — which made music work only after a game had
+                        // been launched and exited. Retrying rides out the handover while
+                        // still leaving a genuinely-playing app (Spotify, a podcast) alone
+                        // once the attempts run out.
+                        // Poll for up to ~12s. On game EXIT the emulator's OWN Oboe/SPU2 stream can
+                        // take several seconds to fully release; start() politely defers while
+                        // AudioManager still reports audio active (so it never stomps Spotify/a
+                        // podcast), so 6×700ms (~4.2s) wasn't long enough for that teardown and the
+                        // music stayed silent until the user toggled it off/on. A longer, finer poll
+                        // rides out the handover; a genuinely-playing third-party app just runs the
+                        // poll out and is left alone.
+                        repeat(24) {
+                            com.armsx2.LibraryMusic.start(this@MainActivityRuntime)
+                            if (com.armsx2.LibraryMusic.isPlaying()) return@LaunchedEffect
+                            kotlinx.coroutines.delay(500)
+                        }
+                    } else {
+                        com.armsx2.LibraryMusic.stop(this@MainActivityRuntime)
+                    }
+                }
                 // Screen orientation follows whichever tier is live: a running game's per-game
                 // rotation, the library's global one. Driven reactively off currentGame rather
                 // than from each site that mutates it — THREE paths clear it (stop-to-library,
@@ -1892,13 +2281,24 @@ open class MainActivityRuntime : ComponentActivity() {
                 androidx.compose.runtime.LaunchedEffect(currentGame.value?.settingsKey) {
                     instance?.applyEmulationOrientation()
                 }
+                // Keep Android's high-refresh vote scoped to an active VM. PAUSED
+                // remains active because the in-game overlay is also where users
+                // toggle Low Latency Mode; clearing/re-requesting on every overlay
+                // open would cause needless display-mode churn.
+                androidx.compose.runtime.LaunchedEffect(
+                    eState.value, currentGame.value?.settingsKey, surface.value
+                ) {
+                    val gameActive =
+                        eState.value == EmuState.RUNNING || eState.value == EmuState.PAUSED
+                    surface.value?.setGameActive(gameActive)
+                }
                 WindowImpl.Window {
                     if (surface.value != null) {
-                        // Pull Compose focus onto the surface as soon as it's
-                        // composed AND whenever a game starts running. Without
-                        // this the AndroidView starts un-focused, so onKeyEvent
-                        // silently drops gamepad input until the user taps the
-                        // screen / presses A to grant focus by hand.
+                        // Keep focus on the SurfaceView while gameplay is active.
+                        // Activity-level key dispatch no longer depends on Compose
+                        // focus, but the surface still needs focus for IME/pointer
+                        // interoperability and to keep frontend focus transitions
+                        // deterministic.
                         //
                         // Keying only on surface.value (which is created once at
                         // onCreate and never reassigned) meant focus was grabbed
@@ -1971,6 +2371,32 @@ open class MainActivityRuntime : ComponentActivity() {
                                 }
                             }
                         }
+                        // ★ The REAL stuck-resume backstop. The block above cannot serve as one:
+                        // it sits in the `else` of LaunchedEffect(frontendOwnsFocus), and reaching
+                        // that `else` requires frontendOwnsFocus == false, i.e. eState was already
+                        // RUNNING — so its `if (eState == PAUSED)` can only fire in the sliver
+                        // between composition and coroutine start, never in the state it was
+                        // written for. Keyed on the actual stuck condition instead, and it RETRIES:
+                        // the native resume() only acts when the VM is exactly Paused and there is
+                        // no retry anywhere, so a resume issued a moment too early is simply lost.
+                        val stuckPaused = !WindowImpl.frontendCovers &&
+                            eState.value == EmuState.PAUSED &&
+                            !WindowImpl.showLibrary.value &&
+                            !com.armsx2.ui.touch.TouchControls.editMode.value
+                        androidx.compose.runtime.LaunchedEffect(stuckPaused) {
+                            if (!stuckPaused) return@LaunchedEffect
+                            // The normal close path posts its resume after a 220 ms dismiss
+                            // animation, so let that win first; only then start nudging.
+                            repeat(4) {
+                                kotlinx.coroutines.delay(700)
+                                if (eState.value != EmuState.PAUSED || WindowImpl.frontendCovers ||
+                                    WindowImpl.showLibrary.value ||
+                                    com.armsx2.ui.touch.TouchControls.editMode.value
+                                ) return@LaunchedEffect
+                                println("@@ANDROID_RESUME_RETRY@@ attempt=$it eState=${eState.value}")
+                                resume()
+                            }
+                        }
                         AndroidView(factory = { surface.value!! }, modifier = Modifier
                             // Drop the surface from the focus system while ANY
                             // Compose frontend surface (pause overlay, in-game
@@ -2008,48 +2434,6 @@ open class MainActivityRuntime : ComponentActivity() {
                                         }
                                     },
                                 )
-                            }
-                            .onKeyEvent { event ->
-                                if (eState.value != EmuState.RUNNING)
-                                    return@onKeyEvent false
-                                // Note: the physical menu button is handled in
-                                // MainActivityRuntime.dispatchKeyEvent (so it can catch BACK /
-                                // back-paddle keys); it never reaches here.
-                                // Local co-op: route by the originating device — first
-                                // controller = P1 (port 0), next = P2 (port 1) — and
-                                // resolve the bind against THAT player's mapping.
-                                val port = com.armsx2.input.PadRouter.portForDevice(event.nativeKeyEvent.deviceId)
-                                // Physical-controller macro: a bound button fires the
-                                // macro's whole button set at once (down on press, up on
-                                // release), reusing the macro slots the on-screen M1-M4
-                                // buttons use. Checked before normal pad routing so a
-                                // macro overrides that button's regular mapping.
-                                val macro = com.armsx2.ui.touch.TouchControls.macroForPhysicalCode(event.key.nativeKeyCode)
-                                if (macro != null) {
-                                    // Through fireMacro so a macro with a Frequency set
-                                    // TOGGLES its button set while held (turbo) instead of
-                                    // just holding it. Keyed per port, so P1 and P2 can
-                                    // hold the same macro without cancelling each other.
-                                    com.armsx2.ui.touch.TouchControls.fireMacro(
-                                        macro, "pad$port", event.type == KeyEventType.KeyDown,
-                                    ) { code, pressed ->
-                                        sendKeyAction(
-                                            if (pressed) KeyEventType.KeyDown else KeyEventType.KeyUp,
-                                            code, port,
-                                        )
-                                    }
-                                    return@onKeyEvent true
-                                }
-                                val target = ControllerMappings.targetForPhysical(event.key.nativeKeyCode, port)
-                                    ?: return@onKeyEvent false
-                                // Turbo/rapid-fire: while the physical button is held, the
-                                // PS2 button auto-presses at ~15 Hz (see handleTurbo).
-                                if (ControllerMappings.isTurboTarget(target, port)) {
-                                    handleTurbo(event.key.nativeKeyCode, event.type, target, port)
-                                    return@onKeyEvent true
-                                }
-                                sendKeyAction(event.type, target, port)
-                                true
                             })
                     }
 
@@ -2087,6 +2471,20 @@ open class MainActivityRuntime : ComponentActivity() {
                     }
                 }
             }
+
+            // "<friend> is now online", over whatever is on screen.
+            //
+            // At the Compose root rather than inside the library's nav host, because in a game
+            // the library is not composed at all — the same banner has to serve both. This
+            // replaces the emulator OSD message that used to handle the in-game case: the OSD is
+            // text only, so it could never show an avatar, and it looked nothing like the
+            // library's version of the same event.
+            androidx.compose.foundation.layout.Box(
+                Modifier.fillMaxSize(),
+                contentAlignment = Alignment.TopCenter,
+            ) {
+                com.armsx2.ui.friends.FriendOnlineBanner()
+            }
             }
         }
     }
@@ -2102,7 +2500,38 @@ open class MainActivityRuntime : ComponentActivity() {
     private val backHoldHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var backHoldRunnable: Runnable? = null
 
+    // Nintendo Joy-Cons report EVERY button (d-pad, face, SL/SR) as KEYCODE_UNKNOWN —
+    // Android ships no key layout for vendor 0x057E, so the keyCode is always 0 and the
+    // buttons differ ONLY by their raw scanCode (emulog-150 confirmed: 20+ distinct presses,
+    // all code=0). Synthesise a stable, distinct keycode from the scanCode so each Joy-Con
+    // button flows through the normal keyCode capture/dispatch path — bind it once in the
+    // remap menu and it sticks. Gated to 0x057E so no other controller is affected; the
+    // 0x10000 base sits far above any real Android keycode so it can never collide.
+    private fun effectiveKeyCode(event: KeyEvent): Int {
+        if (event.keyCode == KeyEvent.KEYCODE_UNKNOWN && event.scanCode != 0 &&
+            InputDevice.getDevice(event.deviceId)?.vendorId == 0x057E) {
+            return 0x10000 + event.scanCode
+        }
+        return event.keyCode
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // Joy-Con buttons all arrive as KEYCODE_UNKNOWN (no Android key layout for 0x057E,
+        // so keyCode is always 0 — emulog-150). Rewrite to a stable scanCode-derived keycode
+        // ONCE here and re-dispatch, so EVERY downstream path — bind-capture, nav, AND the
+        // in-game Compose binding lookup reached via super.dispatchKeyEvent — sees the same
+        // real, matchable key. One seam beats patching each path; gated to 0x057E inside
+        // effectiveKeyCode() so no other controller is touched. Re-entry is single (the
+        // synthetic keycode is no longer UNKNOWN, so it doesn't rewrite again).
+        val effKc = effectiveKeyCode(event)
+        if (effKc != event.keyCode) {
+            return dispatchKeyEvent(
+                KeyEvent(
+                    event.downTime, event.eventTime, event.action, effKc, event.repeatCount,
+                    event.metaState, event.deviceId, event.scanCode, event.flags, event.source,
+                ),
+            )
+        }
         val kc = event.keyCode
         if (kc != KeyEvent.KEYCODE_UNKNOWN) {
             when (event.action) {
@@ -2115,6 +2544,9 @@ open class MainActivityRuntime : ComponentActivity() {
             event.isFromSource(InputDevice.SOURCE_JOYSTICK)) {
             NativeApp.sRumbleDeviceId = event.deviceId
         }
+        // Controller-input diagnostic (ARMSX2_JOYCON): dump the device once + this key.
+        logControllerDeviceOnce(event.deviceId)
+        logControllerKey(event)
         // #254 Emulated USB keyboard. When a game runs with the USB HID keyboard
         // attached (Settings.usbKeyboard, e.g. EQOA / Konami-keyboard titles),
         // forward physical/Bluetooth keyboard key events to it. Gated so it only
@@ -2179,7 +2611,24 @@ open class MainActivityRuntime : ComponentActivity() {
         // below eats B (exit), A (confirm), Y, D-pad and L1/R1 before they reach
         // the binder. Normal nav resumes the moment capture ends.
         if (ControllerMappings.padCapturing.value) {
+            // The event is already scanCode-rewritten at the top (Joy-Con code=0 → synthetic),
+            // so Compose's binder and the in-game lookup both see the same real key.
             return super.dispatchKeyEvent(event)
+        }
+        // L1/R1 flick between settings tabs (as the old Refresh UI did). Handled here, not in
+        // Compose, because a shoulder button never reaches a Composable — the overlay nav
+        // further down consumes gamepad keys first (same reason the capture handlers above
+        // live here). The hook is non-null ONLY while the settings screen is composed, so
+        // in-game L1/R1 still goes to the pad untouched. Placed after the capture blocks so
+        // binding a shoulder button still works.
+        if (kc == KeyEvent.KEYCODE_BUTTON_L1 || kc == KeyEvent.KEYCODE_BUTTON_R1) {
+            val cycleTab = com.armsx2.ui.settingshub.SettingsCategoryNav.cycle
+            if (cycleTab != null) {
+                if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0)
+                    cycleTab(if (kc == KeyEvent.KEYCODE_BUTTON_L1) -1 else 1)
+                // Swallow the UP too, so a stray shoulder release can't leak to the pad.
+                return true
+            }
         }
         // Hold the hardware/software BACK button to exit the app (Dolphin-style).
         // Scoped to IN-GAME with no overlay/menu up — where a short BACK press does
@@ -2191,10 +2640,8 @@ open class MainActivityRuntime : ComponentActivity() {
             // If the user bound BACK to a hotkey (e.g. Menu), that binding WINS — do
             // not hijack it for hold-to-exit. (Regression fix: hold-back consumed
             // BACK before the hotkey dispatch below, killing a BACK-bound Menu key.)
-            val backBoundToHotkey = ControllerMappings.SysHotkey.values().any {
-                ControllerMappings.hotkeyCode(it) == KeyEvent.KEYCODE_BACK ||
-                    ControllerMappings.hotkeyModCode(it) == KeyEvent.KEYCODE_BACK
-            }
+            val backBoundToHotkey =
+                ControllerMappings.isHotkeyKeyOrModifier(KeyEvent.KEYCODE_BACK)
             val inGame = eState.value == EmuState.RUNNING &&
                 !WindowImpl.overlayVisible.value && !WindowImpl.showLibrary.value
             if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0)
@@ -2236,9 +2683,7 @@ open class MainActivityRuntime : ComponentActivity() {
         // Single-button binding only (combos keep their normal hotkey behaviour).
         run {
             val pm = ControllerMappings.SysHotkey.PRESSURE_MOD
-            val pmKey = ControllerMappings.hotkeyCode(pm)
-            if (pmKey != KeyEvent.KEYCODE_UNKNOWN && kc == pmKey &&
-                ControllerMappings.hotkeyModCode(pm) == KeyEvent.KEYCODE_UNKNOWN) {
+            if (ControllerMappings.matchesSingleHotkey(pm, kc)) {
                 when (event.action) {
                     KeyEvent.ACTION_DOWN -> com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = true
                     KeyEvent.ACTION_UP -> com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = false
@@ -2541,6 +2986,10 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (down) InGameOverlay.toggle()
                     return true
                 }
+                ControllerMappings.SysHotkey.SCREENSHOT -> {
+                    if (down) com.armsx2.Screenshots.capture(applicationContext)
+                    return true
+                }
                 ControllerMappings.SysHotkey.SAVE_STATE -> {
                     if (down) {
                         val slot = currentSaveSlot.value
@@ -2571,11 +3020,15 @@ open class MainActivityRuntime : ComponentActivity() {
                     return true
                 }
                 ControllerMappings.SysHotkey.TOGGLE_OSD -> {
-                    if (down && event.repeatCount == 0) InGameOverlay.toggleOsd()
+                    if (down && event.repeatCount == 0) hotkeyToast(InGameOverlay.cycleOsd())
                     return true
                 }
                 ControllerMappings.SysHotkey.GYRO_TOGGLE -> {
                     if (down && event.repeatCount == 0) toggleGyro()
+                    return true
+                }
+                ControllerMappings.SysHotkey.TOGGLE_KEYBOARD -> {
+                    if (down && event.repeatCount == 0) toggleSoftKeyboard()
                     return true
                 }
                 ControllerMappings.SysHotkey.GYRO_HOLD -> {
@@ -2595,7 +3048,7 @@ open class MainActivityRuntime : ComponentActivity() {
                         if (event.repeatCount == 0) {
                             // Holding FF supersedes any latched FF-toggle.
                             if (down) fastForwardToggleActive = false
-                            runCatching { NativeApp.speedhackLimitermode(if (down) FF_LIMITER_MODE else baseLimiterMode()) }
+                            runCatching { NativeApp.speedhackLimitermode(if (down) ffLimiterMode() else baseLimiterMode()) }
                         }
                     }
                     return true
@@ -2648,7 +3101,46 @@ open class MainActivityRuntime : ComponentActivity() {
                 null -> {}
             }
         }
+        // Gameplay buttons take the shortest path after every higher-priority
+        // frontend/capture/hotkey owner has declined them. This avoids routing
+        // ABXY through View -> Compose -> onKeyEvent before the JNI pad write.
+        if (dispatchGameplayKey(event)) return true
         return super.dispatchKeyEvent(event)
+    }
+
+    /** Route one gameplay key edge directly from Activity dispatch to the native pad. */
+    private fun dispatchGameplayKey(event: KeyEvent): Boolean {
+        if (eState.value != EmuState.RUNNING || controllerDrivesFrontend()) return false
+        val type = when (event.action) {
+            KeyEvent.ACTION_DOWN -> KeyEventType.KeyDown
+            KeyEvent.ACTION_UP -> KeyEventType.KeyUp
+            else -> return false
+        }
+        val physicalCode = event.keyCode
+        if (physicalCode == KeyEvent.KEYCODE_UNKNOWN) return false
+
+        // Local co-op routing and macro precedence exactly match the old Compose
+        // onKeyEvent path; only the dispatch layer has changed.
+        val port = com.armsx2.input.PadRouter.portForDevice(event.deviceId)
+        com.armsx2.ui.touch.TouchControls.macroForPhysicalCode(physicalCode)?.let { macro ->
+            com.armsx2.ui.touch.TouchControls.fireMacro(
+                macro, "pad$port", type == KeyEventType.KeyDown,
+            ) { code, pressed ->
+                sendKeyAction(
+                    if (pressed) KeyEventType.KeyDown else KeyEventType.KeyUp,
+                    code, port,
+                )
+            }
+            return true
+        }
+
+        val target = ControllerMappings.targetForPhysical(physicalCode, port) ?: return false
+        if (ControllerMappings.isTurboTarget(target, port)) {
+            handleTurbo(physicalCode, type, target, port)
+        } else {
+            sendKeyAction(type, target, port)
+        }
+        return true
     }
 
     /** #254: forward a hardware keyboard KeyEvent to the emulated USB keyboard.
@@ -2712,7 +3204,7 @@ open class MainActivityRuntime : ComponentActivity() {
         val on = fastForwardToggleActive
         // Fast-forward supersedes an active slow-down latch (mutually exclusive).
         if (on) slowDownToggleActive = false
-        runCatching { NativeApp.speedhackLimitermode(if (on) FF_LIMITER_MODE else baseLimiterMode()) }
+        runCatching { NativeApp.speedhackLimitermode(if (on) ffLimiterMode() else baseLimiterMode()) }
         hotkeyToast(if (on) "Fast Forward ON" else "Fast Forward OFF")
     }
 
@@ -2791,6 +3283,11 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        // Controller-input diagnostic (ARMSX2_JOYCON): logged before ANY gate so it
+        // captures the raw axes even mid-(re)bind and for SOURCE_DPAD-only events the
+        // gameplay path would drop. Pure logging — no behaviour change.
+        logControllerDeviceOnce(ev.deviceId)
+        logControllerMotion(ev)
         // While (re)binding a pad button or a hotkey, the physical D-pad on many
         // handhelds (AYN Odin 3, RP6, etc.) arrives HERE as a HAT *axis*, never as
         // a key in dispatchKeyEvent — so the capture (which only listens for key
@@ -2842,8 +3339,11 @@ open class MainActivityRuntime : ComponentActivity() {
                 MotionEvent.AXIS_X, MotionEvent.AXIS_Y,
                 aXPos = 111, aXNeg = 113, aYPos = 112, aYNeg = 110, // L right/left, down/up
                 leftStick = true, port = port)
+            // Right-stick axes resolved per-device (Joy-Con RX/RY; RZ-as-trigger pads → RX/RY) — was
+            // hard-coded Z/RZ, which read an RZ trigger as stick-Y on AYANEO Xbox-mode pads (#394).
+            val rsAxes = rightStickAxes(ev.deviceId)
             dispatchStick(ev, ControllerMappings.rightStickMode(port),
-                MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ,
+                rsAxes.first, rsAxes.second,
                 aXPos = 121, aXNeg = 123, aYPos = 122, aYNeg = 120, // R right/left, down/up
                 leftStick = false, port = port)
             // Fire any ARMSX2 hotkey bound (Hotkeys tab) to a stick DIRECTION — lets an
@@ -2858,7 +3358,7 @@ open class MainActivityRuntime : ComponentActivity() {
             dispatchDpadCombined(ev, port)
             // Analog triggers (L2/R2). Xbox / DualShock / most modern pads
             // report these as 0..1 motion-axis values, not Key.ButtonL2/R2
-            // key events, so the onKeyEvent path above never sees them.
+            // key events, so the direct key path never sees them.
             // AXIS_LTRIGGER/RTRIGGER is the modern path; some controllers
             // (older Moga, certain BT mappings) report via AXIS_BRAKE/GAS
             // instead — take the max so we handle whichever the device
@@ -2866,7 +3366,7 @@ open class MainActivityRuntime : ComponentActivity() {
             sendTrigger(ev, MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_BRAKE,
                 KeyEvent.KEYCODE_BUTTON_L2, port)
             sendTrigger(ev, MotionEvent.AXIS_RTRIGGER, MotionEvent.AXIS_GAS,
-                KeyEvent.KEYCODE_BUTTON_R2, port)
+                KeyEvent.KEYCODE_BUTTON_R2, port, axisC = rightTriggerExtraAxis(ev.deviceId))
             // Physical STICK DIRECTIONS bound to a PS2 control via the "(send)"
             // rows — e.g. R-Stick Down bound to send Square. The analog "(send)"
             // targets contribute to the merge layer like every other writer.
@@ -2890,8 +3390,9 @@ open class MainActivityRuntime : ComponentActivity() {
     private fun dispatchStickDirBindings(ev: MotionEvent, port: Int) {
         for (left in booleanArrayOf(true, false)) {
             // Same axis correction the main dispatch applies (swap, then inverts).
-            var vx = ev.getAxisValue(if (left) MotionEvent.AXIS_X else MotionEvent.AXIS_Z)
-            var vy = ev.getAxisValue(if (left) MotionEvent.AXIS_Y else MotionEvent.AXIS_RZ)
+            val (rightX, rightY) = rightStickAxes(ev.deviceId)
+            var vx = ev.getAxisValue(if (left) MotionEvent.AXIS_X else rightX)
+            var vy = ev.getAxisValue(if (left) MotionEvent.AXIS_Y else rightY)
             if (ControllerMappings.stickSwapXY(left)) { val t = vx; vx = vy; vy = t }
             if (ControllerMappings.stickInvertX(left)) vx = -vx
             if (ControllerMappings.stickInvertY(left)) vy = -vy
@@ -2923,6 +3424,46 @@ open class MainActivityRuntime : ComponentActivity() {
     // camera moves only in a cross pattern on Android). OFF unless the tester sets
     // prefs boolean "debug.stickLog" true. Shows the raw axes, the corrected pair
     // and the shaped radial output in logcat + the exportable emulog.
+    // Right-stick axis pair, resolved per device and cached.
+    //
+    // Standard Android pads put the right stick on AXIS_Z/AXIS_RZ, but some controllers —
+    // Nintendo Joy-Cons notably — report it on AXIS_RX/AXIS_RY. Every right-stick path here
+    // read Z/RZ unconditionally, so on those pads the right stick's DIRECTIONS were simply
+    // invisible: they couldn't be bound, folded onto the D-pad, or fire a stick hotkey — while
+    // R3 bound fine, because R3 is a KEYCODE and not an axis. That asymmetry is exactly what
+    // was reported. InputDevice.getDevice() is a binder call and motion events arrive far too
+    // often to query per event, hence the cache.
+    private val rightStickAxisCache = HashMap<Int, Pair<Int, Int>>()
+    private fun rightStickAxes(deviceId: Int): Pair<Int, Int> = rightStickAxisCache.getOrPut(deviceId) {
+        val dev = runCatching { InputDevice.getDevice(deviceId) }.getOrNull()
+        fun has(axis: Int) = dev?.getMotionRange(axis) != null
+        val hasRxRy = has(MotionEvent.AXIS_RX) || has(MotionEvent.AXIS_RY)
+        // AXIS_RZ that idles at 0 (range min >= 0) is a TRIGGER, not a stick — some pads (AYANEO
+        // handhelds in Xbox mode) put the right trigger on RZ. A real right-stick-Y spans -1..1, so
+        // this never reclassifies a standard pad's stick.
+        val rz = dev?.getMotionRange(MotionEvent.AXIS_RZ)
+        val rzIsTrigger = rz != null && rz.min >= 0f
+        when {
+            // Joy-Cons expose RX/RY for the right stick; prefer it even if Z/RZ also exist.
+            dev?.vendorId == 0x057E && hasRxRy -> MotionEvent.AXIS_RX to MotionEvent.AXIS_RY
+            // RZ is really a trigger — the right stick can't live on it; use RX/RY when present.
+            rzIsTrigger && hasRxRy -> MotionEvent.AXIS_RX to MotionEvent.AXIS_RY
+            // Any pad with no Z/RZ at all but with RX/RY: that IS its right stick.
+            !has(MotionEvent.AXIS_Z) && !has(MotionEvent.AXIS_RZ) && hasRxRy ->
+                MotionEvent.AXIS_RX to MotionEvent.AXIS_RY
+            else -> MotionEvent.AXIS_Z to MotionEvent.AXIS_RZ
+        }
+    }
+
+    // Extra RT axis for pads that report the right trigger on AXIS_RZ (AYANEO Xbox mode) instead of
+    // RTRIGGER/GAS. Only when RZ is a 0..1 range (a real stick-Y is -1..1), so standard pads are
+    // untouched. -1 = no such axis. Cached — InputDevice.getDevice is a binder call.
+    private val rightTriggerAxisCache = HashMap<Int, Int>()
+    private fun rightTriggerExtraAxis(deviceId: Int): Int = rightTriggerAxisCache.getOrPut(deviceId) {
+        val rz = runCatching { InputDevice.getDevice(deviceId)?.getMotionRange(MotionEvent.AXIS_RZ) }.getOrNull()
+        if (rz != null && rz.min >= 0f) MotionEvent.AXIS_RZ else -1
+    }
+
     private var lastStickProbeMs = 0L
     private fun debugStickProbe(ev: MotionEvent) {
         if (!prefs.getBoolean("debug.stickLog", false)) return
@@ -2936,6 +3477,88 @@ open class MainActivityRuntime : ComponentActivity() {
         val mag = kotlin.math.hypot(z, rz)
         println("@@STICKPROBE@@ dev=${ev.deviceId} Z=%.3f RZ=%.3f RX=%.3f RY=%.3f mag=%.3f shaped=%.3f".format(
             z, rz, rx, ry, mag, shapeStickMag(mag.coerceAtMost(1f), false)))
+    }
+
+    // ---- Joy-Con / controller input diagnostic (tag: ARMSX2_JOYCON) --------
+    // Dumps EXACTLY what a physical controller emits so a reporter can capture
+    // (adb logcat -s ARMSX2_JOYCON) what e.g. a Nintendo Joy-Con d-pad actually
+    // sends on their Android build — the unknown that blocks the real remap fix.
+    // Pure logging, zero behaviour change. Release builds never enable this path.
+    // Debug builds default OFF and can opt in with prefs "debug.joyconLog"=true.
+    // Full device info
+    // is logged once per deviceId; the per-event axis dump is throttled + non-zero.
+    private val joyconLoggedDevices = HashSet<Int>()
+    private var lastJoyconMotionLogMs = 0L
+    private fun joyconLogEnabled(): Boolean =
+        // Pref-gated, NOT BuildConfig.DEBUG-gated. The old `BuildConfig.DEBUG && pref` form
+        // made this permanently unreachable in a release build — i.e. unreachable for exactly
+        // the testers whose controllers we need to identify. It cost a round trip on the
+        // 8BitDo/Switch-Pro trigger report. Default off; costs one boolean read per event.
+        prefs.getBoolean("debug.joyconLog", false)
+
+    /** Emit a diagnostic line to BOTH logcat (adb `-s ARMSX2_JOYCON`) AND the emulog (in-app
+     *  Save Log — so a handheld tester with no PC can capture it). NativeApp.emulog no-ops
+     *  safely when the native console isn't open yet (e.g. pre-boot). */
+    private fun joyconEmit(msg: String) {
+        android.util.Log.d("ARMSX2_JOYCON", msg)
+        runCatching { NativeApp.emulog("@@JOYCON@@ $msg") }
+    }
+
+    /** One-time full dump of a controller: ids, name, sources, and every motion axis
+     *  (id + name + range/flat/fuzz). Fires the first time a gamepad deviceId is seen. */
+    private fun logControllerDeviceOnce(deviceId: Int) {
+        if (!joyconLogEnabled() || deviceId < 0) return
+        if (!joyconLoggedDevices.add(deviceId)) return
+        val dev = InputDevice.getDevice(deviceId) ?: return
+        val src = dev.sources
+        val isPad = (src and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+            (src and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+        if (!isPad) return
+        joyconEmit(
+            "DEVICE id=%d vendor=0x%04x product=0x%04x sources=0x%08x name=\"%s\"".format(
+                deviceId, dev.vendorId, dev.productId, src, dev.name ?: "?"))
+        for (r in dev.motionRanges) {
+            joyconEmit(
+                "  axis=%d (%s) src=0x%08x min=%.3f max=%.3f flat=%.3f fuzz=%.3f".format(
+                    r.axis, MotionEvent.axisToString(r.axis), r.source, r.min, r.max, r.flat, r.fuzz))
+        }
+    }
+
+    /** Throttled dump of every NON-ZERO axis on a controller motion event, so a reporter
+     *  can see which axis (HAT? stick? something else?) the Joy-Con d-pad actually drives.
+     *  Accepts DPAD-sourced events too — those are exactly the ones we're hunting. */
+    private fun logControllerMotion(ev: MotionEvent) {
+        if (!joyconLogEnabled()) return
+        if (!ev.isFromSource(InputDevice.SOURCE_JOYSTICK) &&
+            !ev.isFromSource(InputDevice.SOURCE_GAMEPAD) &&
+            !ev.isFromSource(InputDevice.SOURCE_DPAD)) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastJoyconMotionLogMs < 80) return
+        val ranges = ev.device?.motionRanges ?: return
+        val sb = StringBuilder()
+        for (r in ranges) {
+            val v = ev.getAxisValue(r.axis)
+            if (kotlin.math.abs(v) > 0.001f) sb.append(" %s=%.3f".format(MotionEvent.axisToString(r.axis), v))
+        }
+        if (sb.isEmpty()) return
+        lastJoyconMotionLogMs = now
+        joyconEmit(
+            "MOTION id=%d vendor=0x%04x src=0x%08x%s".format(
+                ev.deviceId, ev.device?.vendorId ?: -1, ev.source, sb))
+    }
+
+    /** Log a controller key event (code + name + action). Low frequency, so no throttle. */
+    private fun logControllerKey(event: KeyEvent) {
+        if (!joyconLogEnabled()) return
+        if (!event.isFromSource(InputDevice.SOURCE_GAMEPAD) &&
+            !event.isFromSource(InputDevice.SOURCE_JOYSTICK)) return
+        val a = when (event.action) {
+            KeyEvent.ACTION_DOWN -> "DOWN"; KeyEvent.ACTION_UP -> "UP"; else -> "?"
+        }
+        joyconEmit(
+            "KEY id=%d vendor=0x%04x code=%d (%s) scan=%d %s repeat=%d".format(
+                event.deviceId, InputDevice.getDevice(event.deviceId)?.vendorId ?: -1,
+                event.keyCode, KeyEvent.keyCodeToString(event.keyCode), event.scanCode, a, event.repeatCount))
     }
 
     // True whenever a Compose frontend surface is drawn over (or instead of) the
@@ -2958,6 +3581,7 @@ open class MainActivityRuntime : ComponentActivity() {
     // library sub-route (Settings/Bios/... reached inside the in-game library) >
     // the library overlay itself > a root sub-route > (root Home) open the drawer.
     private fun handleFrontendBack() {
+        com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.BACK)
         val nav = com.armsx2.navigation.UiNavigator
         val onHome = nav.route.value == com.armsx2.navigation.AppRoute.Home
         when {
@@ -3237,7 +3861,10 @@ open class MainActivityRuntime : ComponentActivity() {
         if (dx != 0) want.add(if (dx > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT)
         if (dy != 0) want.add(if (dy > 0) KeyEvent.KEYCODE_DPAD_DOWN else KeyEvent.KEYCODE_DPAD_UP)
         captureStickCode(ev, MotionEvent.AXIS_X, MotionEvent.AXIS_Y, true).takeIf { it != 0 }?.let { want.add(it) }
-        captureStickCode(ev, MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ, false).takeIf { it != 0 }?.let { want.add(it) }
+        // Right stick via the per-device pair — on a Joy-Con this is RX/RY, and reading Z/RZ
+        // here is why its directions could never be bound.
+        val (capRightX, capRightY) = rightStickAxes(ev.deviceId)
+        captureStickCode(ev, capRightX, capRightY, false).takeIf { it != 0 }?.let { want.add(it) }
         captureHatX = dx
         captureHatY = dy
         val now = SystemClock.uptimeMillis()
@@ -3356,8 +3983,11 @@ open class MainActivityRuntime : ComponentActivity() {
         val hi = (1f - outer).coerceAtLeast(dz + 0.01f) // upper edge; guard hi > dz
         val t = ((m - dz) / (hi - dz)).coerceIn(0f, 1f)
         val accel = ControllerMappings.stickAcceleration(left)
+        // Acceleration + the response-curve preset compose into one exponent (both reshape
+        // magnitude; exp==1 = linear = unchanged).
+        val exp = 1f + accel + ControllerMappings.stickCurveGamma(left)
         val curved =
-            if (accel > 0f) Math.pow(t.toDouble(), (1f + accel).toDouble()).toFloat()
+            if (exp != 1f) Math.pow(t.toDouble(), exp.toDouble()).toFloat()
             else t
         val out = (curved * ControllerMappings.stickSensitivity(left)).coerceIn(0f, 1f)
         // Anti-deadzone (output floor): lift ANY non-zero output up to start at the floor,
@@ -3534,6 +4164,14 @@ open class MainActivityRuntime : ComponentActivity() {
                 sendAxisDigital(vx, posCode = 97, negCode = 99, port = port)  // Circle / Square (right/left)
                 sendAxisDigital(vy, posCode = 96, negCode = 100, port = port) // Cross / Triangle (down/up)
             }
+            ControllerMappings.StickMode.DPAD -> {
+                // "Stick as D-pad" preset (opt-in; the nightly's default for Joy-Cons).
+                // The bit-writes happen in dispatchDpadCombined — the single, change-
+                // tracked d-pad owner, keyed off stickModeFor(...)==DPAD — so a DPAD
+                // stick and the physical HAT can never release each other. The swap/
+                // invert correction above still applied; dispatchDpadCombined re-reads
+                // the raw axes for the fold. Nothing to emit here by design.
+            }
             ControllerMappings.StickMode.CUSTOM -> {
                 // Each direction is bound to any PS2 button (per-player). D-pad targets
                 // (19-22) are owned by dispatchDpadCombined() (avoids the release race);
@@ -3561,7 +4199,8 @@ open class MainActivityRuntime : ComponentActivity() {
      *  collide with the Custom-mode 300+ codes also tracked there. */
     private fun fireStickHotkeys(ev: MotionEvent, port: Int) {
         fireStickHotkeyAxis(ev, MotionEvent.AXIS_X, MotionEvent.AXIS_Y, true, port)
-        fireStickHotkeyAxis(ev, MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ, false, port)
+        val (hkRightX, hkRightY) = rightStickAxes(ev.deviceId)
+        fireStickHotkeyAxis(ev, hkRightX, hkRightY, false, port)
     }
     private fun fireStickHotkeyAxis(ev: MotionEvent, axisX: Int, axisY: Int, left: Boolean, port: Int) {
         val x = ev.getAxisValue(axisX)
@@ -3598,6 +4237,7 @@ open class MainActivityRuntime : ComponentActivity() {
     private fun runStickHotkey(h: ControllerMappings.SysHotkey) {
         when (h) {
             ControllerMappings.SysHotkey.MENU -> InGameOverlay.toggle()
+            ControllerMappings.SysHotkey.SCREENSHOT -> com.armsx2.Screenshots.capture(applicationContext)
             ControllerMappings.SysHotkey.SAVE_STATE -> {
                 val slot = currentSaveSlot.value
                 kotlin.concurrent.thread { runCatching { NativeApp.saveStateToSlot(slot) } }
@@ -3616,7 +4256,7 @@ open class MainActivityRuntime : ComponentActivity() {
             ControllerMappings.SysHotkey.FAST_FORWARD_TOGGLE -> {
                 fastForwardToggleActive = !fastForwardToggleActive
                 val on = fastForwardToggleActive
-                runCatching { NativeApp.speedhackLimitermode(if (on) FF_LIMITER_MODE else baseLimiterMode()) }
+                runCatching { NativeApp.speedhackLimitermode(if (on) ffLimiterMode() else baseLimiterMode()) }
                 hotkeyToast(if (on) "Fast Forward ON" else "Fast Forward OFF")
             }
             ControllerMappings.SysHotkey.GYRO_TOGGLE -> toggleGyro()
@@ -3633,7 +4273,8 @@ open class MainActivityRuntime : ComponentActivity() {
             ControllerMappings.SysHotkey.SAVE_AND_EXIT -> closeGame(saveAutosave = true)
             ControllerMappings.SysHotkey.RESET_GAME -> restart()
             ControllerMappings.SysHotkey.SLOW_DOWN -> toggleSlowDown()
-            ControllerMappings.SysHotkey.TOGGLE_OSD -> InGameOverlay.toggleOsd()
+            ControllerMappings.SysHotkey.TOGGLE_OSD -> hotkeyToast(InGameOverlay.cycleOsd())
+            ControllerMappings.SysHotkey.TOGGLE_KEYBOARD -> toggleSoftKeyboard()
             // Hold-type hotkeys have no one-shot stick-edge meaning.
             ControllerMappings.SysHotkey.FAST_FORWARD,
             ControllerMappings.SysHotkey.PRESSURE_MOD -> {}
@@ -3707,12 +4348,14 @@ open class MainActivityRuntime : ComponentActivity() {
         val hatX = if (dpadAsStick) 0f else ev.getAxisValue(MotionEvent.AXIS_HAT_X)
         val hatY = if (dpadAsStick) 0f else ev.getAxisValue(MotionEvent.AXIS_HAT_Y)
         val hatActive = hatX != 0f || hatY != 0f
-        // DPAD-mode sticks are now written directly in dispatchStick (self-healing,
-        // like FACE). Do NOT fold them here, or the combined owner's change-tracked
-        // release would fight the direct writer. The combined owner still handles
+        // "Stick as D-pad" preset (StickMode.DPAD, opt-in): a stick in DPAD mode drives
+        // the PS2 d-pad through THIS single change-tracked owner (folded via foldStick
+        // below) so it can never release — or be released by — the physical HAT. Left
+        // stick = AXIS_X/Y, right = AXIS_Z/RZ. dispatchStick's DPAD branch is a no-op by
+        // design so there is exactly one writer. The combined owner also still handles
         // the physical HAT and CUSTOM directions bound to a d-pad code.
-        val leftDpad = false
-        val rightDpad = false
+        val leftDpad = ControllerMappings.stickModeFor(true, port) == ControllerMappings.StickMode.DPAD
+        val rightDpad = ControllerMappings.stickModeFor(false, port) == ControllerMappings.StickMode.DPAD
         // Nothing we own could be active → release what we hold and bail, so we
         // never touch the D-pad bits a KeyEvent-style physical D-pad drives.
         if (!hatActive && !leftDpad && !rightDpad && !customTargetsDpad(port)) {
@@ -3744,8 +4387,9 @@ open class MainActivityRuntime : ComponentActivity() {
             down = down || y > STICK_DIGITAL_THRESHOLD
             up = up || y < -STICK_DIGITAL_THRESHOLD
         }
+        val (foldRightX, foldRightY) = rightStickAxes(ev.deviceId)
         if (leftDpad) foldStick(MotionEvent.AXIS_X, MotionEvent.AXIS_Y)
-        if (rightDpad) foldStick(MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ)
+        if (rightDpad) foldStick(foldRightX, foldRightY)
 
         // Fold CUSTOM directions that target a D-pad code so they share this owner.
         fun foldCustom(isLeft: Boolean, axisX: Int, axisY: Int) {
@@ -3767,7 +4411,7 @@ open class MainActivityRuntime : ComponentActivity() {
             mark(ControllerMappings.StickDir.UP, y < -STICK_DIGITAL_THRESHOLD)
         }
         foldCustom(true, MotionEvent.AXIS_X, MotionEvent.AXIS_Y)
-        foldCustom(false, MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ)
+        foldCustom(false, foldRightX, foldRightY)
 
         // Write only on change so a resting stick's motion stream can't re-release
         // a direction the physical D-pad is also holding.
@@ -3783,7 +4427,33 @@ open class MainActivityRuntime : ComponentActivity() {
         apply(19, up)    // D-pad up
     }
 
-    private fun sendTrigger(event: MotionEvent, axisA: Int, axisB: Int, code: Int, port: Int) {
+    /** Does this device actually report the given motion axis? InputDevice.getDevice is a
+     *  binder call and motion events arrive far too often to query per event, hence the cache. */
+    private val axisPresenceCache = HashMap<Long, Boolean>()
+    private fun deviceHasAxis(deviceId: Int, axis: Int): Boolean {
+        if (axis < 0) return false
+        return axisPresenceCache.getOrPut((deviceId.toLong() shl 32) or (axis.toLong() and 0xffffffffL)) {
+            runCatching { InputDevice.getDevice(deviceId)?.getMotionRange(axis) }.getOrNull() != null
+        }
+    }
+
+    private fun sendTrigger(event: MotionEvent, axisA: Int, axisB: Int, code: Int, port: Int, axisC: Int = -1) {
+        // A pad with NO analog trigger axis at all — a Nintendo Switch Pro Controller, or an
+        // 8BitDo Pro in Switch mode, which enumerates as one (vendor 0x057e) — delivers L2/R2
+        // ONLY as KEYCODE_BUTTON_L2/R2 key events. Its axis list is just X/Y, Z/RZ and the HAT.
+        //
+        // Reading the absent trigger axes yields 0.0, so the lines below wrote "trigger
+        // released" on EVERY motion event. Hold R2 and move the stick and the stick's own
+        // motion event cancelled the held trigger — "R2 and the stick can't be used at the
+        // same time", which kills racing games. Buttons were unaffected because nothing on the
+        // motion path writes them; only L2/R2 have a motion-side writer. Same shape as the
+        // D-pad "last write wins" bug handled in dispatchDpadCombined.
+        //
+        // When the device has none of these axes, leave the key path in sole charge.
+        if (!deviceHasAxis(event.deviceId, axisA) && !deviceHasAxis(event.deviceId, axisB) &&
+            !deviceHasAxis(event.deviceId, axisC))
+            return
+
         // Pads report L2/R2 on AXIS_*TRIGGER or on AXIS_BRAKE/GAS — take the higher of
         // the two, clamping negatives (some non-Xbox pads idle an unused trigger axis at
         // -1). Then apply the SMALL trigger deadzone and re-normalize the remaining range
@@ -3795,7 +4465,10 @@ open class MainActivityRuntime : ComponentActivity() {
         // Resolve the physical trigger keycode to its mapped PS2 target — null = cleared,
         // so the trigger is disabled; otherwise drive the resolved (possibly remapped) code.
         val target = ControllerMappings.targetForPhysical(code, port) ?: return
-        val raw = maxOf(event.getAxisValue(axisA), event.getAxisValue(axisB)).coerceIn(0f, 1f)
+        val raw = maxOf(
+            maxOf(event.getAxisValue(axisA), event.getAxisValue(axisB)),
+            if (axisC >= 0) event.getAxisValue(axisC) else 0f,
+        ).coerceIn(0f, 1f)
         val out = if (raw <= TRIGGER_DEAD) 0f else (raw - TRIGGER_DEAD) / (1f - TRIGGER_DEAD)
         if (target in 110..123) {
             // Trigger bound to a PS2 STICK direction ("(send)" rows): contribute the
@@ -3807,7 +4480,30 @@ open class MainActivityRuntime : ComponentActivity() {
         }
     }
 
+    /** Set in onPause when the screen goes off (a real sleep), consumed in onResume so the sleep
+     *  chime is paired with a wake chime + a brief "Welcome Back!" — never on a plain background. */
+    private var wasAsleep = false
+
+    /** Frees a pad's slot in PadRouter when its controller is unplugged / power-cycled, so a
+     *  re-enumerated device (a NEW deviceId after AYANEO sleep/wake) re-claims Player 1 instead of
+     *  the stale dead id owning it and shunting gameplay to an un-armed pad (#394). Registered in
+     *  onCreate and kept alive across pause so the wake-time remove/add is caught. */
+    private val inputDeviceListener = object : android.hardware.input.InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) {}
+        override fun onInputDeviceChanged(deviceId: Int) {}
+        override fun onInputDeviceRemoved(deviceId: Int) {
+            com.armsx2.input.PadRouter.forgetDevice(deviceId)
+        }
+    }
+
     override fun onPause() {
+        // DS-lid-style chime when the SCREEN is going off (device sleeping) — gated on isInteractive
+        // so a plain background (home / recents, screen still on) stays silent. Fires before we pause
+        // audio below so the blip is heard as the device sleeps.
+        if ((getSystemService(android.content.Context.POWER_SERVICE) as? android.os.PowerManager)?.isInteractive == false) {
+            wasAsleep = true
+            com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SLEEP)
+        }
         com.armsx2.navigation.UiNavigator.drawerOpen.value = false
         // Leaving the app (home / recents / slide-out) while a game is running:
         // open the pause OVERLAY instead of a silent pause. A bare pause left
@@ -3825,7 +4521,36 @@ open class MainActivityRuntime : ComponentActivity() {
         // PGO instrument build: flush profile counters so a profiling run survives
         // an Android process kill. No-op in normal builds.
         runCatching { NativeApp.dumpPgoProfile() }
+        // Library music must not keep playing out of a backgrounded app — it would sound
+        // like the emulator ignoring the home button. Paused, not stopped, so returning
+        // to the library picks it back up.
+        com.armsx2.LibraryMusic.pause()
         super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Woke from a real sleep (paired with the onPause sleep chime): play the wake chime + a brief
+        // top-left "Welcome Back!". A plain background return never set wasAsleep, so this only fires
+        // after an actual screen-off sleep.
+        if (wasAsleep) {
+            wasAsleep = false
+            com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.WAKE)
+            if (prefs.getBoolean("ui.hotkeyToasts", true))
+                com.armsx2.ui.WelcomeBanner.show(com.armsx2.i18n.I18n.get("app.welcomeBack"))
+        }
+        // #394 backstop: a controller that slept and woke returns with a NEW deviceId, so drop any
+        // pad slot whose device is no longer connected — the re-enumerated pad then re-claims Player 1
+        // rather than the dead id silently owning it. (inputDeviceListener catches the live remove;
+        // this covers a remove that landed while we were paused / was never delivered.)
+        com.armsx2.input.PadRouter.pruneStale(android.view.InputDevice.getDeviceIds())
+        // Returning to the foreground: call start(), not resume(). A PERMANENT audio-focus
+        // loss (another media app took over — YouTube, iiSU) releases our player entirely,
+        // and resume() only un-pauses an existing player, so the music stayed dead until a
+        // full app restart (#398-adjacent report). start() rebuilds a released player — and
+        // still just un-pauses a merely-paused one — while its own guards keep it a no-op
+        // when the setting is off, a VM is running, or that other app is still playing.
+        com.armsx2.LibraryMusic.start(this)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -3835,6 +4560,8 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        getSystemService(android.hardware.input.InputManager::class.java)
+            ?.unregisterInputDeviceListener(inputDeviceListener)
         // On a CONFIGURATION-driven recreate (e.g. Samsung DeX moving the activity to
         // an external display, density/uiMode change) Android destroys+recreates us.
         // Do NOT tear down the native VM or hard-kill the process then — that races the
@@ -3851,12 +4578,63 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     private fun handleExternalLaunchIntent(intent: Intent?) {
-        val uri = extractLaunchUri(intent) ?: return
-        persistReadGrant(intent, uri)
+        val raw = extractLaunchUri(intent) ?: return
+        persistReadGrant(intent, raw)
+        // Frontends (Cocoon/Daijisho/ES-DE) list the .cue, since that's the canonical disc
+        // descriptor for a cue+bin rip — but the core has no cue parser and .cue isn't in its
+        // disc whitelist (VMManager::IsDiscFileName), so booting one fails outright. Resolve
+        // the cue's first FILE "<name>" BINARY entry to its sibling track and launch that.
+        // Falls back to the original URI whenever anything fails, so a launch that already
+        // worked (.iso/.bin/.chd) can never be made worse by this.
+        val uri = resolveCueToTrack(raw) ?: raw
         currentGame.value = null
         pendingExternalLaunch.value = uri.toString()
         launchPendingExternalGameIfReady()
     }
+
+    /** Maps a `.cue` sheet to the track file it points at. Returns null for anything that
+     *  isn't a resolvable cue, so the caller keeps the original URI. */
+    private fun resolveCueToTrack(cue: Uri): Uri? = runCatching {
+        val label = (cue.lastPathSegment ?: cue.path).orEmpty()
+        if (!label.endsWith(".cue", ignoreCase = true)) return null
+        val text = readBounded(cue) ?: return null
+        // FILE "Game.bin" BINARY  — the name may also be unquoted. Strip any directory part;
+        // a cue always references tracks sitting beside it.
+        val m = Regex("""(?im)^\s*FILE\s+(?:"([^"]+)"|(\S+))""").find(text) ?: return null
+        val track = (m.groupValues[1].takeIf(String::isNotBlank) ?: m.groupValues[2])
+            .trim().substringAfterLast('/').substringAfterLast('\\')
+        if (track.isBlank()) return null
+        siblingOf(cue, track)
+    }.getOrNull()
+
+    /** Bounded read — cue sheets are a few hundred bytes, so never slurp an arbitrary file. */
+    private fun readBounded(uri: Uri, limit: Int = 65536): String? = runCatching {
+        val stream = if (uri.scheme == "content") contentResolver.openInputStream(uri)
+        else uri.path?.let { java.io.File(it).takeIf(java.io.File::isFile)?.inputStream() }
+        stream?.use { s ->
+            val buf = ByteArray(limit)
+            var n = 0
+            while (n < limit) {
+                val r = s.read(buf, n, limit - n)
+                if (r <= 0) break
+                n += r
+            }
+            String(buf, 0, n)
+        }
+    }.getOrNull()
+
+    /** Sibling file alongside [origin]. Raw/file paths resolve directly (we hold all-files
+     *  access on the sideload build); a content:// URI only resolves when it carries a parent
+     *  — a single-document grant from a frontend does not, so we return null and fall back. */
+    private fun siblingOf(origin: Uri, fileName: String): Uri? = runCatching {
+        if (origin.scheme == null || origin.scheme == "file") {
+            val parent = origin.path?.let { java.io.File(it).parentFile } ?: return null
+            java.io.File(parent, fileName).takeIf { it.isFile }?.absolutePath?.toUri()
+        } else {
+            androidx.documentfile.provider.DocumentFile.fromSingleUri(this, origin)
+                ?.parentFile?.findFile(fileName)?.takeIf { it.isFile }?.uri
+        }
+    }.getOrNull()
 
     private fun extractLaunchUri(intent: Intent?): Uri? {
         if (intent == null)

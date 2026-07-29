@@ -65,9 +65,14 @@ object WindowImpl {
     }
 
     private fun resumeIfPaused() {
-        if (MainActivityRuntime.eState.value == EmuState.PAUSED &&
-            !com.armsx2.ui.touch.TouchControls.editMode.value
-        ) {
+        // Deliberately NOT gated on eState == PAUSED any more. eState is driven by
+        // Host::OnVMPaused/OnVMResumed, which fire at the very END of VMManager::SetState — after
+        // the pause edge has already parked MTVU/MTGS — so it lags the real VM state. A stale
+        // RUNNING here silently skipped the resume and left the game frozen with no overlay up,
+        // which is the mirror of the bug in the focus-effect backstop. The native resume() is
+        // already a no-op unless the VM is exactly Paused, so calling it unconditionally is safe
+        // and drops the stale-state dependency entirely.
+        if (!com.armsx2.ui.touch.TouchControls.editMode.value) {
             MainActivityRuntime.resume()
         }
     }
@@ -183,6 +188,10 @@ object WindowImpl {
                 // reachable from any screen, and placing it AFTER the shader editor keeps it
                 // above the one other full-screen layer that opens it.
                 com.armsx2.ui.home.LibraryKeyboard.Overlay(this)
+
+                // Transient top-left "Welcome Back!" banner (and any future brief note) — hosted
+                // here for the same reason as the keyboard: reachable above every surface.
+                com.armsx2.ui.WelcomeBannerOverlay(this)
             }
         }
     }

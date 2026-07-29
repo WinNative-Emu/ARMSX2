@@ -47,6 +47,7 @@
 #include "common/Error.h"
 #include "common/FileSystem.h"
 #include "common/FPControl.h"
+#include "common/Perf.h"
 #include "common/ScopedGuard.h"
 #include "common/SettingsWrapper.h"
 #include "common/SmallString.h"
@@ -78,6 +79,10 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #include "common/Darwin/DarwinMisc.h"
+#endif
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+extern "C" void ARMSX2_PostEmulationOnlyStartupReady(void);
 #endif
 
 namespace VMManager
@@ -159,8 +164,19 @@ static bool s_log_block_system_console = false;
 static bool s_log_force_file_log = false;
 
 static std::atomic<VMState> s_state{VMState::Shutdown};
+static std::atomic_bool s_emulation_only_mode{false};
+static std::atomic<u32> s_emulation_only_release_flags{VMManager::EMULATION_ONLY_RELEASE_ALL};
+static std::atomic_bool s_boot_patches_applied{false};
+static std::atomic_bool s_texture_replacement_startup_complete{false};
+static std::atomic_bool s_emulation_only_startup_notification_posted{false};
 static bool s_cpu_implementation_changed = false;
 static Threading::ThreadHandle s_vm_thread_handle;
+
+static bool ArePatchesDisabledByEmulationOnlyMode()
+{
+	return s_emulation_only_mode.load(std::memory_order_acquire) &&
+		(s_emulation_only_release_flags.load(std::memory_order_acquire) & VMManager::EMULATION_ONLY_RELEASE_PATCHES) != 0;
+}
 
 static std::deque<std::thread> s_save_state_threads;
 static std::mutex s_save_state_threads_mutex;
@@ -377,10 +393,32 @@ const std::string& VMManager::GetCurrentELF()
 	return s_elf_path;
 }
 
+// Identity of the CPU thread, for IsOnCPUThread(). The CPU thread owns EmuConfig and is the
+// sole producer into the MTGS ring, so a good deal of core state may only be touched from it;
+// this backs the dev asserts that catch a frontend calling in from its UI thread instead of
+// marshalling via Host::RunOnCPUThread().
+static std::atomic<std::thread::id> s_cpu_thread_id{};
+
+bool VMManager::Internal::IsOnCPUThread()
+{
+	const std::thread::id owner = s_cpu_thread_id.load(std::memory_order_acquire);
+
+	// Permissive before CPUThreadInitialize() and after CPUThreadShutdown(): during startup and
+	// teardown there is no CPU thread to marshal onto, and the frontends legitimately drive core
+	// setup inline (e.g. VMManager::ApplySettings before the first Initialize). Test harnesses
+	// which never register a CPU thread at all are covered by the same allowance.
+	if (owner == std::thread::id())
+		return true;
+
+	return owner == std::this_thread::get_id();
+}
+
 bool VMManager::Internal::CPUThreadInitialize()
 {
 	Threading::SetNameOfCurrentThread("CPU Thread");
+	s_cpu_thread_id.store(std::this_thread::get_id(), std::memory_order_release);
 	PerformanceMetrics::SetCPUThread(Threading::ThreadHandle::GetForCallingThread());
+	PerformanceMetrics::AdpfRegisterCallingThread(); // ADPF: hint the EE thread's core (Android)
 
 	// On Win32, we have a bunch of things which use COM (e.g. SDL, XAudio2, etc).
 	// We need to initialize COM first, before anything else does, because otherwise they might
@@ -459,6 +497,7 @@ void VMManager::Internal::CPUThreadShutdown()
 	WaitForSaveStateFlush();
 
 	PerformanceMetrics::SetCPUThread(Threading::ThreadHandle());
+	PerformanceMetrics::AdpfShutdown(); // ADPF: close the hint session on VM shutdown (Android)
 
 	USBshutdown();
 
@@ -477,6 +516,9 @@ void VMManager::Internal::CPUThreadShutdown()
 	Log::SetFileOutputLevel(LOGLEVEL_NONE, std::string());
 
 	R5900SymbolImporter.ShutdownWorkerThread();
+
+	// Last: everything above still runs as the CPU thread and may hit an IsOnCPUThread() assert.
+	s_cpu_thread_id.store(std::thread::id(), std::memory_order_release);
 }
 
 u64 VMManager::Internal::GetPerformanceClusterAffinityMask()
@@ -583,6 +625,11 @@ void VMManager::Internal::LoadStartupSettings()
 	EmuFolders::LoadConfig(*bsi);
 	EmuFolders::EnsureFoldersExist();
 
+	// Redirect perf jitdump (Linux ProfileWithPerfJitDump builds) out of /tmp
+	// into the cache dir; the dump can be hundreds of MB and tmpfs /tmp on
+	// embedded targets fills up. No-op on non-jitdump builds.
+	Perf::SetJitDumpDir(EmuFolders::Cache);
+
 	// We need to create the console window early, otherwise it appears behind the main window.
 	UpdateLoggingSettings(*bsi);
 
@@ -641,6 +688,10 @@ void VMManager::LoadSettings()
 	InputManager::ReloadSources(*si, lock);
 	LoadInputBindings(*si, lock);
 	UpdateLoggingSettings(*si);
+
+	// Apply runtime perf-dump gate from Profiler config (no-op on
+	// non-USE_PERF_JITDUMP builds).
+	Perf::SetJitDumpEnabled(EmuConfig.Profiler.EnablePerfDump);
 
 	if (HasValidOrInitializingVM())
 	{
@@ -782,6 +833,19 @@ void VMManager::ApplyGameFixes()
 
 void VMManager::ApplySettings()
 {
+	// Must run on the CPU thread. This move-constructs and then reconstructs the whole global
+	// EmuConfig — every std::string in it is freed and reallocated, and there is a window where
+	// EmuConfig is moved-from — and CheckForCPUConfigChanges() below goes on to call
+	// ClearCPUExecutionCaches(), i.e. it resets the recompiler code caches. That function
+	// documents that it expects to be re-entered from inside the running CPU ("we're still
+	// executing the cpu when this function is called"), which is only true on the CPU thread.
+	// Called from a UI thread instead, it frees the JIT code buffer under an executing JIT.
+	//
+	// Note the WaitVU/WaitGS below is a *drain*, not a park: it does not stop the EE, so it is no
+	// substitute for being on the right thread.
+	pxAssertMsg(Internal::IsOnCPUThread(),
+		"VMManager::ApplySettings() off the CPU thread — marshal via Host::RunOnCPUThread()");
+
 	Console.WriteLn("Applying settings...");
 
 	// If we're running, ensure the threads are synced.
@@ -802,6 +866,8 @@ void VMManager::ApplySettings()
 	if (vtlb_FastmemAreaUnavailable() && EmuConfig.Cpu.Recompiler.EnableFastmem)
 		EmuConfig.Cpu.Recompiler.EnableFastmem = false;
 	CheckForConfigChanges(old_config);
+	if (s_emulation_only_mode.load(std::memory_order_acquire))
+		ReleaseNonEssentialRuntimeResources(s_emulation_only_release_flags.load(std::memory_order_acquire));
 }
 
 void VMManager::ApplyCoreSettings()
@@ -833,6 +899,8 @@ void VMManager::ApplyCoreSettings()
 	}
 
 	CheckForConfigChanges(old_config);
+	if (s_emulation_only_mode.load(std::memory_order_acquire))
+		ReleaseNonEssentialRuntimeResources(s_emulation_only_release_flags.load(std::memory_order_acquire));
 }
 
 bool VMManager::ReloadGameSettings()
@@ -912,7 +980,8 @@ void VMManager::Internal::UpdateEmuFolders()
 
 	if (VMManager::HasValidVM())
 	{
-		if (EmuFolders::Cheats != old_cheats_directory || EmuFolders::Patches != old_patches_directory)
+		if ((EmuFolders::Cheats != old_cheats_directory || EmuFolders::Patches != old_patches_directory) &&
+			!ArePatchesDisabledByEmulationOnlyMode())
 			Patch::ReloadPatches(s_disc_serial, s_current_crc, true, false, true, true);
 
 		if (EmuFolders::MemoryCards != old_memcards_directory)
@@ -1184,7 +1253,10 @@ void VMManager::UpdateDiscDetails(bool booting)
 	ApplySettings();
 
 	// Patches are game-dependent, thus should get applied after game settings ia loaded.
-	Patch::ReloadPatches(s_disc_serial, HasBootedELF() ? s_current_crc : 0, true, true, false, false);
+	if (!ArePatchesDisabledByEmulationOnlyMode())
+	{
+		Patch::ReloadPatches(s_disc_serial, HasBootedELF() ? s_current_crc : 0, true, true, false, false);
+	}
 
 	ReportGameChangeToHost();
 	if (MTGS::IsOpen())
@@ -1221,7 +1293,8 @@ void VMManager::HandleELFChange(bool verbose_patches_if_changed)
 	Achievements::GameChanged(s_disc_crc, crc_to_report);
 
 	Console.WriteLn(Color_StrongOrange, fmt::format("ELF changed, active CRC {:08X} ({})", crc_to_report, s_elf_path));
-	Patch::ReloadPatches(s_disc_serial, crc_to_report, false, false, false, verbose_patches_if_changed);
+	if (!ArePatchesDisabledByEmulationOnlyMode())
+		Patch::ReloadPatches(s_disc_serial, crc_to_report, false, false, false, verbose_patches_if_changed);
 	ApplyCoreSettings();
 }
 
@@ -1384,6 +1457,12 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
 		Error::SetString(error, TRANSLATE_STR("VMManager", "The virtual machine is already running."));
 		return VMBootResult::StartupFailure;
 	}
+
+	s_emulation_only_mode.store(false, std::memory_order_release);
+	s_emulation_only_release_flags.store(EMULATION_ONLY_RELEASE_ALL, std::memory_order_release);
+	s_boot_patches_applied.store(false, std::memory_order_release);
+	s_texture_replacement_startup_complete.store(false, std::memory_order_release);
+	s_emulation_only_startup_notification_posted.store(false, std::memory_order_release);
 
 	// cancel any game list scanning, we need to use CDVD!
 	// TODO: we can get rid of this once, we make CDVD not use globals...
@@ -1669,6 +1748,15 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
 	FullscreenUI::OnVMStarted();
 	UpdateInhibitScreensaver(EmuConfig.InhibitScreensaver);
 
+	// A BIOS-only boot has no game ELF or replacement-texture map to signal the
+	// normal readiness barriers. Its optional-resource teardown may begin once
+	// all VM subsystems above have finished initializing.
+	if (boot_params.filename.empty())
+	{
+		NotifyBootPatchesApplied();
+		NotifyTextureReplacementStartupComplete();
+	}
+
 	SetEmuThreadAffinities();
 
 	// do we want to load state?
@@ -1690,6 +1778,8 @@ void VMManager::Shutdown(bool save_resume_state)
 	// we'll probably already be stopping (this is how Qt calls shutdown),
 	// but just in case, so any of the stuff we call here knows we don't have a valid VM.
 	s_state.store(VMState::Stopping, std::memory_order_release);
+
+	PerformanceMetrics::LogSessionSummary();
 
 	SetTimerResolutionIncreased(false);
 
@@ -2322,7 +2412,18 @@ void VMManager::ResetFrameLimiter()
 void VMManager::Internal::Throttle()
 {
 	if (s_target_speed == 0.0f || s_use_vsync_for_timing)
+	{
+		// Not frame-limiting this frame (unlimited / host-vsync pacing): invalidate the ADPF work
+		// period so no wall-time-with-wait duration is submitted.
+		PerformanceMetrics::AdpfPauseFrameWork();
 		return;
+	}
+
+	// ADPF: report the active-work period that just ended (before the limiter sleep below), then
+	// re-open a new period AFTER the sleep. The ScopedGuard fires on EVERY exit past here —
+	// including the missed-frame early return — so measurement survives the can't-hit-target case.
+	PerformanceMetrics::AdpfOnFrameWorkComplete();
+	ScopedGuard adpf_begin_next_work([]() { PerformanceMetrics::AdpfBeginFrameWork(); });
 
 	const u64 uExpectedEnd =
 		s_limiter_frame_start +
@@ -2681,9 +2782,26 @@ void VMManager::LogCPUCapabilities()
 		extensions += "AVX2 ";
 	if (g_cpu.vectorISA >= ProcessorFeatures::VectorISA::AVX512F)
 		extensions += "AVX512F ";
-#ifdef ARCH_ARM64
+#elif defined(ARCH_ARM64)
+	// This arm used to sit nested *inside* the ARCH_X86 block, so it never
+	// compiled and the whole "CPU Extensions Detected" section never printed
+	// on ARM. NEON on its own says nothing — it is architectural on AArch64 —
+	// so report what actually varies across our targets: LSE (absent on the
+	// ARMv8.0 handhelds) and SVE (SPU2 selects its SVE2 path at compile time,
+	// making a mismatch here the first thing to check on a SIGILL report).
+	// cpuinfo_initialize() has already run unconditionally in
+	// CPUThreadInitialize, immediately before this function is called.
+	std::string extensions;
 	if (cpuinfo_has_arm_neon())
 		extensions += "NEON ";
+	if (cpuinfo_has_arm_atomics())
+		extensions += "LSE ";
+	if (cpuinfo_has_arm_crc32())
+		extensions += "CRC32 ";
+	if (cpuinfo_has_arm_sve())
+		extensions += "SVE ";
+	if (cpuinfo_has_arm_sve2())
+		extensions += "SVE2 ";
 #endif
 
 	StringUtil::StripWhitespace(&extensions);
@@ -2691,7 +2809,6 @@ void VMManager::LogCPUCapabilities()
 	Console.WriteLn(Color_StrongBlack, "CPU Extensions Detected:");
 	Console.WriteLnFmt("  {}", extensions);
 	Console.WriteLn();
-#endif
 
 #ifdef ARCH_ARM64
 	const size_t runtime_cache_line_size = HostSys::GetRuntimeCacheLineSize();
@@ -2712,24 +2829,11 @@ void VMManager::LogCPUCapabilities()
 
 void VMManager::InitializeCPUProviders()
 {
-#ifdef _M_X86 // TODO(Stenzek): Remove me once EE/VU/IOP recs are added.
 	recCpu.Reserve();
 	psxRec.Reserve();
 
 	CpuMicroVU0.Reserve();
 	CpuMicroVU1.Reserve();
-#else
-	// ARM64 (Phase 1.5): reserve the EE recompiler so its code cache + constant pool
-	// are set up. (Phase 6) the IOP recompiler is now ported, so reserve it too.
-	// (Phase 7.8) the VU recompilers (microVU0/1) are now ported — reserve them as well.
-	// recMicroVU1::Reserve() opens vu1Thread for us (mirrors x86 microVU.cpp), so we no
-	// longer open it explicitly here.
-	recCpu.Reserve();
-	psxRec.Reserve();
-
-	CpuMicroVU0.Reserve();
-	CpuMicroVU1.Reserve();
-#endif
 
 	VifUnpackSSE_Init();
 }
@@ -2742,21 +2846,11 @@ void VMManager::ShutdownCPUProviders()
 		dVifRelease(0);
 	}
 
-#ifdef _M_X86 // TODO(Stenzek): Remove me once EE/VU/IOP recs are added.
 	CpuMicroVU1.Shutdown();
 	CpuMicroVU0.Shutdown();
 
 	psxRec.Shutdown();
 	recCpu.Shutdown();
-#else
-	// ARM64 (Phase 1.5 / Phase 6 / Phase 7.8): tear down the VU + IOP + EE recompilers
-	// reserved above. recMicroVU1::Shutdown() waits on / closes vu1Thread for us.
-	CpuMicroVU1.Shutdown();
-	CpuMicroVU0.Shutdown();
-
-	psxRec.Shutdown();
-	recCpu.Shutdown();
-#endif
 }
 
 void VMManager::UpdateCPUImplementations()
@@ -2770,24 +2864,11 @@ void VMManager::UpdateCPUImplementations()
 		return;
 	}
 
-#ifdef _M_X86 // TODO(Stenzek): Remove me once EE/VU/IOP recs are added.
 	Cpu = CHECK_EEREC ? &recCpu : &intCpu;
 	psxCpu = CHECK_IOPREC ? &psxRec : &psxInt;
 
 	CpuVU0 = EmuConfig.Cpu.Recompiler.EnableVU0 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU0) : static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
 	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
-#else
-	// ARM64 (Phase 4.3): the EE recompiler is now functional, so select it when the
-	// EE rec is enabled (it falls back to the interpreter per-opcode for anything it
-	// can't compile yet). (Phase 6) the IOP recompiler is functional too — same
-	// per-opcode interpreter fallback model. (Phase 7.8) microVU0/1 are now ported, so
-	// select them when the VU recs are enabled (mirrors the x86 path).
-	Cpu = CHECK_EEREC ? &recCpu : &intCpu;
-	psxCpu = CHECK_IOPREC ? &psxRec : &psxInt;
-
-	CpuVU0 = EmuConfig.Cpu.Recompiler.EnableVU0 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU0) : static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
-	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
-#endif
 }
 
 void VMManager::Internal::ClearCPUExecutionCaches()
@@ -2795,23 +2876,9 @@ void VMManager::Internal::ClearCPUExecutionCaches()
 	Cpu->Reset();
 	psxCpu->Reset();
 
-#ifdef _M_X86 // TODO(Stenzek): Remove me once EE/VU/IOP recs are added.
 	// mVU's VU0 needs to be properly initialized for macro mode even if it's not used for micro mode!
 	if (CHECK_EEREC && !EmuConfig.Cpu.Recompiler.EnableVU0)
 		CpuMicroVU0.Reset();
-#else
-	// ARM64 (Phase 1.5 / Phase 6): reset the EE + IOP rec code caches/constant pools
-	// even when not the active provider, so their emit cursors start clean on each VM
-	// reset (Cpu->Reset()/psxCpu->Reset() above only reset the interpreters when the
-	// recs aren't selected).
-	recCpu.Reset();
-	psxRec.Reset();
-
-	// (Phase 7.8) mVU's VU0 needs to be properly initialized for macro mode even if it's
-	// not used for micro mode (mirrors the x86 branch above).
-	if (CHECK_EEREC && !EmuConfig.Cpu.Recompiler.EnableVU0)
-		CpuMicroVU0.Reset();
-#endif
 
 	CpuVU0->Reset();
 	CpuVU1->Reset();
@@ -2939,7 +3006,8 @@ void VMManager::Internal::ELFLoadingOnCPUThread(std::string elf_path)
 	// Remove patches, if we're changing games, we don't want to be applying the patch for the old game while it's loading.
 	if (!was_running_bios)
 	{
-		Patch::ReloadPatches(s_disc_serial, 0, false, false, false, true);
+		if (!ArePatchesDisabledByEmulationOnlyMode())
+			Patch::ReloadPatches(s_disc_serial, 0, false, false, false, true);
 		ApplyCoreSettings();
 	}
 }
@@ -2964,6 +3032,7 @@ void VMManager::Internal::EntryPointCompilingOnCPUThread()
 	HandleELFChange(true);
 
 	Patch::ApplyBootPatches();
+	NotifyBootPatchesApplied();
 
 	// If the config changes at this point, it's a reset, so the game doesn't currently know about the memcard
 	// so there's no need to leave the eject running.
@@ -3032,6 +3101,11 @@ void VMManager::CheckForCPUConfigChanges(const Pcsx2Config& old_config)
 
 	Console.WriteLn("Updating CPU configuration...");
 	FPControlRegister::SetCurrent(EmuConfig.Cpu.FPUFPCR);
+
+	// The VU program cache toggle (EnableVUProgramCache) is picked up by the
+	// mVUreset that ClearCPUExecutionCaches triggers below — recording and the
+	// disk cache are re-synced there from the live config, so no explicit sync
+	// is needed here.
 	Internal::ClearCPUExecutionCaches();
 	memBindConditionalHandlers();
 
@@ -3212,7 +3286,7 @@ void VMManager::CheckForConfigChanges(const Pcsx2Config& old_config)
 
 void VMManager::ReloadPatches(bool reload_files, bool reload_enabled_list, bool verbose, bool verbose_if_changed)
 {
-	if (!HasValidVM())
+	if (!HasValidVM() || ArePatchesDisabledByEmulationOnlyMode())
 		return;
 
 	Patch::ReloadPatches(s_disc_serial, HasBootedELF() ? s_current_crc : 0, reload_files, reload_enabled_list, verbose, verbose_if_changed);
@@ -3220,6 +3294,112 @@ void VMManager::ReloadPatches(bool reload_files, bool reload_enabled_list, bool 
 	// Might change widescreen mode.
 	if (Patch::ReloadPatchAffectingOptions())
 		ApplyCoreSettings();
+}
+
+bool VMManager::IsEmulationOnlyMode()
+{
+	return s_emulation_only_mode.load(std::memory_order_acquire);
+}
+
+static void TryPostEmulationOnlyStartupReady()
+{
+	if (!s_boot_patches_applied.load(std::memory_order_acquire) ||
+		!s_texture_replacement_startup_complete.load(std::memory_order_acquire))
+	{
+		return;
+	}
+
+	bool expected = false;
+	if (!s_emulation_only_startup_notification_posted.compare_exchange_strong(
+			expected, true, std::memory_order_acq_rel, std::memory_order_acquire))
+	{
+		return;
+	}
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+	ARMSX2_PostEmulationOnlyStartupReady();
+#endif
+}
+
+void VMManager::NotifyBootPatchesApplied()
+{
+	s_boot_patches_applied.store(true, std::memory_order_release);
+	TryPostEmulationOnlyStartupReady();
+}
+
+void VMManager::NotifyTextureReplacementStartupComplete()
+{
+	s_texture_replacement_startup_complete.store(true, std::memory_order_release);
+	TryPostEmulationOnlyStartupReady();
+}
+
+void VMManager::ReleaseNonEssentialRuntimeResources(u32 release_flags)
+{
+	if (!HasValidVM())
+		return;
+
+	release_flags &= EMULATION_ONLY_RELEASE_ALL;
+	s_emulation_only_release_flags.store(release_flags, std::memory_order_release);
+	s_emulation_only_mode.store(true, std::memory_order_release);
+
+	// These are runtime copies. Persistent user settings are intentionally unchanged and
+	// LoadSettings() restores them for the next VM session.
+	if (release_flags & EMULATION_ONLY_RELEASE_PINE)
+		EmuConfig.EnablePINE = false;
+	if (release_flags & EMULATION_ONLY_RELEASE_DISCORD_PRESENCE)
+		EmuConfig.EnableDiscordPresence = false;
+	if (release_flags & EMULATION_ONLY_RELEASE_ACHIEVEMENTS)
+		EmuConfig.Achievements.Enabled = false;
+	if (release_flags & EMULATION_ONLY_RELEASE_PATCHES)
+	{
+		EmuConfig.EnablePatches = false;
+		EmuConfig.EnableCheats = false;
+		EmuConfig.EnableWideScreenPatches = false;
+		EmuConfig.EnableNoInterlacingPatches = false;
+	}
+
+	if (release_flags & EMULATION_ONLY_RELEASE_PINE)
+		PINEServer::Deinitialize();
+	if (release_flags & EMULATION_ONLY_RELEASE_DISCORD_PRESENCE)
+		ShutdownDiscordPresence();
+	if (release_flags & EMULATION_ONLY_RELEASE_ACHIEVEMENTS)
+		Achievements::Shutdown(false);
+
+	if ((release_flags & EMULATION_ONLY_RELEASE_INPUT_RECORDING) && g_InputRecording.isActive())
+		g_InputRecording.stop();
+
+	if (release_flags & EMULATION_ONLY_RELEASE_PATCHES)
+		Patch::UnloadPatches();
+
+	if (release_flags & EMULATION_ONLY_RELEASE_OSD)
+	{
+		Host::ClearOSDMessages();
+
+		// Disable every live OSD feed without persisting the user's selected preset.
+		GSConfig.OsdMessagesPos = OsdOverlayPos::None;
+		GSConfig.OsdPerformancePos = OsdOverlayPos::None;
+		GSConfig.OsdShowSpeed = false;
+		GSConfig.OsdShowFPS = false;
+		GSConfig.OsdShowVPS = false;
+		GSConfig.OsdShowResolution = false;
+		GSConfig.OsdShowGSStats = false;
+		GSConfig.OsdShowCPU = false;
+		GSConfig.OsdShowGPU = false;
+		GSConfig.OsdShowGPUDebug = false;
+		GSConfig.OsdShowGPUStats = false;
+		GSConfig.OsdShowIndicators = false;
+		GSConfig.OsdShowFrameTimes = false;
+		GSConfig.OsdShowHardwareInfo = false;
+		GSConfig.OsdShowVersion = false;
+		GSConfig.OsdShowSettings = false;
+		GSConfig.OsdshowPatches = false;
+		GSConfig.OsdShowInputs = false;
+		GSConfig.OsdShowVideoCapture = false;
+		GSConfig.OsdShowInputRec = false;
+		GSConfig.OsdShowTextureReplacements = false;
+	}
+
+	Console.WriteLn("Emulation-only mode: released optional runtime services and overlays.");
 }
 
 void VMManager::EnforceAchievementsChallengeModeSettings()
@@ -3322,7 +3502,10 @@ void VMManager::WarnAboutUnsafeSettings()
 			append(ICON_FA_PAINTBRUSH,
 				TRANSLATE_SV("VMManager", "Blending Accuracy is below Basic, this may break effects in some games."));
 		}
-		if (EmuConfig.GS.HWDownloadMode > GSHardwareDownloadMode::EnabledForceFull)
+		// NOT a relational comparison: Asynchronous (5) was appended after Disabled (4), so the
+		// enum is no longer ordered by accuracy and `> EnabledForceFull` wrongly flags Async while
+		// the ordering trap is exactly what the rest of the port was rewritten to avoid.
+		if (!IsHardwareDownloadReadbackEnabled(EmuConfig.GS.HWDownloadMode))
 		{
 			append(ICON_FA_DOWNLOAD,
 				TRANSLATE_SV("VMManager", "Hardware Download Mode is not set to Accurate, this may break rendering in some games."));
@@ -3689,6 +3872,19 @@ void VMManager::SetHardwareDependentDefaultSettings(SettingsInterface& si)
 	const int extra_threads = (core_count > 3) ? 3 : 2;
 	Console.WriteLn(fmt::format("  Setting Extra Software Rendering Threads to {}.", extra_threads));
 	si.SetIntValue("EmuCore/GS", "extrathreads", extra_threads);
+
+	// Enable thread pinning by default on heterogeneous CPUs (big.LITTLE).
+	// Without it, the kernel may migrate the EE / VU / GS threads to E-cores
+	// mid-frame — even one such migration is enough to miss the 60fps deadline
+	// on Apple Silicon under Asahi and Intel Alder Lake-class hybrid systems.
+	// SetEmuThreadAffinities already sorts processors by frequency, so pinning
+	// to indices 0..2 lands on the fastest cores.
+	if (cpuinfo_get_clusters_count() > 1 && core_count >= 3)
+	{
+		Console.WriteLn(fmt::format("  Heterogeneous CPU detected ({} clusters); enabling thread pinning.",
+			cpuinfo_get_clusters_count()));
+		si.SetBoolValue("EmuCore", "EnableThreadPinning", true);
+	}
 }
 
 #elif defined(__APPLE__)
@@ -3748,6 +3944,15 @@ void VMManager::EnsureCPUInfoInitialized()
 	std::call_once(s_processor_list_initialized, InitializeProcessorList);
 }
 
+#if defined(__ANDROID__)
+// Android "Affinity Control Mode", set by the app from NativeApp.setAffinityMode() before the VM
+// boots (see SetEmuThreadAffinities below for the semantics of each value):
+//   0 Disabled (default — scheduler decides)   1 EE>VU>GS   2 EE>GS>VU   3 VU>EE>GS
+//   4 VU>GS>EE   5 GS>EE>VU   6 GS>VU>EE       7 Performance Cores
+// A plain int like g_gs_android_prefer_vk: written once at startup/boot, read on the CPU thread.
+int g_android_affinity_mode = 0;
+#endif
+
 void VMManager::SetEmuThreadAffinities()
 {
 #if defined(__ANDROID__)
@@ -3760,11 +3965,121 @@ void VMManager::SetEmuThreadAffinities()
 	// which slams GoW2). cpuinfo also can't read per-core frequency on many Android
 	// devices (all clusters report 0 MHz), so the frequency-ordered pin is unreliable
 	// anyway. Release any affinity so the scheduler can use the prime for VU.
-	MTGS::GetThreadHandle().SetAffinity(0);
-	vu1Thread.GetThreadHandle().SetAffinity(0);
-	s_vm_thread_handle.SetAffinity(0);
-	s_software_renderer_processor_list = {};
-	s_thread_affinities_set = false;
+	//
+	// Affinity Control Mode (g_android_affinity_mode, default 0 = Disabled) is the opt-in
+	// escape hatch from that default. It exists because the reasoning above is not universal:
+	// on GS-bound titles an unpinned GS thread measurably regressed (Burnout 3), and community
+	// testers on other SoCs report gains from explicit placement. It is EXPERIMENTAL and
+	// off by default — the unpinned scheduler path below stays the recommended setting.
+	if (g_android_affinity_mode == 0)
+	{
+		MTGS::GetThreadHandle().SetAffinity(0);
+		vu1Thread.GetThreadHandle().SetAffinity(0);
+		s_vm_thread_handle.SetAffinity(0);
+		s_software_renderer_processor_list = {};
+		s_thread_affinities_set = false;
+		return;
+	}
+
+	EnsureCPUInfoInitialized();
+	if (s_processor_list.empty())
+	{
+		// cpuinfo gave us nothing to place threads on — behave exactly like Disabled.
+		MTGS::GetThreadHandle().SetAffinity(0);
+		vu1Thread.GetThreadHandle().SetAffinity(0);
+		s_vm_thread_handle.SetAffinity(0);
+		s_software_renderer_processor_list = {};
+		s_thread_affinities_set = false;
+		return;
+	}
+
+	const bool android_mtvu = EmuConfig.Speedhacks.vuThread;
+
+	// Mode 7 = "Performance Cores": don't hand out individual cores at all, just confine all
+	// three threads to the big/prime cluster and let EAS place them within it. This is the
+	// safest of the pinning modes because it never pins VU to a specific mid-tier core.
+	if (g_android_affinity_mode == 7)
+	{
+		// NOTE: deliberately NOT Internal::GetPerformanceClusterAffinityMask() — that is still a
+		// stub returning 0 in this core, which would make this mode silently do nothing. Derive
+		// the cluster from cpuinfo here instead: find the cluster owning the highest-frequency
+		// core and union every processor in it. cpuinfo reports 0 MHz for all cores on many
+		// Android SoCs, in which case this settles on the first cluster it lists — still a
+		// coherent cluster rather than a garbage mask.
+		const u64 perf_mask = [] {
+			const u32 count = cpuinfo_get_processors_count();
+			const cpuinfo_cluster* target = nullptr;
+			u32 best_freq = 0;
+			for (u32 i = 0; i < count; i++)
+			{
+				const cpuinfo_processor* proc = cpuinfo_get_processor(i);
+				if (!proc || proc->smt_id != 0 || !proc->core || !proc->cluster)
+					continue;
+				if (!target || proc->core->frequency > best_freq)
+				{
+					target = proc->cluster;
+					best_freq = proc->core->frequency;
+				}
+			}
+			u64 mask = 0;
+			if (!target)
+				return mask;
+			for (u32 i = 0; i < count; i++)
+			{
+				const cpuinfo_processor* proc = cpuinfo_get_processor(i);
+				if (!proc || proc->smt_id != 0 || proc->cluster != target)
+					continue;
+				mask |= static_cast<u64>(1) << GetProcessorIdForProcessor(proc);
+			}
+			return mask;
+		}();
+		if (perf_mask != 0)
+		{
+			INFO_LOG("Affinity mode: Performance Cores (mask 0x{:x})", perf_mask);
+			s_vm_thread_handle.SetAffinity(perf_mask);
+			MTGS::GetThreadHandle().SetAffinity(perf_mask);
+			vu1Thread.GetThreadHandle().SetAffinity(android_mtvu ? perf_mask : 0);
+			s_thread_affinities_set = true;
+			return;
+		}
+		// No usable cluster mask — fall through to the ordered path rather than silently
+		// leaving the user's chosen mode doing nothing.
+	}
+
+	// Modes 1-6: explicit EE/VU/GS priority over s_processor_list, which is ordered fastest
+	// core first. Rows are {ee_rank, vu_rank, gs_rank}; the row order matches the UI order.
+	//   1 EE>VU>GS   2 EE>GS>VU   3 VU>EE>GS   4 VU>GS>EE   5 GS>EE>VU   6 GS>VU>EE
+	static constexpr int kAffinityRanks[6][3] = {
+		{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {2, 0, 1}, {1, 2, 0}, {2, 1, 0},
+	};
+	const int mode_row = std::clamp(g_android_affinity_mode, 1, 6) - 1;
+	int ee_rank = kAffinityRanks[mode_row][0];
+	int vu_rank = kAffinityRanks[mode_row][1];
+	int gs_rank = kAffinityRanks[mode_row][2];
+
+	// With MTVU off there is no VU thread to place, so let GS inherit VU's slot when VU
+	// ranked higher — otherwise the faster core sits idle. Mirrors the desktop path's
+	// "steal vu's thread if mtvu is off".
+	if (!android_mtvu && vu_rank < gs_rank)
+		gs_rank = vu_rank;
+
+	// cpuinfo frequently reports fewer usable processors than ranks; clamp rather than
+	// running off the end of the list.
+	const auto affinity_for_rank = [](int rank) -> u64 {
+		const size_t idx = std::min(static_cast<size_t>(rank), s_processor_list.size() - 1);
+		return static_cast<u64>(1) << s_processor_list[idx];
+	};
+
+	const u64 android_ee_affinity = affinity_for_rank(ee_rank);
+	const u64 android_gs_affinity = affinity_for_rank(gs_rank);
+	INFO_LOG("Affinity mode {}: EE rank {} (0x{:x}), VU rank {}, GS rank {} (0x{:x}), mtvu={}",
+		g_android_affinity_mode, ee_rank, android_ee_affinity, vu_rank, gs_rank,
+		android_gs_affinity, android_mtvu ? 1 : 0);
+
+	s_vm_thread_handle.SetAffinity(android_ee_affinity);
+	MTGS::GetThreadHandle().SetAffinity(android_gs_affinity);
+	vu1Thread.GetThreadHandle().SetAffinity(android_mtvu ? affinity_for_rank(vu_rank) : 0);
+	s_thread_affinities_set = true;
 	return;
 #else
 	const bool new_pin_enable = (GetState() != VMState::Shutdown && EmuConfig.EnableThreadPinning);

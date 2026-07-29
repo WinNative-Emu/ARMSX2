@@ -14,10 +14,17 @@
 #define ARMSX2_HAS_SWIFTUI_HOST 0
 #endif
 
-// MetalFX spatial upscaler is iOS 16+ and weak-linked (see PCSX2 CMake). Both
-// headers are pulled in here so isMetalFXSupported can probe device capability.
+// MetalFX spatial upscaler is iOS 16+ device and weak-linked (see PCSX2 CMake).
+// The iOS Simulator SDK does not ship the MetalFX framework, so the import is
+// gated off when targeting the sim; isMetalFXSupported then returns NO without
+// referencing MTLFXSpatialScalerDescriptor.
 #import <Metal/Metal.h>
-#import <MetalFX/MetalFX.h>
+#if !TARGET_OS_SIMULATOR
+	#import <MetalFX/MetalFX.h>
+	#define ARMSX2_HAS_METALFX 1
+#else
+	#define ARMSX2_HAS_METALFX 0
+#endif
 
 #include "common/Darwin/DarwinMisc.h"
 #include <SDL3/SDL.h>
@@ -45,6 +52,7 @@ extern "C" void ARMSX2_iOSCopyDeviceStats(int* outBatteryPercent, int* outTherma
 #include "ps2/BiosTools.h"
 #include "pcsx2/Host.h"
 #include "pcsx2/INISettingsInterface.h"
+#include "pcsx2/PerformanceMetrics.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
 #include "common/ZipHelpers.h"
@@ -69,6 +77,7 @@ extern INISettingsInterface* g_p44_settings_interface;
 extern "C" void ARMSX2_PrepareGameRenderViewForCurrentRenderer(const char* reason);
 extern "C" void ARMSX2_PostRuntimeMenuStateChanged(void);
 extern "C" void ARMSX2_iOSTestGamepadRumble(void);
+extern "C" bool ARMSX2_IsIdleVMPrewarmResolved(void);
 
 // Coalesce base-settings INI writes so rapid changes (slider drags, preset bursts,
 // repeated toggles) persist to disk once per short window instead of once per call.
@@ -102,13 +111,45 @@ static void ARMSX2FlushINISave()
 }
 
 static NSDate* s_lastNVMSaveDate = nil;
-static NSDictionary<NSString*, id>* s_pendingRetroAchievementsNotification = nil;
+static ARMSX2RetroAchievementsToastInfo* s_pendingRetroAchievementsNotification = nil;
 
 @implementation ARMSX2SaveStateSlotInfo
 @end
 
 @implementation ARMSX2BIOSInfo
 @end
+
+@implementation ARMSX2RetroAchievementsToastInfo
+#if !__has_feature(objc_arc)
+- (void)dealloc
+{
+    [_title release];
+    [_message release];
+    [_badgePath release];
+    [super dealloc];
+}
+#endif
+@end
+
+static void ARMSX2SetPendingRetroAchievementsNotification(ARMSX2RetroAchievementsToastInfo* toast)
+{
+#if __has_feature(objc_arc)
+    s_pendingRetroAchievementsNotification = toast;
+#else
+    [s_pendingRetroAchievementsNotification release];
+    s_pendingRetroAchievementsNotification = [toast retain];
+#endif
+}
+
+static void ARMSX2ClearPendingRetroAchievementsNotification()
+{
+#if __has_feature(objc_arc)
+    s_pendingRetroAchievementsNotification = nil;
+#else
+    [s_pendingRetroAchievementsNotification release];
+    s_pendingRetroAchievementsNotification = nil;
+#endif
+}
 
 static NSString* const ARMSX2CompatibilityProfileOff = @"off";
 static NSString* const ARMSX2CompatibilityProfileCOP1 = @"cop1";
@@ -469,7 +510,8 @@ extern "C" void ARMSX2_PostRetroAchievementsStateChanged(void)
     });
 }
 
-extern "C" void ARMSX2_PostRetroAchievementsNotification(const char* title, const char* message, const char* badgePath)
+extern "C" void ARMSX2_PostRetroAchievementsNotification(const char* title, const char* message,
+	const char* badgePath, float duration)
 {
     NSString* titleString = title ? [NSString stringWithUTF8String:title] : nil;
     if (titleString.length == 0)
@@ -482,27 +524,23 @@ extern "C" void ARMSX2_PostRetroAchievementsNotification(const char* title, cons
     if (!badgePathString)
         badgePathString = @"";
 
-    std::fprintf(stderr, "@@RA_NOTIFY@@ title_len=%lu message_len=%lu badge=%d hardcore=%d notifications=%d overlays=%d\n",
-        static_cast<unsigned long>(titleString.length),
-        static_cast<unsigned long>(messageString.length),
-        badgePathString.length > 0 ? 1 : 0,
-        Achievements::IsHardcoreModeActive() ? 1 : 0,
-        EmuConfig.Achievements.Notifications ? 1 : 0,
-        EmuConfig.Achievements.Overlays ? 1 : 0);
-    std::fflush(stderr);
+    // A non-positive duration means "use the SwiftUI default"; the key is omitted so the
+    // receiver falls back to its own configured display time.
+    NSNumber* durationNumber = (duration > 0.0f) ? @(duration) : nil;
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSDictionary* userInfo = @{
-            @"title": titleString,
-            @"message": messageString,
-            @"badgePath": badgePathString,
-            @"handledByUIKit": @NO,
-        };
-        s_pendingRetroAchievementsNotification = userInfo;
-        std::fprintf(stderr, "@@RA_NOTIFY_QUEUED@@ title_len=%lu pending=1\n",
-            static_cast<unsigned long>(titleString.length));
-        std::fflush(stderr);
-        [[NSNotificationCenter defaultCenter] postNotificationName:@"ARMSX2RetroAchievementsNotification" object:nil userInfo:userInfo];
+        ARMSX2RetroAchievementsToastInfo* toast = [[ARMSX2RetroAchievementsToastInfo alloc] init];
+        toast.title = titleString;
+        toast.message = messageString;
+        toast.badgePath = badgePathString;
+        toast.duration = durationNumber != nil ? durationNumber.doubleValue : 0.0;
+        ARMSX2SetPendingRetroAchievementsNotification(toast);
+#if !__has_feature(objc_arc)
+        [toast release];
+#endif
+
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"ARMSX2RetroAchievementsNotification"
+                                                           object:nil];
     });
 }
 
@@ -554,8 +592,6 @@ static bool ARMSX2RetroAchievementsHardcoreActive()
 
 static void ARMSX2LogRetroAchievementsHardcoreBlock(const char* action)
 {
-    std::fprintf(stderr, "@@RA_HARDCORE_BLOCK@@ action=%s\n", action ? action : "unknown");
-    std::fflush(stderr);
     NSLog(@"[ARMSX2Bridge] RetroAchievements Hardcore blocked action=%s", action ? action : "unknown");
 }
 
@@ -1309,15 +1345,60 @@ static BOOL ARMSX2IsControllerSkinImportName(NSString* name, NSSet<NSString*>* a
     return key.length > 0 && [allowedJSONNames containsObject:key];
 }
 
+// Skin authors hand-edit manifests and a raw tab inside a string is enough to
+// fail every JSON parser. Substituting a space keeps the length, and no byte
+// below 0x20 can be a UTF-8 continuation byte or part of a "\t" pair, so
+// multi-byte text and real escapes come through untouched.
+//
+// Swift has to do the same thing after extraction, so there is a second copy in
+// SkinManifestImporter.repairedJSON. Change one, change the other.
+static NSData* ARMSX2RepairedJSONData(NSData* data)
+{
+    NSMutableData* repaired = [data mutableCopy];
+    uint8_t* bytes = static_cast<uint8_t*>(repaired.mutableBytes);
+    const NSUInteger length = repaired.length;
+    BOOL inString = NO;
+    BOOL escaped = NO;
+    BOOL changed = NO;
+
+    for (NSUInteger i = 0; i < length; i++) {
+        const uint8_t byte = bytes[i];
+        if (!inString) {
+            if (byte == 0x22)
+                inString = YES;
+            continue;
+        }
+
+        if (escaped)
+            escaped = NO;
+        else if (byte == 0x5C)
+            escaped = YES;
+        else if (byte == 0x22)
+            inString = NO;
+        else if (byte < 0x20) {
+            bytes[i] = 0x20;
+            changed = YES;
+        }
+    }
+    return changed ? repaired : nil;
+}
+
 static NSMutableSet<NSString*>* ARMSX2AllowedControllerSkinJSONNames(zip_t* zf, zip_int64_t count)
 {
+    static const zip_uint64_t kMaxLooseLayoutBytes = 1024 * 1024;
+    static const NSUInteger kMaxLooseLayoutEntries = 8;
+
     NSMutableSet<NSString*>* allowedJSONNames = [NSMutableSet setWithObject:@"manifest.json"];
-    for (zip_uint64_t i = 0; i < static_cast<zip_uint64_t>(std::max<zip_int64_t>(count, 0)); i++) {
+    NSMutableSet<NSString*>* namedLayoutKeys = [NSMutableSet set];
+    const zip_uint64_t entryCount = static_cast<zip_uint64_t>(std::max<zip_int64_t>(count, 0));
+    for (zip_uint64_t i = 0; i < entryCount; i++) {
         zip_stat_t stat = {};
         if (zip_stat_index(zf, i, ZIP_FL_ENC_GUESS, &stat) != 0 || !stat.name)
             continue;
 
         NSString* entryName = [NSString stringWithUTF8String:stat.name];
+        if ([entryName containsString:@"__MACOSX"] || [entryName.lastPathComponent hasPrefix:@"."])
+            continue;
         if (![ARMSX2ControllerSkinJSONImportKey(entryName) isEqualToString:@"manifest.json"])
             continue;
 
@@ -1331,16 +1412,60 @@ static NSMutableSet<NSString*>* ARMSX2AllowedControllerSkinJSONNames(zip_t* zf, 
 
         NSData* manifestData = [NSData dataWithBytes:data->data() length:data->size()];
         id manifestObject = [NSJSONSerialization JSONObjectWithData:manifestData options:0 error:nil];
-        if (![manifestObject isKindOfClass:NSDictionary.class])
-            continue;
+        if (![manifestObject isKindOfClass:NSDictionary.class]) {
+            NSData* repaired = ARMSX2RepairedJSONData(manifestData);
+            manifestObject = repaired ? [NSJSONSerialization JSONObjectWithData:repaired options:0 error:nil] : nil;
+            if (![manifestObject isKindOfClass:NSDictionary.class])
+                continue;
+        }
 
         id layoutValue = [(NSDictionary*)manifestObject objectForKey:@"layout"];
         if (![layoutValue isKindOfClass:NSString.class])
             continue;
 
         NSString* layoutKey = ARMSX2ControllerSkinJSONImportKey((NSString*)layoutValue);
-        if (layoutKey.length > 0)
+        if (layoutKey.length > 0) {
             [allowedJSONNames addObject:layoutKey];
+            [namedLayoutKeys addObject:layoutKey];
+        }
+    }
+
+    // Naming a layout is not the same as shipping one. If the named file is really
+    // in there we are done; if it is not, fall through and let the loose pass find
+    // whatever the author actually shipped.
+    for (zip_uint64_t i = 0; i < entryCount && namedLayoutKeys.count > 0; i++) {
+        zip_stat_t stat = {};
+        if (zip_stat_index(zf, i, ZIP_FL_ENC_GUESS, &stat) != 0 || !stat.name)
+            continue;
+        NSString* entryName = [NSString stringWithUTF8String:stat.name];
+        if ([entryName containsString:@"__MACOSX"] || [entryName.lastPathComponent hasPrefix:@"."])
+            continue;
+        if ([namedLayoutKeys containsObject:ARMSX2ControllerSkinJSONImportKey(entryName)])
+            return allowedJSONNames;
+    }
+
+    // Nothing named, nothing readable to name it, or the named file is absent. Let
+    // the other jsons through so Swift can work out which one is the layout, but
+    // keep it bounded: too many candidates and it has no way to choose.
+    NSSet<NSString*>* manifestKeys = [NSSet setWithArray:@[@"manifest.json", @"info.json", @"manifest-v2.json"]];
+    NSUInteger looseCount = 0;
+    for (zip_uint64_t i = 0; i < entryCount && looseCount < kMaxLooseLayoutEntries; i++) {
+        zip_stat_t stat = {};
+        if (zip_stat_index(zf, i, ZIP_FL_ENC_GUESS, &stat) != 0 || !stat.name)
+            continue;
+        if ((stat.valid & ZIP_STAT_SIZE) && stat.size > kMaxLooseLayoutBytes)
+            continue;
+
+        NSString* entryName = [NSString stringWithUTF8String:stat.name];
+        if ([entryName containsString:@"__MACOSX"] || [entryName.lastPathComponent hasPrefix:@"."])
+            continue;
+
+        NSString* key = ARMSX2ControllerSkinJSONImportKey(entryName);
+        if (key.length == 0 || [manifestKeys containsObject:key] || [allowedJSONNames containsObject:key])
+            continue;
+
+        [allowedJSONNames addObject:key];
+        looseCount++;
     }
     return allowedJSONNames;
 }
@@ -1359,82 +1484,6 @@ static NSString* ARMSX2SanitizedSkinFileName(NSString* name)
         [sanitized appendString:[allowed characterIsMember:ch] ? [NSString stringWithCharacters:&ch length:1] : @"_"];
     }
     return sanitized;
-}
-
-static void ARMSX2ApplyLiveGSBoolSetting(const char* section, const char* key, bool value)
-{
-    if (std::strcmp(section, "EmuCore/GS") != 0)
-        return;
-
-#define APPLY_OSD_BOOL(name) \
-    do { \
-        if (std::strcmp(key, #name) == 0) { \
-            EmuConfig.GS.name = value; \
-            GSConfig.name = value; \
-            return; \
-        } \
-    } while (0)
-
-    APPLY_OSD_BOOL(OsdShowFPS);
-    APPLY_OSD_BOOL(OsdShowVPS);
-    APPLY_OSD_BOOL(OsdShowSpeed);
-    APPLY_OSD_BOOL(OsdShowCPU);
-    APPLY_OSD_BOOL(OsdShowGPU);
-    APPLY_OSD_BOOL(OsdShowResolution);
-    APPLY_OSD_BOOL(OsdShowGSStats);
-    APPLY_OSD_BOOL(OsdShowIndicators);
-    APPLY_OSD_BOOL(OsdShowSettings);
-    APPLY_OSD_BOOL(OsdShowInputs);
-    APPLY_OSD_BOOL(OsdShowFrameTimes);
-    APPLY_OSD_BOOL(OsdShowVersion);
-    APPLY_OSD_BOOL(OsdShowHardwareInfo);
-    APPLY_OSD_BOOL(OsdShowVideoCapture);
-    APPLY_OSD_BOOL(OsdShowInputRec);
-    APPLY_OSD_BOOL(DumpReplaceableTextures);
-    APPLY_OSD_BOOL(DumpReplaceableMipmaps);
-    APPLY_OSD_BOOL(DumpTexturesWithFMVActive);
-    APPLY_OSD_BOOL(DumpDirectTextures);
-    APPLY_OSD_BOOL(DumpPaletteTextures);
-    APPLY_OSD_BOOL(LoadTextureReplacements);
-    APPLY_OSD_BOOL(LoadTextureReplacementsAsync);
-    APPLY_OSD_BOOL(PrecacheTextureReplacements);
-
-    if (std::strcmp(key, "hw_mipmap") == 0) {
-        EmuConfig.GS.HWMipmap = value;
-        GSConfig.HWMipmap = value;
-        return;
-    }
-
-#undef APPLY_OSD_BOOL
-}
-
-static void ARMSX2ApplyLiveGSIntSetting(const char* section, const char* key, int value)
-{
-    if (std::strcmp(section, "EmuCore/GS") != 0)
-        return;
-
-    if (std::strcmp(key, "OsdPerformancePos") == 0) {
-        const int clamped = std::clamp(value, static_cast<int>(OsdOverlayPos::None), static_cast<int>(OsdOverlayPos::TopRight));
-        EmuConfig.GS.OsdPerformancePos = static_cast<OsdOverlayPos>(clamped);
-        GSConfig.OsdPerformancePos = static_cast<OsdOverlayPos>(clamped);
-    } else if (std::strcmp(key, "OsdMessagesPos") == 0) {
-        // Toggles the transient OSD message queue (shader-compilation, save,
-        // settings-applied, etc.) without touching performance counters or the
-        // separate SwiftUI alert path used for critical errors.
-        const int clamped = std::clamp(value, static_cast<int>(OsdOverlayPos::None), static_cast<int>(OsdOverlayPos::TopRight));
-        EmuConfig.GS.OsdMessagesPos = static_cast<OsdOverlayPos>(clamped);
-        GSConfig.OsdMessagesPos = static_cast<OsdOverlayPos>(clamped);
-    } else if (std::strcmp(key, "texture_preloading") == 0) {
-        const int clamped = std::clamp(value, 0, static_cast<int>(TexturePreloadingLevel::Full));
-        EmuConfig.GS.TexturePreloading = static_cast<TexturePreloadingLevel>(clamped);
-        GSConfig.TexturePreloading = static_cast<TexturePreloadingLevel>(clamped);
-    } else if (std::strcmp(key, "UserHacks_SkipDraw_Start") == 0) {
-        EmuConfig.GS.SkipDrawStart = value;
-        GSConfig.SkipDrawStart = value;
-    } else if (std::strcmp(key, "UserHacks_SkipDraw_End") == 0) {
-        EmuConfig.GS.SkipDrawEnd = std::max(EmuConfig.GS.SkipDrawStart, value);
-        GSConfig.SkipDrawEnd = EmuConfig.GS.SkipDrawEnd;
-    }
 }
 
 static void ARMSX2ApplyLiveTargetSpeedSetting(std::function<void()> update, const char* section, const char* key, float value)
@@ -1511,40 +1560,23 @@ static bool ARMSX2ShouldBlockRetroAchievementsHardcoreBoolSetting(const char* se
     return false;
 }
 
+// Emulation-speed scalars only. EmuCore/GS is not handled here: every graphics
+// setting reloads through the Setting<T> hook -> applyGraphicsSettingsNow.
 static void ARMSX2ApplyLiveFloatSetting(const char* section, const char* key, float value)
 {
-    if (std::strcmp(section, "Framerate") == 0) {
-        const float clamped = std::isfinite(value) ? std::clamp(value, 0.05f, 10.0f) : 1.0f;
-        if (std::strcmp(key, "NominalScalar") == 0) {
-            const float normalized = ARMSX2NormalizeIOSNominalScalar(value);
-            if (std::fabs(normalized - clamped) > 0.001f)
-                NSLog(@"[ARMSX2Bridge] clamping unsupported NominalScalar %.3f -> %.3f", clamped, normalized);
-            ARMSX2ApplyLiveTargetSpeedSetting([normalized]() { EmuConfig.EmulationSpeed.NominalScalar = normalized; }, section, key, normalized);
-        } else if (std::strcmp(key, "TurboScalar") == 0)
-            ARMSX2ApplyLiveTargetSpeedSetting([clamped]() { EmuConfig.EmulationSpeed.TurboScalar = clamped; }, section, key, clamped);
-        else if (std::strcmp(key, "SlomoScalar") == 0)
-            ARMSX2ApplyLiveTargetSpeedSetting([clamped]() { EmuConfig.EmulationSpeed.SlomoScalar = clamped; }, section, key, clamped);
-        else
-            return;
-        return;
-    }
-
-    if (std::strcmp(section, "EmuCore/GS") != 0)
+    if (std::strcmp(section, "Framerate") != 0)
         return;
 
-    if (std::strcmp(key, "FramerateNTSC") == 0) {
-        ARMSX2ApplyLiveTargetSpeedSetting([value]() { EmuConfig.GS.FramerateNTSC = value; }, section, key, value);
-        return;
-    }
-    if (std::strcmp(key, "FrameratePAL") == 0) {
-        ARMSX2ApplyLiveTargetSpeedSetting([value]() { EmuConfig.GS.FrameratePAL = value; }, section, key, value);
-        return;
-    }
-    if (std::strcmp(key, "upscale_multiplier") == 0) {
-        const float clamped = std::clamp(value, 0.25f, 8.0f);
-        EmuConfig.GS.UpscaleMultiplier = clamped;
-        GSConfig.UpscaleMultiplier = clamped;
-        return;
+    const float clamped = std::isfinite(value) ? std::clamp(value, 0.05f, 10.0f) : 1.0f;
+    if (std::strcmp(key, "NominalScalar") == 0) {
+        const float normalized = ARMSX2NormalizeIOSNominalScalar(value);
+        if (std::fabs(normalized - clamped) > 0.001f)
+            NSLog(@"[ARMSX2Bridge] clamping unsupported NominalScalar %.3f -> %.3f", clamped, normalized);
+        ARMSX2ApplyLiveTargetSpeedSetting([normalized]() { EmuConfig.EmulationSpeed.NominalScalar = normalized; }, section, key, normalized);
+    } else if (std::strcmp(key, "TurboScalar") == 0) {
+        ARMSX2ApplyLiveTargetSpeedSetting([clamped]() { EmuConfig.EmulationSpeed.TurboScalar = clamped; }, section, key, clamped);
+    } else if (std::strcmp(key, "SlomoScalar") == 0) {
+        ARMSX2ApplyLiveTargetSpeedSetting([clamped]() { EmuConfig.EmulationSpeed.SlomoScalar = clamped; }, section, key, clamped);
     }
 }
 
@@ -1690,7 +1722,11 @@ static void ARMSX2ApplyPerGameSettingsOverrides(NSMutableDictionary<NSString*, i
         si.ContainsValue("EmuCore/Speedhacks", "EECycleRate") ||
         si.ContainsValue("EmuCore", "EnableFastBoot") ||
         si.ContainsValue("SPU2/Output", "StandardVolume") ||
-        si.ContainsValue("SPU2/Output", "FastForwardVolume");
+        si.ContainsValue("SPU2/Output", "FastForwardVolume") ||
+        si.ContainsValue("ARMSX2iOS/UI", "InvertLeftStickX") ||
+        si.ContainsValue("ARMSX2iOS/UI", "InvertLeftStickY") ||
+        si.ContainsValue("ARMSX2iOS/UI", "InvertRightStickX") ||
+        si.ContainsValue("ARMSX2iOS/UI", "InvertRightStickY");
 
     result[@"enabled"] = @(hasKnownOverride);
     const bool hasStandardVolumeOverride = si.ContainsValue("SPU2/Output", "StandardVolume");
@@ -2264,6 +2300,10 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
     return DarwinMisc::iPSX2_FORCE_EE_INTERP != 0;
 }
 
++ (BOOL)isIdleVMPrewarmResolved {
+    return ARMSX2_IsIdleVMPrewarmResolved() ? YES : NO;
+}
+
 + (nonnull NSArray<NSURL *> *)extractControllerSkinArchiveAtURL:(nonnull NSURL *)archiveURL
                                                     toDirectory:(nonnull NSURL *)destinationDirectory {
     static const zip_uint64_t kMaxSkinArchiveEntryBytes = 16 * 1024 * 1024;
@@ -2310,6 +2350,11 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
             continue;
 
         NSString *entryName = [NSString stringWithUTF8String:stat.name];
+        // Every file in a mac-built zip has a "._" sibling, and they were eating
+        // the entry budget one-for-one with the real art. Skips dotfiles in
+        // general, which a skin has no business shipping anyway.
+        if ([entryName containsString:@"__MACOSX"] || [entryName.lastPathComponent hasPrefix:@"."])
+            continue;
         if (entryName.length == 0 || [entryName hasSuffix:@"/"] || !ARMSX2IsControllerSkinImportName(entryName, allowedJSONNames))
             continue;
 
@@ -2964,11 +3009,14 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
                                         eeCycleRateOverride, eeCycleRate, fastBootOverride, fastBoot,
                                         enableCheats, enablePatches, enableGameFixes, enableGameDBHardwareFixes);
 
-    if (VMManager::HasValidVM()) {
+    // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
+    Host::RunOnCPUThread([]() {
+        if (!VMManager::HasValidVM())
+            return;
         VMManager::ReloadGameSettings();
         if (MTGS::IsOpen())
             MTGS::ApplySettings();
-    }
+    });
 }
 
 + (nullable NSString *)linkedDiscPathForELF:(nonnull NSString *)elfName {
@@ -3151,27 +3199,38 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
 // Toggle overlay visibility via position (None vs TopRight).
 // Individual OSD flags are controlled by preset in SettingsStore, not here.
 + (void)setPerformanceOverlayVisible:(BOOL)visible {
+    // Hidden in the config means the user never picked a corner, so give them one.
+    OsdOverlayPos pos = OsdOverlayPos::None;
     if (visible) {
-        GSConfig.OsdPerformancePos = EmuConfig.GS.OsdPerformancePos;
-        // If user had None in config, default to TopRight
-        if (GSConfig.OsdPerformancePos == OsdOverlayPos::None) {
-            GSConfig.OsdPerformancePos = OsdOverlayPos::TopRight;
-            EmuConfig.GS.OsdPerformancePos = OsdOverlayPos::TopRight;
-        }
-    } else {
-        GSConfig.OsdPerformancePos = OsdOverlayPos::None;
-        EmuConfig.GS.OsdPerformancePos = OsdOverlayPos::None;
+        pos = EmuConfig.GS.OsdPerformancePos;
+        if (pos == OsdOverlayPos::None)
+            pos = OsdOverlayPos::TopRight;
     }
 
     if (g_p44_settings_interface) {
-        g_p44_settings_interface->SetIntValue("EmuCore/GS", "OsdPerformancePos",
-            static_cast<int>(EmuConfig.GS.OsdPerformancePos));
+        g_p44_settings_interface->SetIntValue("EmuCore/GS", "OsdPerformancePos", static_cast<int>(pos));
         g_p44_settings_interface->Save();
     }
+
+    // GSConfig belongs to the GS thread and EmuConfig to the CPU thread; this is
+    // called from the UI. Both live in a bitfield, so an off-thread write can drop
+    // a neighbouring flag -- including the ones that decide whether GSUpdateConfig
+    // tears the device down.
+    Host::RunOnCPUThread([pos]() {
+        EmuConfig.GS.OsdPerformancePos = pos;
+        GSConfig.OsdPerformancePos = pos;
+    });
 }
 
 + (BOOL)isPerformanceOverlayVisible {
-    return GSConfig.OsdPerformancePos != OsdOverlayPos::None;
+    // Read the INI, not GSConfig: the setter writes the INI now and hands the
+    // config update to the CPU thread, so GSConfig lags a toggle by a hop and a
+    // UI read-back would bounce the switch.
+    if (g_p44_settings_interface) {
+        return g_p44_settings_interface->GetIntValue("EmuCore/GS", "OsdPerformancePos",
+            static_cast<int>(OsdOverlayPos::None)) != static_cast<int>(OsdOverlayPos::None);
+    }
+    return EmuConfig.GS.OsdPerformancePos != OsdOverlayPos::None;
 }
 
 + (nonnull NSDictionary<NSString *, id> *)deviceStatsForAccessibility {
@@ -3194,6 +3253,9 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
 }
 
 + (void)triggerDeviceHapticLarge:(NSUInteger)large small:(NSUInteger)small {
+    if (VMManager::IsEmulationOnlyMode())
+        return;
+
     // GameEventHaptics is @MainActor-isolated; dispatch to the main queue.
     dispatch_async(dispatch_get_main_queue(), ^{
 #if ARMSX2_HAS_SWIFTUI_HOST
@@ -3205,74 +3267,76 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
     });
 }
 
-// Apply OSD preset — sets ALL GSConfig flags to match the preset
-+ (void)applyOsdPreset:(int)preset {
-    // Clear everything first
-    GSConfig.OsdShowFPS = false;
-    GSConfig.OsdShowSpeed = false;
-    GSConfig.OsdShowVPS = false;
-    GSConfig.OsdShowCPU = false;
-    GSConfig.OsdShowGPU = false;
-    GSConfig.OsdShowResolution = false;
-    GSConfig.OsdShowGSStats = false;
-    GSConfig.OsdShowFrameTimes = false;
-    GSConfig.OsdShowVersion = false;
-    GSConfig.OsdShowHardwareInfo = false;
-    GSConfig.OsdShowIndicators = false;
-    GSConfig.OsdShowSettings = false;
-    GSConfig.OsdShowInputs = false;
-    GSConfig.OsdShowVideoCapture = false;
-    GSConfig.OsdShowInputRec = false;
-
-    switch (preset) {
-    case 1: // simple: clean player readout; device stats are Swift-side
-        GSConfig.OsdShowFPS = true;
-        GSConfig.OsdShowSpeed = true;
-        GSConfig.OsdShowCPU = true;
-        GSConfig.OsdShowVersion = true;
-        break;
-    case 2: // detail: performance and renderer diagnostics
-        GSConfig.OsdShowFPS = true;
-        GSConfig.OsdShowVPS = true;
-        GSConfig.OsdShowSpeed = true;
-        GSConfig.OsdShowCPU = true;
-        GSConfig.OsdShowGPU = true;
-        GSConfig.OsdShowResolution = true;
-        GSConfig.OsdShowIndicators = true;
-        GSConfig.OsdShowVersion = true;
-        break;
-    case 3: // full: closest to Android's full stats section
-        GSConfig.OsdShowFPS = true;
-        GSConfig.OsdShowVPS = true;
-        GSConfig.OsdShowSpeed = true;
-        GSConfig.OsdShowCPU = true;
-        GSConfig.OsdShowGPU = true;
-        GSConfig.OsdShowResolution = true;
-        GSConfig.OsdShowGSStats = true;
-        GSConfig.OsdShowFrameTimes = true;
-        GSConfig.OsdShowVersion = true;
-        GSConfig.OsdShowHardwareInfo = true;
-        GSConfig.OsdShowIndicators = true;
-        GSConfig.OsdShowSettings = true;
-        GSConfig.OsdShowInputs = true;
-        break;
-    default: // 0 = off
-        break;
++ (void)releaseNonEmulationResources:(NSUInteger)releaseFlags {
+    if (releaseFlags & VMManager::EMULATION_ONLY_RELEASE_ACHIEVEMENTS) {
+        void (^clearPendingNotification)(void) = ^{
+            ARMSX2ClearPendingRetroAchievementsNotification();
+        };
+        if ([NSThread isMainThread])
+            clearPendingNotification();
+        else
+            dispatch_async(dispatch_get_main_queue(), clearPendingNotification);
     }
 
-    EmuConfig.GS.OsdShowFPS = GSConfig.OsdShowFPS;
-    EmuConfig.GS.OsdShowVPS = GSConfig.OsdShowVPS;
-    EmuConfig.GS.OsdShowSpeed = GSConfig.OsdShowSpeed;
-    EmuConfig.GS.OsdShowCPU = GSConfig.OsdShowCPU;
-    EmuConfig.GS.OsdShowGPU = GSConfig.OsdShowGPU;
-    EmuConfig.GS.OsdShowResolution = GSConfig.OsdShowResolution;
-    EmuConfig.GS.OsdShowGSStats = GSConfig.OsdShowGSStats;
-    EmuConfig.GS.OsdShowFrameTimes = GSConfig.OsdShowFrameTimes;
-    EmuConfig.GS.OsdShowVersion = GSConfig.OsdShowVersion;
-    EmuConfig.GS.OsdShowHardwareInfo = GSConfig.OsdShowHardwareInfo;
-    EmuConfig.GS.OsdShowIndicators = GSConfig.OsdShowIndicators;
-    EmuConfig.GS.OsdShowSettings = GSConfig.OsdShowSettings;
-    EmuConfig.GS.OsdShowInputs = GSConfig.OsdShowInputs;
+    Host::RunOnCPUThread([releaseFlags]() {
+        if (!VMManager::HasValidVM())
+            return;
+
+        VMManager::ReleaseNonEssentialRuntimeResources(static_cast<u32>(releaseFlags));
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:@"ARMSX2iOSEmulationOnlyResourcesReleased"
+                object:nil];
+        });
+    }, false);
+}
+
++ (BOOL)isEmulationOnlyModeActive {
+    return VMManager::IsEmulationOnlyMode();
+}
+
+// Apply OSD preset — sets ALL GSConfig flags to match the preset
++ (void)applyOsdPreset:(int)preset {
+    // 1 simple: clean player readout, plus the device stats line the overlay draws.
+    // 2 detail: performance and renderer diagnostics.
+    // 3 full: closest to Android's full stats section. 0 is off.
+    const bool simple = (preset == 1);
+    const bool detail = (preset == 2);
+    const bool full = (preset == 3);
+
+    const bool fps = simple || detail || full;
+    const bool vps = detail || full;
+    const bool speed = simple || detail || full;
+    const bool cpu = simple || detail || full;
+    const bool gpu = detail || full;
+    const bool resolution = detail || full;
+    const bool indicators = detail || full;
+    const bool version = simple || detail || full;
+    const bool gsStats = full;
+    const bool frameTimes = full;
+    const bool hardwareInfo = full;
+    const bool settings = full;
+    const bool inputs = full;
+
+    // Same ownership problem as setPerformanceOverlayVisible: these are bitfield
+    // members of the CPU and GS threads' configs, written here from the UI.
+    Host::RunOnCPUThread([=]() {
+        EmuConfig.GS.OsdShowFPS = GSConfig.OsdShowFPS = fps;
+        EmuConfig.GS.OsdShowVPS = GSConfig.OsdShowVPS = vps;
+        EmuConfig.GS.OsdShowSpeed = GSConfig.OsdShowSpeed = speed;
+        EmuConfig.GS.OsdShowCPU = GSConfig.OsdShowCPU = cpu;
+        EmuConfig.GS.OsdShowGPU = GSConfig.OsdShowGPU = gpu;
+        EmuConfig.GS.OsdShowResolution = GSConfig.OsdShowResolution = resolution;
+        EmuConfig.GS.OsdShowGSStats = GSConfig.OsdShowGSStats = gsStats;
+        EmuConfig.GS.OsdShowFrameTimes = GSConfig.OsdShowFrameTimes = frameTimes;
+        EmuConfig.GS.OsdShowVersion = GSConfig.OsdShowVersion = version;
+        EmuConfig.GS.OsdShowHardwareInfo = GSConfig.OsdShowHardwareInfo = hardwareInfo;
+        EmuConfig.GS.OsdShowIndicators = GSConfig.OsdShowIndicators = indicators;
+        EmuConfig.GS.OsdShowSettings = GSConfig.OsdShowSettings = settings;
+        EmuConfig.GS.OsdShowInputs = GSConfig.OsdShowInputs = inputs;
+        GSConfig.OsdShowVideoCapture = false;
+        GSConfig.OsdShowInputRec = false;
+    });
 }
 
 + (int)emulatorVolumePercent {
@@ -3457,7 +3521,6 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
     }
     g_p44_settings_interface->SetIntValue(section.UTF8String, key.UTF8String, value);
     ARMSX2ScheduleINISave();
-    ARMSX2ApplyLiveGSIntSetting(section.UTF8String, key.UTF8String, value);
 }
 
 + (void)setINIBool:(nonnull NSString *)section key:(nonnull NSString *)key value:(BOOL)value {
@@ -3466,7 +3529,6 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
         value = NO;
     g_p44_settings_interface->SetBoolValue(section.UTF8String, key.UTF8String, value);
     ARMSX2ScheduleINISave();
-    ARMSX2ApplyLiveGSBoolSetting(section.UTF8String, key.UTF8String, value);
 }
 
 + (void)setINIFloat:(nonnull NSString *)section key:(nonnull NSString *)key value:(float)value {
@@ -3501,9 +3563,18 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
     if (!VMManager::HasValidVM())
         return;
 
-    VMManager::ApplySettings();
-    if (MTGS::IsOpen())
-        MTGS::ApplySettings();
+    // ApplySettings owns EmuConfig and resets the JIT caches, and MTGS::ApplySettings pushes to
+    // the single-producer ring — both the CPU thread's, and this runs on the UI thread.
+    //
+    // The push looks redundant (ApplySettings ends in CheckForGSConfigChanges, which pushes
+    // for us) but it is not: applyOsdPreset and setPerformanceOverlayVisible still pre-write
+    // EmuConfig.GS, so the reload can find nothing changed and skip its own push. They are
+    // queued onto this same thread now, so ordering is defined, but the pre-write remains.
+    Host::RunOnCPUThread([]() {
+        VMManager::ApplySettings();
+        if (MTGS::IsOpen())
+            MTGS::ApplySettings();
+    });
 }
 
 // Force any deferred base-settings INI write to disk immediately.
@@ -3515,16 +3586,41 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
 // Probes whether MetalFX Spatial upscaling is available on this device. This is
 // a standalone check that works from the main menu before any GS device exists,
 // so the settings UI can decide whether to show the Upscaler section at all. It
-// returns NO on pre-iOS-16, the simulator, and any GPU that fails the framework
-// capability probe.
+// returns NO on pre-iOS-16, the simulator (statically compiled out), and any
+// GPU that fails the framework capability probe.
 + (BOOL)isMetalFXSupported {
-    if (@available(iOS 16.0, *)) {
-        MRCOwned<id<MTLDevice>> device = MRCTransfer(MTLCreateSystemDefaultDevice());
-        if (!device)
-            return NO;
-        return [MTLFXSpatialScalerDescriptor supportsDevice:device];
+#if ARMSX2_HAS_METALFX
+	if (@available(iOS 16.0, *)) {
+		MRCOwned<id<MTLDevice>> device = MRCTransfer(MTLCreateSystemDefaultDevice());
+		if (!device)
+			return NO;
+		return [MTLFXSpatialScalerDescriptor supportsDevice:device];
+	}
+	return NO;
+#else
+	// iOS Simulator build: MetalFX framework absent at compile time.
+	return NO;
+ #endif
+ }
+
+#pragma mark - Frame-time history
+
+// Returns the 150-sample PerformanceMetrics frame-time history (read-only).
+// Each sample is boxed as an NSNumber so Swift sees `[NSNumber]`.
++ (nonnull NSArray<NSNumber *> *)frameTimeHistory {
+    const PerformanceMetrics::FrameTimeHistory& history = PerformanceMetrics::GetFrameTimeHistory();
+    NSMutableArray<NSNumber *>* result = [NSMutableArray arrayWithCapacity:history.size()];
+    for (size_t i = 0; i < history.size(); i++) {
+        [result addObject:@(history[i])];
     }
-    return NO;
+    return result;
+}
+
+// Current write cursor inside the ring buffer, so callers can read the most
+// recent N samples (those just before the cursor) rather than treating the
+// array as a linear window.
++ (NSUInteger)frameTimeHistoryPos {
+    return (NSUInteger)PerformanceMetrics::GetFrameTimeHistoryPos();
 }
 
 #pragma mark - Per-game INI getter/setter
@@ -3646,9 +3742,12 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
     si.SetIntValue(section.UTF8String, key.UTF8String, value);
     Error error;
     si.Save(&error);
-    VMManager::ReloadGameSettings();
-    if (MTGS::IsOpen())
-        MTGS::ApplySettings();
+    // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
+    Host::RunOnCPUThread([]() {
+        VMManager::ReloadGameSettings();
+        if (MTGS::IsOpen())
+            MTGS::ApplySettings();
+    });
 }
 
 + (void)setPerGameINIBoolForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(BOOL)value {
@@ -3661,9 +3760,64 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
     si.SetBoolValue(section.UTF8String, key.UTF8String, value);
     Error error;
     si.Save(&error);
-    VMManager::ReloadGameSettings();
-    if (MTGS::IsOpen())
-        MTGS::ApplySettings();
+    // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
+    Host::RunOnCPUThread([]() {
+        VMManager::ReloadGameSettings();
+        if (MTGS::IsOpen())
+            MTGS::ApplySettings();
+    });
+}
+
++ (float)getPerGameINIFloat:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(float)def forISO:(nonnull NSString *)isoName {
+    std::string serial;
+    u32 crc = 0;
+    if (!ARMSX2PerGameIdentityForISO(isoName, &serial, &crc))
+        return def;
+    INISettingsInterface si(ARMSX2PerGameSettingsPath(serial, crc));
+    if (!si.Load())
+        return def;
+    return si.GetFloatValue(section.UTF8String, key.UTF8String, def);
+}
+
++ (void)setPerGameINIFloat:(nonnull NSString *)section key:(nonnull NSString *)key value:(float)value forISO:(nonnull NSString *)isoName {
+    std::string serial;
+    u32 crc = 0;
+    if (!ARMSX2PerGameIdentityForISO(isoName, &serial, &crc))
+        return;
+    INISettingsInterface si(ARMSX2PerGameSettingsPath(serial, crc));
+    si.Load();
+    si.SetFloatValue(section.UTF8String, key.UTF8String, value);
+    Error error;
+    si.Save(&error);
+}
+
++ (float)getPerGameINIFloatForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(float)def {
+    std::string serial;
+    u32 crc = 0;
+    if (!ARMSX2PerGameIdentityForCurrentGame(&serial, &crc))
+        return def;
+    INISettingsInterface si(ARMSX2PerGameSettingsPath(serial, crc));
+    if (!si.Load())
+        return def;
+    return si.GetFloatValue(section.UTF8String, key.UTF8String, def);
+}
+
++ (void)setPerGameINIFloatForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(float)value {
+    std::string serial;
+    u32 crc = 0;
+    if (!ARMSX2PerGameIdentityForCurrentGame(&serial, &crc))
+        return;
+    INISettingsInterface si(ARMSX2PerGameSettingsPath(serial, crc));
+    si.Load();
+    si.SetFloatValue(section.UTF8String, key.UTF8String, value);
+    Error error;
+    si.Save(&error);
+    // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
+    Host::RunOnCPUThread([]() {
+        VMManager::ReloadGameSettings();
+        if (MTGS::IsOpen())
+            MTGS::ApplySettings();
+    });
 }
 
 + (void)deletePerGameINIValueForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key {
@@ -3678,9 +3832,28 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
     si.RemoveEmptySections();
     Error error;
     si.Save(&error);
-    VMManager::ReloadGameSettings();
-    if (MTGS::IsOpen())
-        MTGS::ApplySettings();
+    // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
+    Host::RunOnCPUThread([]() {
+        VMManager::ReloadGameSettings();
+        if (MTGS::IsOpen())
+            MTGS::ApplySettings();
+    });
+}
+
++ (nonnull NSString *)perGameIdentityKeyForCurrentGame {
+    std::string serial;
+    u32 crc = 0;
+    if (!ARMSX2PerGameIdentityForCurrentGame(&serial, &crc))
+        return @"";
+    return [NSString stringWithFormat:@"%s_%08X", serial.c_str(), (unsigned int)crc];
+}
+
++ (nonnull NSString *)perGameIdentityKeyForISO:(nonnull NSString *)isoName {
+    std::string serial;
+    u32 crc = 0;
+    if (!ARMSX2PerGameIdentityForISO(isoName, &serial, &crc))
+        return @"";
+    return [NSString stringWithFormat:@"%s_%08X", serial.c_str(), (unsigned int)crc];
 }
 
 + (int)limiterMode
@@ -4434,18 +4607,6 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
         displayName = savedUsernameValue;
     }
 
-    std::fprintf(stderr, "@@RA_STATE@@ enabled=%d active=%d logged_in=%d saved_username=%d saved_token=%d login_pending=%d has_game=%d hardcore_pref=%d hardcore_active=%d\n",
-        EmuConfig.Achievements.Enabled ? 1 : 0,
-        active ? 1 : 0,
-        loggedIn ? 1 : 0,
-        savedUsername ? 1 : 0,
-        savedToken ? 1 : 0,
-        loginPending ? 1 : 0,
-        hasGame ? 1 : 0,
-        EmuConfig.Achievements.HardcoreMode ? 1 : 0,
-        hardcoreActive ? 1 : 0);
-    std::fflush(stderr);
-
     return @{
         @"supported": @(ARMSX2RetroAchievementsAvailable),
         @"hardcoreSupported": @(ARMSX2RetroAchievementsHardcoreAvailable),
@@ -4510,8 +4671,8 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
     return result;
 }
 
-+ (nullable NSDictionary<NSString *, id> *)consumePendingRetroAchievementsNotification {
-    __block NSDictionary<NSString*, id>* pending = nil;
++ (nullable ARMSX2RetroAchievementsToastInfo *)consumePendingRetroAchievementsNotification {
+    __block ARMSX2RetroAchievementsToastInfo* pending = nil;
     void (^consume)(void) = ^{
         pending = s_pendingRetroAchievementsNotification;
         s_pendingRetroAchievementsNotification = nil;
@@ -4523,9 +4684,11 @@ static std::string ARMSX2PerGameSettingsPath(const std::string& serial, u32 crc)
         dispatch_sync(dispatch_get_main_queue(), consume);
     }
 
-    std::fprintf(stderr, "@@RA_NOTIFY_CONSUME@@ pending=%d\n", pending ? 1 : 0);
-    std::fflush(stderr);
+#if __has_feature(objc_arc)
     return pending;
+#else
+    return [pending autorelease];
+#endif
 }
 
 + (BOOL)isRetroAchievementsHardcoreActive {

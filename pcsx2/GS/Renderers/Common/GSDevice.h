@@ -15,6 +15,8 @@
 #include "GS/GSExtra.h"
 #include <array>
 #include <span>
+#include <string>
+#include <vector>
 
 enum class Filter
 {
@@ -1362,8 +1364,13 @@ static inline u32 GetVertexAlignment(GSHWDrawConfig::VSExpand expand)
 	}
 }
 
+class GSPassScheduler;
+
 class GSDevice : public GSAlignedClass<32>
 {
+	/// Emits queued draws through DoRenderHW, which is protected.
+	friend class GSPassScheduler;
+
 public:
 	enum class PresentResult
 	{
@@ -1399,6 +1406,7 @@ public:
 		bool stencil_buffer       : 1; ///< Supports stencil buffer, and can use for DATE.
 		bool cas_sharpening       : 1; ///< Supports sufficient functionality for contrast adaptive sharpening.
 		bool test_and_sample_depth: 1; ///< Supports concurrently binding the depth-stencil buffer for sampling and depth testing.
+		bool no_ps2_z_quantization: 1; ///< Skip PS2 32-bit-fixed Z floor (saves SPIR-V DepthReplacing → re-enables early-ZS on tilers).
 		bool depth_feedback       : 1; ///< Depth feedback loops can be done with DS directly (otherwise need to copy to separate RT).  Implies `feedback_loops`.
 		bool aa1                  : 1; ///< Supports the GS AA1 feature.
 		bool rov                  : 1; ///< Supports rasterizer ordered views for both depth and color.
@@ -1452,11 +1460,23 @@ protected:
 	std::string m_name = "Unknown";
 	FeatureSupport m_features;
 	u32 m_max_texture_size = 0;
-	RuntimeGpuProfile m_runtime_gpu_profile = RuntimeGpuProfile::Adreno;
+	// ★ Unknown, NOT Adreno. Defaulting to a real vendor meant every backend that never calls
+	// SetRuntimeGPUProfile (Vulkan, Metal, DX12 — none of them did) silently identified as Adreno,
+	// and so did desktop OpenGL on anything not-Mali. That made IsAdrenoGPUProfile() fire
+	// Adreno-only workarounds on Apple Silicon, and made IsMaliGPUProfile() permanently false under
+	// Vulkan — which quietly disabled the Tekken 5 MediaTek-Mali GameDB fix on our default renderer.
+	// Unknown means "no vendor quirks", which is the only safe thing to assume before detection.
+	RuntimeGpuProfile m_runtime_gpu_profile = RuntimeGpuProfile::Unknown;
 	// Per-vendor mobile GPU identity + GS tuning (pool sizes / ages / constrained), resolved from the
 	// GPU-profile system (sashkinbro/EmuCoreX). Drives texture/target pool sizing on Android below.
 	MobileGpuIdentity m_mobile_gpu_identity;
 	MobileGsTuning m_mobile_gs_tuning;
+	// Resolved driver identity + the workarounds the driver-bug database says this exact
+	// driver needs. Kept beside the GPU identity because the two answer different questions:
+	// the identity is "which silicon", this is "which blob", and the blob is what actually
+	// miscompiles shaders (see GSGPUDriverProfile.cpp). Empty/conservative until a backend
+	// resolves it, so a device with no matching rule behaves exactly as it did before.
+	MobileDriverProfile m_mobile_driver_profile;
 	// Android: true when the SoC is MediaTek (Dimensity/Helio). Hoisted from GSDeviceVK
 	// so both backends + GS.cpp Android GameDB overrides can read it. Set during device
 	// open from the resolved GPU profile.
@@ -1504,6 +1524,20 @@ protected:
 	GSTexture* m_mfx_output = nullptr; ///< MetalFX spatial upscale destination (Metal backend).
 	GSTexture* m_colclip_rt = nullptr; ///< Temp hw colclip texture
 	GSTexture* m_ds_as_rt = nullptr; ///< Depth as color
+
+	/// Render passes are coalesced by holding draws here until something needs to observe
+	/// the target. See GSPassScheduler and FlushDeferredDraws().
+	std::unique_ptr<GSPassScheduler> m_pass_scheduler;
+	u32 m_deferred_draw_count = 0;
+	bool m_flushing = false;
+
+	/// Textures the texture cache has finished with, but which queued draws still read or
+	/// write. They go back into the pool once those draws have run - returning them any
+	/// earlier would let FetchSurface hand out a texture that is about to be sampled.
+	std::vector<GSTexture*> m_deferred_recycle;
+
+	void FlushDeferredDrawsImpl();
+	bool DeferredDrawsReference(const GSTexture* tex) const;
 
 	bool AcquireWindow(bool recreate_window);
 
@@ -1553,8 +1587,23 @@ protected:
 	{
 		pxFailRel("Not implemented");
 	}
-	void DoStretchRectWithAssertions(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect, 
+	void DoStretchRectWithAssertions(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
 		ShaderConvertSelector shader, Filter filter);
+
+	/// Backend entry points for work that reads or writes texture contents. These are
+	/// reached only through the public non-virtual wrappers of the same name, which run
+	/// FlushDeferredDraws() first — see that function for why the indirection exists.
+	/// Backends may call them directly on themselves to skip the (re-entrant) flush.
+	virtual void DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r, u32 destX, u32 destY) = 0;
+	virtual void DoDrawMultiStretchRects(const MultiStretchRect* rects, u32 num_rects, GSTexture* dTex, ShaderConvertSelector shader);
+	virtual void DoUpdateCLUTTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, GSTexture* dTex, u32 dOffset, u32 dSize) = 0;
+	virtual void DoConvertToIndexedTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, u32 SBW, u32 SPSM, GSTexture* dTex, u32 DBW, u32 DPSM) = 0;
+	virtual void DoFilteredDownsampleTexture(GSTexture* sTex, GSTexture* dTex, u32 downsample_factor, const GSVector2i& clamp_min, const GSVector4& dRect) = 0;
+	virtual void DoRenderHW(GSHWDrawConfig& config) = 0;
+	virtual void DoBeginDSAsRT(GSTexture* ds, const GSVector4i& drawarea);
+	virtual void DoHintReadbackSource(GSTexture* tex);
+	virtual PresentResult DoBeginPresent(bool frame_skip) = 0;
+
 public:
 	GSDevice();
 	virtual ~GSDevice();
@@ -1568,7 +1617,11 @@ public:
 
 	bool IsDSInRTActive() const { return m_ds_as_rt; }
 	/// Create a temporary color clone of depth for depth feedback
-	virtual void BeginDSAsRT(GSTexture* ds, const GSVector4i& drawarea);
+	void BeginDSAsRT(GSTexture* ds, const GSVector4i& drawarea)
+	{
+		FlushDeferredDraws();
+		DoBeginDSAsRT(ds, drawarea);
+	}
 	void EndDSAsRT();
 
 	/// Returns a string representing the specified API.
@@ -1618,6 +1671,17 @@ public:
 	__fi void SetMobileGSTuning(const MobileGsTuning& tuning) { m_mobile_gs_tuning = tuning; }
 	__fi const MobileGpuIdentity& GetMobileGPUIdentity() const { return m_mobile_gpu_identity; }
 	__fi const MobileGsTuning& GetMobileGSTuning() const { return m_mobile_gs_tuning; }
+	__fi void SetMobileDriverProfile(const MobileDriverProfile& profile) { m_mobile_driver_profile = profile; }
+	__fi const MobileDriverProfile& GetMobileDriverProfile() const { return m_mobile_driver_profile; }
+	/// The driver is *known* to have this defect. Diagnostics only — never gate rendering on it,
+	/// because a recorded bug whose mitigation is not integrated yet still has no workaround bit.
+	__fi bool HasMobileDriverBug(DriverBug bug) const { return m_mobile_driver_profile.HasBug(bug); }
+	/// The one call sites should use: "is this mitigation active for this driver". False for every
+	/// device the database has no rule for, so untouched hardware keeps its existing behaviour.
+	__fi bool UsesMobileDriverWorkaround(DriverWorkaround workaround) const
+	{
+		return m_mobile_driver_profile.UsesWorkaround(workaround);
+	}
 	__fi bool IsConstrainedMobileGPUProfile() const { return m_mobile_gs_tuning.constrained; }
 	__fi RuntimeGpuProfile GetRuntimeGPUProfile() const { return m_runtime_gpu_profile; }
 	__fi void SetMediaTekSoC(bool v) { m_is_mediatek_soc = v; }
@@ -1630,6 +1694,16 @@ public:
 	__fi s32 GetWindowWidth() const { return static_cast<s32>(m_window_info.surface_width); }
 	__fi s32 GetWindowHeight() const { return static_cast<s32>(m_window_info.surface_height); }
 	__fi GSVector2i GetWindowSize() const { return GSVector2i(static_cast<s32>(m_window_info.surface_width), static_cast<s32>(m_window_info.surface_height)); }
+	// Logical window dimensions for layout: same as GetWindowSize for
+	// Rot0/Rot180, swapped for Rot90/Rot270 so callers compute the present
+	// rect against a portrait box that the rotation transform then maps onto
+	// the landscape swapchain. Use this in callers that produce coordinates
+	// later consumed by the rotation-aware Vulkan present path (game draw_rect,
+	// ImGui DisplaySize). Other callers (GS Resize, viewport setup) want the
+	// raw physical dims and should keep using GetWindowWidth/Height.
+	GSVector2i GetPresentationSize() const;
+	__fi s32 GetPresentationWidth() const { return GetPresentationSize().x; }
+	__fi s32 GetPresentationHeight() const { return GetPresentationSize().y; }
 	__fi float GetWindowScale() const { return m_window_info.surface_scale; }
 	__fi GSVSyncMode GetVSyncMode() const { return m_vsync_mode; }
 	__fi bool IsPresentThrottleAllowed() const { return m_allow_present_throttle; }
@@ -1641,6 +1715,11 @@ public:
 
 	/// Returns true if it's an OpenGL-based renderer.
 	bool UsesLowerLeftOrigin() const;
+
+	/// Texture/target pool budget. Per-GPU from the mobile GS tuning on Android, the
+	/// MAX_POOLED_*/MAX_*_AGE constants elsewhere. From sashkinbro/EmuCoreX.
+	u32 GetPoolLimit(bool texture) const;
+	u32 GetPoolMaxAge(bool texture) const;
 
 	/// Free ImGui textures before shutdown
 	void DestroyImGuiTextures();
@@ -1668,7 +1747,11 @@ public:
 
 	/// Returns false if the window was completely occluded. If frame_skip is set, the frame won't be
 	/// displayed, but the GPU command queue will still be flushed.
-	virtual PresentResult BeginPresent(bool frame_skip) = 0;
+	PresentResult BeginPresent(bool frame_skip)
+	{
+		FlushDeferredDraws();
+		return DoBeginPresent(frame_skip);
+	}
 
 	/// Presents the frame to the display.
 	virtual void EndPresent() = 0;
@@ -1691,6 +1774,15 @@ public:
 	/// Get the pipeline statistics for the last frame.
 	virtual GPUPipelineStatistics GetAndResetAccumulatedGPUPipelineStatistics() = 0;
 
+	/// Enables backend-specific diagnostic counters (e.g. Vulkan acquire/present timing).
+	/// Off by default to surface WSI-layer timing in diagnostic tools without paying
+	/// the cost on the normal present hot path.
+	virtual void EnableExtendedStats(bool enabled) {}
+
+	/// Returns backend-specific diagnostic lines (swapchain config, present/acquire timing, etc).
+	/// Each line is a fully-formatted string, ready to print as-is. Default: empty.
+	virtual std::vector<std::string> GetExtendedStats() const { return {}; }
+
 	/// Returns true if not enough time has passed for present to not block.
 	bool ShouldSkipPresentingFrame();
 
@@ -1705,6 +1797,18 @@ public:
 	virtual void PushDebugGroup(const char* fmt, ...) = 0;
 	virtual void PopDebugGroup() = 0;
 	virtual void InsertDebugMessage(DebugMessageCategory category, const char* fmt, ...) = 0;
+
+	/// Per-draw graphics-debugger label, compiled into every build and gated at runtime
+	/// on GSConfig.DebugLabels.
+	///
+	/// Distinct from PushDebugGroup, which is compiled out unless ENABLE_OGL_DEBUG and
+	/// additionally requires UseDebugDevice -- and therefore the validation layer, which
+	/// makes a capture useless for timing. The GL_* macro family also evaluates its
+	/// format arguments at every call site before the emitter can bail, so un-gating it
+	/// wholesale would be far too expensive for a release build. This takes a
+	/// pre-formatted string and is only reached when labelling is actually on.
+	virtual void PushDrawLabel(const std::string_view label) {}
+	virtual void PopDrawLabel() {}
 
 	GSTexture* FetchSurface(GSTexture::Usage usage, int width, int height, int levels, GSTexture::Format format, bool clear, bool prefer_reuse);
 	GSTexture* FetchSurface(GSTexture::Usage usage, const GSVector2i& size, int levels, GSTexture::Format format, bool clear, bool prefer_reuse);
@@ -1728,9 +1832,17 @@ public:
 	/// back every frame (e.g. small occlusion-test targets) will typically draw into the
 	/// same texture again shortly before the next readback; backends can use this to
 	/// schedule command submission so that readback has minimal GPU backlog to wait on.
-	virtual void HintReadbackSource(GSTexture* tex);
+	void HintReadbackSource(GSTexture* tex)
+	{
+		FlushDeferredDraws();
+		DoHintReadbackSource(tex);
+	}
 
-	virtual void CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r, u32 destX, u32 destY) = 0;
+	void CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r, u32 destX, u32 destY)
+	{
+		FlushDeferredDraws();
+		DoCopyRect(sTex, dTex, r, destX, destY);
+	}
 
 	// StretchRect - all options
 	void StretchRect(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect, ShaderConvertSelector shader, Filter filter);
@@ -1754,21 +1866,86 @@ public:
 
 	/// Same as doing StretchRect for each item, except tries to batch together rectangles in as few draws as possible.
 	/// The provided list should be sorted by texture, the implementations only check if it's the same as the last.
-	virtual void DrawMultiStretchRects(const MultiStretchRect* rects, u32 num_rects, GSTexture* dTex, ShaderConvertSelector shader = ShaderConvert::COPY);
+	void DrawMultiStretchRects(const MultiStretchRect* rects, u32 num_rects, GSTexture* dTex, ShaderConvertSelector shader = ShaderConvert::COPY)
+	{
+		FlushDeferredDraws();
+		DoDrawMultiStretchRects(rects, num_rects, dTex, shader);
+	}
 
 	/// Sorts a MultiStretchRect list for optimal batching.
 	static void SortMultiStretchRects(MultiStretchRect* rects, u32 num_rects);
 
 	/// Updates a GPU CLUT texture from a source texture.
-	virtual void UpdateCLUTTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, GSTexture* dTex, u32 dOffset, u32 dSize) = 0;
+	void UpdateCLUTTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, GSTexture* dTex, u32 dOffset, u32 dSize)
+	{
+		FlushDeferredDraws();
+		DoUpdateCLUTTexture(sTex, sScale, offsetX, offsetY, dTex, dOffset, dSize);
+	}
 
 	/// Converts a colour format to an indexed format texture.
-	virtual void ConvertToIndexedTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, u32 SBW, u32 SPSM, GSTexture* dTex, u32 DBW, u32 DPSM) = 0;
+	void ConvertToIndexedTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, u32 SBW, u32 SPSM, GSTexture* dTex, u32 DBW, u32 DPSM)
+	{
+		FlushDeferredDraws();
+		DoConvertToIndexedTexture(sTex, sScale, offsetX, offsetY, SBW, SPSM, dTex, DBW, DPSM);
+	}
 
 	/// Uses box downsampling to resize a texture.
-	virtual void FilteredDownsampleTexture(GSTexture* sTex, GSTexture* dTex, u32 downsample_factor, const GSVector2i& clamp_min, const GSVector4& dRect) = 0;
+	void FilteredDownsampleTexture(GSTexture* sTex, GSTexture* dTex, u32 downsample_factor, const GSVector2i& clamp_min, const GSVector4& dRect)
+	{
+		FlushDeferredDraws();
+		DoFilteredDownsampleTexture(sTex, dTex, downsample_factor, clamp_min, dRect);
+	}
 
-	virtual void RenderHW(GSHWDrawConfig& config) = 0;
+	/// Submits a hardware draw. With the render-pass scheduler active this may hold the
+	/// draw back and emit it later, coalesced with other draws to the same target — see
+	/// GSPassScheduler. Any device entry point that could observe the result flushes
+	/// first, so the deferral is invisible.
+	void RenderHW(GSHWDrawConfig& config);
+
+	/// Emits any draws the render-pass scheduler is holding back, in an order that
+	/// preserves what every deferred draw would have seen had it run immediately.
+	///
+	/// This is the load-bearing half of the coalescing design. Deferral is safe only
+	/// because *observing* a render target — copying it, sampling it, downsampling it,
+	/// presenting it, reading it back — has to go through a GSDevice entry point, and
+	/// every one of those entry points calls this first. The virtuals behind them are
+	/// protected and named Do*, so a caller cannot reach the backend without passing
+	/// through the flush.
+	///
+	/// Re-entrant by design: emitting a deferred draw calls DoRenderHW, and several
+	/// backends call CopyRect on themselves from inside it to clone an RT for a feedback
+	/// loop. Re-entry is a no-op rather than recursion.
+	///
+	/// The queue depth is mirrored here rather than read from the scheduler so that the
+	/// overwhelmingly common "nothing queued" case stays one load and one branch, and so
+	/// that GSDevice.h - which most of the GS tree includes - does not have to pull in
+	/// GSPassScheduler.h.
+	__fi void FlushDeferredDraws()
+	{
+		if (m_deferred_draw_count != 0 && !m_flushing)
+			FlushDeferredDrawsImpl();
+	}
+
+	/// Narrower form for the entry points that only touch one texture: flushes just when a
+	/// queued draw can actually observe it. Texture pooling and deferred-clear bookkeeping
+	/// run several times a frame on textures the queue has never heard of, and flushing for
+	/// those throws away most of the coalescing.
+	__fi void FlushDeferredDrawsFor(const GSTexture* tex)
+	{
+		if (m_deferred_draw_count != 0 && !m_flushing && DeferredDrawsReference(tex))
+			FlushDeferredDrawsImpl();
+	}
+
+#if defined(PCSX2_DEBUG) || defined(PCSX2_DEVBUILD)
+	/// True when a queued draw can still observe [tex] — i.e. when reaching a backend path
+	/// that touches it, without having gone through FlushDeferredDraws() first, would be a
+	/// bug. Backends assert on this at their lowest-level "about to touch this texture"
+	/// chokepoint; see GSTextureVK::TransitionToLayout for the reasoning.
+	__fi bool DeferredDrawsWouldObserve(const GSTexture* tex) const
+	{
+		return (m_deferred_draw_count != 0 && !m_flushing && DeferredDrawsReference(tex));
+	}
+#endif
 
 	virtual void ClearSamplerCache() = 0;
 
@@ -1818,3 +1995,8 @@ template <>
 struct std::hash<GSHWDrawConfig::PSSelector> : public GSHWDrawConfig::PSSelectorHash {};
 
 extern std::unique_ptr<GSDevice> g_gs_device;
+
+// Draw-config stringifiers, shared between the per-draw config dump and the draw log.
+const char* GSGetTopologyName(GSHWDrawConfig::Topology topology);
+const char* GSGetTexHazardName(u32 tex_hazard);
+const char* GSGetDestinationAlphaModeName(GSHWDrawConfig::DestinationAlphaMode datm);

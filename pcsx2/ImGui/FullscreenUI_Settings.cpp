@@ -2871,6 +2871,9 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 		FSUI_NSTR("Disable Readbacks (Synchronize GS Thread)"),
 		FSUI_NSTR("Unsynchronized (Non-Deterministic)"),
 		FSUI_NSTR("Disabled (Ignore Transfers)"),
+		// Must stay index 5 to match GSHardwareDownloadMode::Asynchronous; without this entry
+		// DrawIntListSetting falls back to "Unknown" for the mode.
+		FSUI_NSTR("Asynchronous (Experimental, Readback Lags A Frame)"),
 	};
 	static constexpr const char* s_screenshot_sizes[] = {
 		FSUI_NSTR("Display Resolution (Aspect Corrected)"),
@@ -3319,6 +3322,15 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 				"EmuCore/GS", "HWDownloadMode", static_cast<int>(GSHardwareDownloadMode::Enabled), s_hw_download, std::size(s_hw_download),
 				true);
 		}
+		static constexpr const char* s_back_thread_modes[] = {
+			FSUI_NSTR("Disabled (Default)"),
+			FSUI_NSTR("Inline Records (Debug)"),
+			FSUI_NSTR("Lockstep (Debug)"),
+			FSUI_NSTR("Pipelined (Second GS Thread)"),
+		};
+		DrawIntListSetting(bsi, FSUI_ICONSTR(ICON_FA_MICROCHIP, "GS Back Thread"),
+			FSUI_CSTR("Pipelined splits GS emulation across two threads on multi-core systems. The debug modes are much slower — do not use them for play."),
+			"EmuCore/GS", "GSBackThreadMode", static_cast<int>(GSBackThreadMode::Off), s_back_thread_modes, std::size(s_back_thread_modes), true);
 #if !defined(__APPLE__)
 		DrawIntListSetting(bsi, FSUI_ICONSTR(ICON_FA_EXPAND, "Allow Exclusive Fullscreen"),
 			FSUI_CSTR("Overrides the driver's heuristics for enabling exclusive fullscreen, or direct flip/scanout."), "EmuCore/GS",
@@ -3332,6 +3344,10 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 			"GSDumpCompression", static_cast<int>(GSDumpCompressionMethod::LZMA), s_gsdump_compression, std::size(s_gsdump_compression), true);
 		DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_BAN, "Disable Framebuffer Fetch"),
 			FSUI_CSTR("Prevents the usage of framebuffer fetch when supported by host GPU."), "EmuCore/GS", "DisableFramebufferFetch", false);
+		DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_LAYER_GROUP, "Coalesce Render Passes"),
+			FSUI_CSTR("Groups consecutive draws to the same target into one render pass. Helps on tiling GPUs, where every "
+					  "pass boundary costs a full tile load and store. Rendering is unchanged."),
+			"EmuCore/GS", "CoalesceRenderPasses", false);
 		DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_BAN, "Disable Shader Cache"), FSUI_CSTR("Prevents the loading and saving of shaders/pipelines to disk."),
 			"EmuCore/GS", "DisableShaderCache", false);
 		DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_BAN, "Disable Vertex Shader Expand"), FSUI_CSTR("Falls back to the CPU for expanding sprites/lines."),
@@ -4207,6 +4223,16 @@ void FullscreenUI::DrawNetworkHDDSettingsPage()
 
 void FullscreenUI::OpenMemoryCardCreateDialog()
 {
+	// Pre-fill the first unused "Mcd00N" so a card can be created with a controller alone:
+	// Big Picture's input popup has no on-screen keyboard, so a blank field is a dead end.
+	std::string default_name;
+	for (int i = 1; i <= 999; i++)
+	{
+		default_name = fmt::format("Mcd{:03d}", i);
+		if (!FileMcd_GetCardInfo(default_name + ".ps2").has_value())
+			break;
+	}
+
 	OpenInputStringDialog(FSUI_ICONSTR(ICON_FA_PLUS, "Create Memory Card"),
 		FSUI_STR("Enter the name for the new memory card."), std::string(),
 		FSUI_ICONSTR(ICON_FA_CHECK, "Create"), [](std::string name) {
@@ -4297,7 +4323,7 @@ void FullscreenUI::OpenMemoryCardCreateDialog()
 					CloseChoiceDialog();
 #endif
 				});
-		});
+		}, default_name);
 }
 
 void FullscreenUI::DoCreateMemoryCard(std::string name, MemoryCardType type, MemoryCardFileType file_type, bool use_ntfs_compression)
@@ -5516,6 +5542,10 @@ void FullscreenUI::DrawAdvancedSettingsPage()
 		DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_MEMORY, "Enable Extended RAM (Dev Console)"),
 			FSUI_CSTR("Exposes additional memory to the virtual machine, expanding the EE and IOP memory to 128MB and 8MB respectively."),
 			"EmuCore/CPU", "ExtraMemory", false);
+		DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_PLUS_MINUS, "FPU Add/Sub Guard Bits"),
+			FSUI_CSTR("Emulates the EE FPU's missing add/sub guard bits for hardware-accurate results (default). A few games need it; "
+					  "disabling is a minor speedup for EE-FPU-heavy games verified correct without it. No effect in Full clamping mode."),
+			"EmuCore/CPU/Recompiler", "fpuGuardedAddSub", true);
 
 		MenuHeading(FSUI_CSTR("Vector Units"));
 		DrawIntListSetting(bsi, FSUI_ICONSTR(ICON_FA_ARROW_TREND_DOWN, "VU0 Rounding Mode"),

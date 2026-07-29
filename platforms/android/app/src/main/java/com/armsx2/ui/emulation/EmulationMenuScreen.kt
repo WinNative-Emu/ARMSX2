@@ -37,6 +37,7 @@ import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -77,7 +78,9 @@ import com.armsx2.ui.common.GameCoverArt
 import com.armsx2.ui.settings.controllerFocusable
 import com.armsx2.ui.touch.TouchControls
 import com.armsx2.ui.theme.Danger
+import com.armsx2.ui.common.StatusChip
 import com.armsx2.ui.theme.Success
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -87,12 +90,24 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
     val scope = rememberCoroutineScope()
     var shown by remember { mutableStateOf(false) }
     var dismissing by remember { mutableStateOf(false) }
+    var friendsOpen by remember { mutableStateOf(false) }
     val closeMenu: () -> Unit = remember(viewModel, scope) {
         {
             if (!dismissing) {
                 dismissing = true
                 shown = false
-                scope.launch {
+                // ★ Dispatchers.Main, NOT the composition's own dispatcher. rememberCoroutineScope
+                // inherits the composition context, which on Android is AndroidUiDispatcher — it
+                // dispatches continuations on CHOREOGRAPHER FRAME CALLBACKS. We have just set
+                // shown = false, so once the exit animation settles Compose has nothing left to
+                // invalidate, no frame is scheduled, and the continuation after this delay is
+                // never dispatched: the VM is simply never told to resume. The game sits paused
+                // with the OSD reading "FPS: N/A" until something incidentally causes a frame —
+                // which is exactly why tapping the on-screen controls "speeds up" the recovery
+                // (touch input schedules a frame) and why waiting also eventually works.
+                // Dispatchers.Main is a plain main-looper Handler dispatcher with no frame
+                // dependency, so the resume fires on time whether or not anything is drawing.
+                scope.launch(Dispatchers.Main) {
                     delay(220)
                     viewModel.dismissHandler = null
                     viewModel.resumeImmediately()
@@ -110,9 +125,41 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
         }
     }
     LaunchedEffect(Unit) { shown = true }
-    BackHandler(onBack = closeMenu)
+
+    // Hand pad input to the Friends panel while it is open, and give it back on close.
+    //
+    // The nav registry is shared between the menu and the panel, so ownership has to be explicit:
+    // the selection is cleared on both edges, because a selection left pointing at a control on
+    // the other side of the transition highlights something the user cannot see.
+    DisposableEffect(friendsOpen) {
+        if (friendsOpen) {
+            EmulationMenuInputController.overlayDismiss = { friendsOpen = false }
+            com.armsx2.ui.settings.SettingsControllerNav.clearSelection()
+        }
+        onDispose {
+            EmulationMenuInputController.overlayDismiss = null
+            com.armsx2.ui.settings.SettingsControllerNav.clearSelection()
+        }
+    }
+    // Highlight the panel's first control once it has actually composed. Selecting in the same
+    // frame the panel opens would find an empty registry — controllerFocusable only registers
+    // items that exist, and the panel's do not until AnimatedVisibility has run.
+    LaunchedEffect(friendsOpen) {
+        if (friendsOpen) {
+            delay(260)
+            if (friendsOpen) com.armsx2.ui.settings.SettingsControllerNav.move(1)
+        }
+    }
+    // Back closes the friends overlay first when it is up. Without this, opening Friends and
+    // pressing Back would dismiss the entire pause menu and resume the game, which is not what
+    // anyone means by "go back" from a panel sitting on top of another panel.
+    BackHandler(onBack = { if (friendsOpen) friendsOpen = false else closeMenu() })
 
     state.pendingHardcore?.let { enabling ->
+        androidx.compose.runtime.DisposableEffect(Unit) {
+            com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.POPUP_OPEN)
+            onDispose { com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.POPUP_CLOSE) }
+        }
         AlertDialog(
             onDismissRequest = viewModel::cancelToggleHardcore,
             title = { Text(str(if (enabling) "ra.hardcore.enable.title" else "ra.hardcore.disable.title")) },
@@ -157,7 +204,13 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
                     shadowElevation = 22.dp,
                 ) {
-                    MenuPage(state, viewModel, compact = true, modifier = Modifier.fillMaxSize())
+                    MenuPage(
+                        state = state,
+                        viewModel = viewModel,
+                        compact = true,
+                        modifier = Modifier.fillMaxSize(),
+                        onOpenFriends = { friendsOpen = true },
+                    )
                 }
             } else {
                 Row(
@@ -181,6 +234,7 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
                             viewModel = viewModel,
                             compact = false,
                             modifier = Modifier.fillMaxSize(),
+                            onOpenFriends = { friendsOpen = true },
                         )
                     }
                     Surface(
@@ -195,6 +249,67 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
                 }
             }
         }
+
+        // Friends, as its own panel over the menu.
+        //
+        // Composed here rather than as an AlertDialog on purpose: a Dialog gets its own focused
+        // window, and a focused window swallows gamepad keys before our input plumbing ever sees
+        // them — the pause menu would stop responding to the pad the moment this opened.
+        AnimatedVisibility(
+            visible = friendsOpen,
+            enter = fadeIn(tween(160, easing = EaseOut)),
+            exit = fadeOut(tween(140, easing = EaseIn)),
+        ) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.72f))
+                    .clickable { friendsOpen = false },
+            )
+        }
+        AnimatedVisibility(
+            visible = friendsOpen,
+            enter = fadeIn(tween(190, easing = EaseOut)),
+            exit = fadeOut(tween(150, easing = EaseIn)),
+            modifier = Modifier.align(Alignment.Center),
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(if (compact) 0.94f else 0.6f)
+                    .widthIn(max = 620.dp)
+                    .fillMaxHeight(0.9f)
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Vertical)),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
+                shadowElevation = 24.dp,
+            ) {
+                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(start = 16.dp, end = 10.dp, top = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            str("friends.title"),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        // Between the title and Close: whose Discord this is.
+                        com.armsx2.ui.friends.SelfChip(
+                            Modifier.weight(1f).padding(horizontal = 12.dp),
+                        )
+                        TextButton(
+                            onClick = { friendsOpen = false },
+                            modifier = Modifier.controllerFocusable(
+                                "menu.friends.close",
+                                onConfirm = { friendsOpen = false },
+                            ),
+                        ) { Text(str("action.close")) }
+                    }
+                    com.armsx2.ui.friends.FriendsPanel(Modifier.padding(horizontal = 12.dp))
+                }
+            }
+        }
     }
 }
 
@@ -204,6 +319,7 @@ private fun MenuPage(
     viewModel: EmulationMenuViewModel,
     compact: Boolean,
     modifier: Modifier,
+    onOpenFriends: () -> Unit,
 ) {
     val tabScrollStates = remember {
         EmulationMenuTab.entries.associateWith {
@@ -231,7 +347,7 @@ private fun MenuPage(
                 .padding(bottom = 18.dp),
         ) {
             if (compact) CompactMenuTabs(state.tab, viewModel::selectTab)
-            MenuHeader(compact, state.hardcore, state.richPresence)
+            MenuHeader(compact, state.hardcore, state.richPresence, state.gameCRC, onOpenFriends)
             HorizontalDivider(
                 modifier = Modifier.padding(horizontal = 8.dp),
                 color = MaterialTheme.colorScheme.outline.copy(alpha = 0.34f),
@@ -395,7 +511,13 @@ private fun tabGlyph(tab: EmulationMenuTab): String = when (tab) {
 }
 
 @Composable
-private fun MenuHeader(compact: Boolean, hardcore: Boolean, richPresence: String) {
+private fun MenuHeader(
+    compact: Boolean,
+    hardcore: Boolean,
+    richPresence: String,
+    gameCRC: String,
+    onOpenFriends: () -> Unit,
+) {
     val game = MainActivityRuntime.currentGame.value
     Row(
         Modifier.fillMaxWidth().padding(horizontal = if (compact) 12.dp else 16.dp, vertical = 12.dp),
@@ -427,10 +549,27 @@ private fun MenuHeader(compact: Boolean, hardcore: Boolean, richPresence: String
                     com.armsx2.ui.common.StatusChip(g.extension.ifBlank { g.platform.key.uppercase() })
                 }
             }
-            if (!game?.serial.isNullOrBlank()) {
+            // Serial and CRC together: a PNACH is named <SERIAL>_<CRC>.pnach, so the two values
+            // needed to name one should not live on separate screens.
+            //
+            // The live VM CRC is preferred but cannot be relied on: for ISO boots the core hands
+            // ELFLoadingOnCPUThread an empty path, so UpdateELFInfo takes its failure branch and
+            // leaves s_current_crc at 0 — the emulog shows the loader computing the real CRC and
+            // the VM then reporting 00000000. When that happens, identify the image instead, which
+            // is the same path the Info tab and the library's long-press sheet already take.
+            val resolvedCRC by androidx.compose.runtime.produceState(gameCRC, gameCRC, game?.uri) {
+                value = gameCRC.ifBlank {
+                    game?.uri?.let { com.armsx2.DiscIdentity.resolve(it, game.serial) }.orEmpty()
+                }
+            }
+            val identity = buildList {
+                game?.serial?.takeIf { it.isNotBlank() }?.let(::add)
+                resolvedCRC.takeIf { it.isNotBlank() }?.let { add("CRC $it") }
+            }.joinToString("  ·  ")
+            if (identity.isNotBlank()) {
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    game?.serial.orEmpty(),
+                    identity,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -446,6 +585,30 @@ private fun MenuHeader(compact: Boolean, hardcore: Boolean, richPresence: String
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+            }
+        }
+
+        // Friends, in the header where it is always visible, with the online count on it. A build
+        // without the SDK has nothing to show, so it does not take up header space there.
+        if (com.armsx2.DiscordPresence.available()) {
+            Spacer(Modifier.width(8.dp))
+            Surface(
+                onClick = onOpenFriends,
+                modifier = Modifier.controllerFocusable(
+                    "menu.friends",
+                    RoundedCornerShape(14.dp),
+                    onConfirm = onOpenFriends,
+                ),
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
+            ) {
+                Box(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
+                    com.armsx2.ui.friends.FriendsGlyphWithBadge(
+                        color = MaterialTheme.colorScheme.onSurface,
+                        glyphSize = 19.sp,
+                    )
+                }
             }
         }
     }
@@ -483,21 +646,41 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
             TouchControls.setPauseTapToReveal(it)
         }
         Spacer(Modifier.height(6.dp))
-        // Full OSD = any verbose stat line (FPS is shared with Simple, so it's excluded
-        // from the "full is on" test); Simple OSD = FPS only. Reading the same osdShow*
-        // fields two ways keeps the two toggles mutually exclusive.
-        val osdFullOn = with(state.settings) {
-            osdShowVps || osdShowSpeed || osdShowCpu || osdShowGpu || osdShowResolution ||
-                osdShowGsStats || osdShowFrameTimes || osdShowHardwareInfo || osdShowGpuStats || osdShowVersion
+        // OSD mode selector — one control (Full / Minimal / Custom / Off) in place of the old
+        // master + simple toggles, cycled here and by the "Cycle Perf Stats (OSD)" hotkey. Custom
+        // = the detailed per-stat selection from All Settings > On-Screen.
+        val osdModes = com.armsx2.ui.InGameOverlay.OsdMode.entries
+        val osdModeIndex = osdModes.indexOf(com.armsx2.ui.InGameOverlay.osdMode.value).coerceAtLeast(0)
+        MenuCycleRow(
+            title = str("overlay.master.label"),
+            valueLabel = com.armsx2.ui.InGameOverlay.osdModeLabel(osdModes[osdModeIndex]),
+        ) { step ->
+            val size = osdModes.size
+            val next = ((osdModeIndex + step) % size + size) % size
+            com.armsx2.ui.InGameOverlay.setOsdMode(osdModes[next])
         }
-        val osdSimpleOn = state.settings.osdShowFps && !osdFullOn
-        MenuSwitchRow(str("overlay.master.label"), osdFullOn) { viewModel.setOsdMaster(it) }
-        Spacer(Modifier.height(6.dp))
-        MenuSwitchRow(str("overlay.simple.label"), osdSimpleOn) { viewModel.setOsdSimple(it) }
         Spacer(Modifier.height(6.dp))
         MenuSwitchRow(str("perf.frameLimit.label"), state.settings.frameLimitEnable) { value ->
             viewModel.updateSettings { it.copy(frameLimitEnable = value) }
         }
+        Spacer(Modifier.height(6.dp))
+        // Fast-forward SPEED — how fast the FF hotkey/button runs: 2..10x, or Unlimited (the
+        // default, uncapped) at the top. Global pref; re-applied live if FF is currently engaged.
+        var ffSpeed by remember { mutableStateOf(MainActivityRuntime.fastForwardSpeed()) }
+        val ffUnlimitedLabel = str("common.unlimited") // hoisted: str() is @Composable, can't run in the formatter lambda
+        com.armsx2.ui.settings.IntSliderRow(
+            label = str("perf.ffSpeed.label"),
+            value = ffSpeed,
+            min = 2,
+            max = MainActivityRuntime.FF_SPEED_UNLIMITED,
+            valueFormatter = { if (it >= MainActivityRuntime.FF_SPEED_UNLIMITED) ffUnlimitedLabel else "${it}×" },
+            onChange = { v ->
+                ffSpeed = v
+                MainActivityRuntime.setFastForwardSpeed(v)
+                if (MainActivityRuntime.fastForwardToggleActive)
+                    runCatching { kr.co.iefriends.pcsx2.NativeApp.speedhackLimitermode(MainActivityRuntime.ffLimiterMode()) }
+            },
+        )
         Spacer(Modifier.height(6.dp))
         // OSD colour, cycled in place. Shares the palette with the All Settings picker rather
         // than carrying its own copy. Safe to add here: this card's rows are plain switches with
@@ -577,6 +760,28 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
             viewModel.updateSettings { it.copy(useAngleOpenGL = on) }
         }
     }
+    // GS Multi-threading (GV7 front/back split). Restart-required like the renderer /
+    // driver above, so it lives in the same group — hit Apply & Restart below to apply.
+    // Off = single-threaded; On = GS on a dedicated back thread (Pipelined, enum 3).
+    // The Inline/Lockstep dev rungs are not exposed. Description shown inline so users
+    // who never open full settings still understand what it does.
+    MenuSwitchRow(
+        str("renderer.gsBackThread.label"),
+        settings.gsBackThreadMode >= 3,
+        description = str("renderer.gsBackThread.description"),
+    ) { on ->
+        viewModel.updateSettings { it.copy(gsBackThreadMode = if (on) 3 else 0) }
+    }
+    // Every phone GPU is a tiler, so this belongs in the in-game menu next to the other
+    // renderer levers, not just in full settings — it is the kind of thing you toggle while
+    // looking at the framerate.
+    MenuSwitchRow(
+        str("renderer.coalesceRenderPasses.label"),
+        settings.coalesceRenderPasses,
+        description = str("renderer.coalesceRenderPasses.description"),
+    ) { on ->
+        viewModel.updateSettings { it.copy(coalesceRenderPasses = on) }
+    }
     CompactAction(str("backend.applyRestart"), "↻", Modifier.fillMaxWidth(), MainActivityRuntime::restart)
     HorizontalOptions(
         title = str("renderer.upscale.label"),
@@ -594,6 +799,7 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
             2 to "4:3",
             3 to "16:9",
             4 to "10:7",
+            5 to "21:9",
         ),
         selected = settings.aspectRatio,
         onSelect = viewModel::setAspectRatio,
@@ -618,7 +824,10 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     )
     HorizontalOptions(
         title = str("renderer.hardwareDownloadMode.label"),
-        options = listOf("Accurate", "Force Full", "No Readbacks", "Unsync", "Disabled").mapIndexed { index, label -> index to label },
+        // Index == GSHardwareDownloadMode, so the order is load-bearing. "Async" is 5 and must stay
+        // last; it is experimental (non-blocking readback) and is not the default.
+        options = listOf("Accurate", "Force Full", "No Readbacks", "Unsync", "Disabled", "Async")
+            .mapIndexed { index, label -> index to label },
         selected = settings.hardwareDownloadMode,
         onSelect = viewModel::setHardwareDownloadMode,
     )
@@ -854,6 +1063,19 @@ private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
         checked = state.rumbleEnabled,
         onCheckedChange = viewModel::setRumble,
     )
+    // Vibration Strength — the same global 0-200% haptic multiplier as All Settings ›
+    // Controls, reachable here in-game. Local state drives the live update since it's a
+    // plain pref (not part of EmulationMenuUiState).
+    var haptic by remember { mutableStateOf(com.armsx2.input.ControllerMappings.hapticIntensity()) }
+    com.armsx2.ui.settings.IntSliderRow(
+        label = str("pad.hapticStrength.label"),
+        value = haptic,
+        min = 0,
+        max = 200,
+        description = str("pad.hapticStrength.description"),
+        valueFormatter = { if (it == 0) "Off" else "${it}%" },
+        onChange = { haptic = it; com.armsx2.input.ControllerMappings.setHapticIntensity(it) },
+    )
     MenuSwitchRow(str("pad.multitap.label"), state.multitapEnabled, onCheckedChange = viewModel::setMultitap)
     MenuSwitchRow(str("network.emulateUsbKeyboard"), state.settings.usbKeyboard) {
         viewModel.updateSettings { current -> current.copy(usbKeyboard = it) }
@@ -946,6 +1168,40 @@ private fun AchievementsPane(state: EmulationMenuUiState, viewModel: EmulationMe
     CompactAction(str("ra.viewAchievements"), "★", Modifier.fillMaxWidth(), viewModel::openAchievements)
     Spacer(Modifier.height(4.dp))
     SectionCard("RetroAchievements") {
+        // Signed-in account: avatar + name + both point totals (hardcore / softcore).
+        if (state.raUserName.isNotBlank()) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (state.raAvatarUrl.isNotBlank()) {
+                    AsyncImage(
+                        state.raAvatarUrl,
+                        state.raUserName,
+                        Modifier.size(46.dp).clip(CircleShape),
+                        contentScale = ContentScale.Crop,
+                    )
+                    Spacer(Modifier.width(12.dp))
+                }
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        state.raUserName,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "${state.raScore} HC",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = com.armsx2.ui.theme.Danger,
+                        )
+                        Text(
+                            "  ·  ${state.raSoftcoreScore} SC",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+        }
         Text(
             state.achievementSummary,
             style = MaterialTheme.typography.bodyMedium,
@@ -1000,6 +1256,12 @@ private fun InGameAchievementRow(item: AchievementItem) {
                 }
             }
             Spacer(Modifier.width(8.dp))
+            // Flag missables in-game — the actionable warning while you're actually playing.
+            // Progression/Win badges are left to the full achievements screen to avoid clutter here.
+            if (item.type == 1) {
+                StatusChip(str("ra.typeChip.missable"), Color(0xFFF5A623))
+                Spacer(Modifier.width(8.dp))
+            }
             Text(
                 "${item.points}",
                 style = MaterialTheme.typography.labelMedium,
@@ -1105,28 +1367,38 @@ private fun <T> HorizontalOptions(
     }
 }
 
-// Free-choice framerate cap (30–120 Hz) instead of a couple of fixed chips. The
-// default (59.94 / 50) is kept exactly until the user drags; dragging snaps to
-// whole Hz so common targets (50/60/72/90/120) are easy to hit.
+// Free-choice framerate slider (20–120 Hz) instead of a couple of fixed chips.
+// The default (59.94 / 50) is kept exactly, and the 60/50 stops snap back to
+// those exact PS2 rates (canonicalFramerate) so the true default is always
+// recoverable; every other stop is whole Hz for easy targets (72/90/120).
 @Composable
 private fun FramerateSlider(title: String, value: Float, onValue: (Float) -> Unit) {
     SectionCard(title) {
         Column(
             Modifier.fillMaxWidth().controllerFocusable(
                 "pause.framerate.$title",
-                onLeft = { onValue((value - 1f).coerceAtLeast(20f)) },
-                onRight = { onValue((value + 1f).coerceAtMost(120f)) },
+                onLeft = { onValue(canonicalFramerate((Math.round(value) - 1).coerceAtLeast(20))) },
+                onRight = { onValue(canonicalFramerate((Math.round(value) + 1).coerceAtMost(120))) },
             ),
         ) {
             val label = if (value % 1f == 0f) "${value.toInt()} Hz" else "%.2f Hz".format(value)
             Text(label, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
             Slider(
                 value = value.coerceIn(20f, 120f),
-                onValueChange = { onValue(Math.round(it).toFloat()) },
+                onValueChange = { onValue(canonicalFramerate(Math.round(it))) },
                 valueRange = 20f..120f,
             )
         }
     }
+}
+
+// The PS2's true NTSC/PAL rates are 59.94/50.00 Hz; the integer slider stops at
+// 60/50 map back to those exact defaults so the canonical rate stays recoverable
+// (dragging otherwise snaps to whole Hz and loses 59.94 forever).
+private fun canonicalFramerate(hz: Int): Float = when (hz) {
+    60 -> 59.94f
+    50 -> 50.00f
+    else -> hz.toFloat()
 }
 
 @Composable
@@ -1179,6 +1451,7 @@ private fun MenuSwitchRow(
     title: String,
     checked: Boolean,
     enabled: Boolean = true,
+    description: String? = null,
     onCheckedChange: (Boolean) -> Unit,
 ) {
     Surface(
@@ -1200,13 +1473,22 @@ private fun MenuSwitchRow(
             Modifier.padding(horizontal = 13.dp, vertical = 9.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                title,
-                modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.titleSmall,
-                color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
-            )
+            Column(Modifier.weight(1f)) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                )
+                if (description != null) {
+                    Text(
+                        description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 3,
+                    )
+                }
+            }
             Spacer(Modifier.width(10.dp))
             Switch(checked = checked, onCheckedChange = if (enabled) onCheckedChange else null)
         }

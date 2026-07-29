@@ -255,6 +255,32 @@ fun PadTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
                 ControllerMappings.setRumbleEnabled(it)
                 refreshToken.intValue++
             }
+            // Vibration strength: one multiplier over BOTH controller rumble and on-screen touch
+            // haptics (they share the motor path), so an over-eager motor can be tamed or a weak
+            // one boosted. 100% = as authored; 0% = off.
+            IntSliderRow(
+                label = str("pad.hapticStrength.label"),
+                value = ControllerMappings.hapticIntensity(),
+                min = 0,
+                max = 200,
+                description = str("pad.hapticStrength.description"),
+                valueFormatter = { if (it == 0) "Off" else "${it}%" },
+                onChange = { ControllerMappings.setHapticIntensity(it); refreshToken.intValue++ },
+            )
+            SettingsDivider()
+            // How hard the DS2 pressure modifier presses. There was a PRESSURE button (on-screen
+            // and bindable as "Pressure Modifier (hold)") but no way to choose the amount, so it
+            // was permanently stuck at the hardcoded 50%. Range is deliberately 5..95: 0 collides
+            // with the "full press" sentinel and 100 is just a normal press.
+            IntSliderRow(
+                label = str("pad.pressureAmount.label"),
+                value = com.armsx2.ui.touch.TouchControls.pressurePercent.intValue,
+                min = 5,
+                max = 95,
+                description = str("pad.pressureAmount.description"),
+                valueFormatter = { "${it}%" },
+                onChange = { com.armsx2.ui.touch.TouchControls.setPressurePercent(it) },
+            )
             SettingsDivider()
             // PS2 Multitap: route up to 8 controllers (both ports become 4-slot taps).
             // The pref drives PadRouter's slot count + the boot-time native arming; when a
@@ -612,7 +638,7 @@ fun PadTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
                 value = (TouchControls.multiTouchRadius.value * 100f).toInt(),
                 min = 50,
                 max = 95,
-                description = str("pad.onScreenControls.description"),
+                description = str("pad.multiTouch.description"),
                 valueFormatter = { "${it}%" },
                 onChange = { TouchControls.setMultiTouchRadius(it / 100f) },
             )
@@ -638,6 +664,17 @@ private fun StickFeelSliders(left: Boolean, title: String, refreshToken: Mutable
     @Suppress("UNUSED_EXPRESSION")
     refreshToken.value
     CollapsibleSection(title, initiallyExpanded = false) {
+        SegmentedRow(
+            label = str("pad.stickFeel.responseCurve.label"),
+            options = listOf(
+                str("pad.stickFeel.curve.linear"), str("pad.stickFeel.curve.light"),
+                str("pad.stickFeel.curve.medium"), str("pad.stickFeel.curve.strong"),
+            ),
+            selectedIndex = ControllerMappings.stickResponseCurve(left),
+            description = str("pad.stickFeel.responseCurve.description"),
+            onChange = { ControllerMappings.setStickResponseCurve(left, it); refreshToken.value++ },
+        )
+        SettingsDivider()
         IntSliderRow(
             label = str("pad.stickFeel.deadzone.label"),
             value = (ControllerMappings.stickDeadzone(left) * 100f).toInt(), // 0.0..0.4 -> 0..40

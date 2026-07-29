@@ -11,6 +11,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -88,6 +90,7 @@ import com.armsx2.ui.theme.ToolbarPositionPreferences
 import com.armsx2.ui.theme.LibraryChromePreferences
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.platform.LocalContext
@@ -140,20 +143,16 @@ fun HomeScreen(
     val backgroundPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { picked ->
         picked?.let { LibraryBackground.set(context, it) }
     }
-    // Controller access to the search field: A on the Search zone focuses it + opens the
-    // soft keyboard. (Registered with the controller once the library has loaded, since
-    // the field only exists then.)
-    val searchFocus = remember { FocusRequester() }
-    val keyboard = LocalSoftwareKeyboardController.current
+    // Search: both the controller (A on the Search zone) AND a touch tap open the app's own D-pad +
+    // touch keyboard (LibraryKeyboard). The search bar is no longer an editable TextField, so the
+    // Android system IME never appears. (Registered once the library has loaded.)
     val showSearch = LibraryChromePreferences.showSearch.value
     val showRecents = LibraryChromePreferences.showRecents.value
+    val searchPlaceholder = str("games.search.placeholder")
     LaunchedEffect(state.initialized, showSearch) {
         if (!showSearch && viewModel.state.value.query.isNotEmpty()) viewModel.setQuery("")
         HomeInputController.setSearchAction(state.initialized && showSearch) {
-            // Controller path: open our own D-pad-navigable keyboard (the system IME
-            // can't be driven by a D-pad). Touch still uses the system keyboard by
-            // tapping the field directly.
-            LibraryKeyboard.open(viewModel.state.value.query, viewModel::setQuery)
+            LibraryKeyboard.open(viewModel.state.value.query, viewModel::setQuery, searchPlaceholder)
         }
     }
     LaunchedEffect(directories, nativeReady) { viewModel.load(directories, nativeReady) }
@@ -170,14 +169,31 @@ fun HomeScreen(
         backgroundLayer = {
             val libraryBg = LibraryBackground.uri.value
             if (libraryBg == null) {
-                // Default: the bundled PS3 XMB-wave STILL. It used to be a looping MP4,
-                // but the continuous video decode cost in-library performance (sbro
-                // review), so it's a static image now.
-                Image(
-                    painter = painterResource(R.drawable.library_bg_xmb),
-                    contentDescription = null,
+                // Default: the live PS3-XMB wave (XmbGlView — a GLES3 port of linkev's
+                // grid-displacement mesh, matching iOS). When GL can't init — older Mali without
+                // float-texture filtering, or any EGL failure — we fall back to a looping GIF
+                // instead of a frozen still. The bundled still is the cheap floor shown during GL
+                // startup (and, once the wave is up, sits hidden behind it), so capable devices
+                // never decode the heavy GIF. Custom backgrounds below override all of this.
+                var xmbGlState by remember { mutableStateOf<Boolean?>(null) } // null=starting, true=up, false=failed
+                if (xmbGlState == false) {
+                    AsyncImage(
+                        model = ImageRequest.Builder(context).data(R.raw.library_fallback).build(),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop,
+                    )
+                } else {
+                    Image(
+                        painter = painterResource(R.drawable.library_bg_xmb),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop,
+                    )
+                }
+                AndroidView(
+                    factory = { XmbGlView(it).apply { onGlStatus = { ok -> xmbGlState = ok } } },
                     modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop,
                 )
             } else {
                 // User-picked still image / GIF (Coil handles both).
@@ -188,13 +204,19 @@ fun HomeScreen(
                     contentScale = ContentScale.Crop,
                 )
             }
-            // Scrim so covers and text stay readable over the backdrop.
+            // Scrim so covers and text stay readable over the backdrop. A user-picked image can
+            // be any brightness, so it gets the full dark scrim. The XMB is our own controlled
+            // backdrop (dark at the top where the content sits) and a heavy scrim just muddied
+            // its blue into navy — so it gets only a whisper of dimming, letting the vivid blue
+            // read through.
+            val scrimTop = if (libraryBg == null) 0.06f else 0.55f
+            val scrimBottom = if (libraryBg == null) 0.20f else 0.80f
             Box(
                 Modifier.fillMaxSize().background(
                     Brush.verticalGradient(
                         listOf(
-                            MaterialTheme.colorScheme.background.copy(alpha = 0.55f),
-                            MaterialTheme.colorScheme.background.copy(alpha = 0.80f),
+                            MaterialTheme.colorScheme.background.copy(alpha = scrimTop),
+                            MaterialTheme.colorScheme.background.copy(alpha = scrimBottom),
                         ),
                     ),
                 ),
@@ -203,8 +225,13 @@ fun HomeScreen(
     ) {
         BoxWithConstraints(modifier.fillMaxSize()) {
             val compact = maxWidth < 600.dp
+            // Adaptive cells alone give a tablet MORE columns rather than BIGGER art, so scale the
+            // cell width. Bigger cells mean bigger covers and fewer, better-spaced columns. Opt-in:
+            // 1.0 everywhere until the user moves the Cover size slider.
+            val coverScale = com.armsx2.ui.UiScale.coverScale.value
+            val gridCellDp = (if (compact) 104f else 118f) * coverScale
             val columns = if (state.layout == LibraryLayout.Grid) {
-                GridCells.Adaptive(if (compact) 104.dp else 118.dp)
+                GridCells.Adaptive(gridCellDp.dp)
             } else {
                 // List and Shelf are full-width rows.
                 GridCells.Fixed(1)
@@ -214,8 +241,12 @@ fun HomeScreen(
             // otherwise Up/Down move one cover at a time (feeling like Left/Right) and
             // only the very first cover can step up into the Recents row.
             val estimatedColumns = when (state.layout) {
-                LibraryLayout.Grid -> (maxWidth.value / if (compact) 112f else 128f).toInt().coerceAtLeast(1)
-                LibraryLayout.Shelf -> (maxWidth.value / ((if (compact) 84f else 100f) + 20f)).toInt().coerceIn(3, 8)
+                // MUST track gridCellDp — this feeds HomeInputController's Up/Down step, so if the
+                // estimate and the real column count diverge, controller navigation skips rows.
+                LibraryLayout.Grid ->
+                    (maxWidth.value / ((if (compact) 112f else 128f) * coverScale)).toInt().coerceAtLeast(1)
+                LibraryLayout.Shelf ->
+                    (maxWidth.value / (((if (compact) 84f else 100f) * coverScale) + 20f)).toInt().coerceIn(3, 8)
                 LibraryLayout.List -> 1
             }
             LaunchedEffect(estimatedColumns) { HomeInputController.setColumnCount(estimatedColumns) }
@@ -422,10 +453,9 @@ fun HomeScreen(
                     item(span = { GridItemSpan(maxLineSpan) }) {
                         SearchField(
                             value = state.query,
-                            onValueChange = viewModel::setQuery,
-                            placeholder = str("games.search.placeholder"),
+                            onClick = { LibraryKeyboard.open(viewModel.state.value.query, viewModel::setQuery, searchPlaceholder) },
+                            placeholder = searchPlaceholder,
                             modifier = Modifier.fillMaxWidth(),
-                            focusRequester = searchFocus,
                             selected = HomeInputController.zone.value == HomeZone.Search,
                         )
                     }
@@ -451,7 +481,7 @@ fun HomeScreen(
                                 GameShelf(
                                     games = shownRecents,
                                     shelfRes = R.drawable.shelf_frosted,
-                                    coverWidth = if (compact) 84.dp else 100.dp,
+                                    coverWidth = ((if (compact) 84f else 100f) * coverScale).dp,
                                     scroll = true,
                                     selectedIndex = recentSel,
                                     onLaunch = { viewModel.launch(it) },
@@ -526,7 +556,7 @@ fun HomeScreen(
                     emptyLibrary(state.query.isBlank())
                 } else if (state.layout == LibraryLayout.Shelf) {
                     // Fill each plank: chunk by how many covers fit the shelf width.
-                    val shelfCoverW = if (compact) 84.dp else 100.dp
+                    val shelfCoverW = ((if (compact) 84f else 100f) * coverScale).dp
                     val perShelf = (maxWidth.value / (shelfCoverW.value + 20f)).toInt().coerceIn(3, 8)
                     val shelfRows = state.visibleGames.chunked(perShelf)
                     items(
@@ -611,9 +641,15 @@ fun HomeScreen(
     }
 
     menuGame?.let { game ->
+        // Tri-state on purpose: null while identifying, blank when the image cannot be identified.
+        // produceState alone cannot tell those apart — both are null — so an unidentifiable game
+        // would sit on "…" forever, reading as still-loading when it is actually unknown.
+        val menuCRC by androidx.compose.runtime.produceState<String?>(initialValue = null, game.uri) {
+            value = com.armsx2.DiscIdentity.resolve(game.uri, game.serial) ?: ""
+        }
         ModalBottomSheet(onDismissRequest = { menuGame = null }) {
             Column(
-                Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, bottom = 20.dp),
+                Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start = 8.dp, end = 8.dp, bottom = 20.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
@@ -622,6 +658,21 @@ fun HomeScreen(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                )
+                // Serial and CRC — the two halves of a <SERIAL>_<CRC>.pnach filename.
+                val identity = buildList {
+                    game.serial?.takeIf { it.isNotBlank() }?.let(::add)
+                    add("CRC " + when (menuCRC) {
+                        null -> "…"   // still identifying
+                        "" -> "—"     // identified as unknown
+                        else -> menuCRC
+                    })
+                }.joinToString("  ·  ")
+                Text(
+                    identity,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 8.dp),
                 )
                 GameMenuAction("▶", str("action.play")) {
                     menuGame = null
@@ -645,6 +696,14 @@ fun HomeScreen(
                     menuGame = null
                     if (!com.armsx2.HomeShortcuts.pin(context, game))
                         Toast.makeText(context, addToHomeFailed, Toast.LENGTH_LONG).show()
+                }
+                // Only offered when the game is actually in Recently Played — this drops
+                // just this one entry, unlike the library-wide "Show Recently Played" toggle.
+                if (state.recentGames.any { it.uri == game.uri }) {
+                    GameMenuAction("🕐", str("games.removeRecent")) {
+                        viewModel.removeFromRecent(game)
+                        menuGame = null
+                    }
                 }
                 val hidden = com.armsx2.HiddenGames.isHidden(game)
                 GameMenuAction(if (hidden) "◍" else "🚫", str(if (hidden) "games.unhide" else "games.hide")) {
@@ -720,9 +779,6 @@ private fun LibraryOverflowMenu(
             color = MaterialTheme.colorScheme.primary,
             fontWeight = FontWeight.Bold,
         )
-        LibraryOverflowItem("☰", str("games.overflow.openNavigation")) {
-            closeThen(onOpenNavigation)
-        }
         LibraryOverflowItem(
             glyph = "A–Z",
             label = str("games.overflow.sortTitle"),
@@ -737,6 +793,7 @@ private fun LibraryOverflowMenu(
         ) {
             closeThen { onSort(HomeSort.RecentlyPlayed) }
         }
+        OverflowSeparator()
         LibraryOverflowItem(
             glyph = if (use3dCovers) "3D" else "2D",
             label = str("games.overflow.coverStyle"),
@@ -746,10 +803,10 @@ private fun LibraryOverflowMenu(
         }
         LibraryOverflowItem(
             glyph = "Aa",
-            label = str("games.overflow.gridNames"),
-            trailing = if (showGridNames) str("common.on") else str("common.off"),
+            label = str("games.overflow.customNames"),
+            trailing = if (customNames) str("common.on") else str("common.off"),
         ) {
-            closeThen(onToggleGridNames)
+            closeThen(onToggleCustomNames)
         }
         LibraryOverflowItem(
             glyph = "Aa",
@@ -772,6 +829,7 @@ private fun LibraryOverflowMenu(
         ) {
             closeThen(onToggleShowHidden)
         }
+        OverflowSeparator()
         LibraryOverflowItem("▧", str("games.background.choose")) {
             closeThen(onChooseBackground)
         }
@@ -780,13 +838,34 @@ private fun LibraryOverflowMenu(
                 closeThen(onClearBackground)
             }
         }
-        LibraryOverflowItem("↻", str("games.overflow.setup")) {
-            closeThen { MainActivityRuntime.reopenSetup() }
-        }
-        LibraryOverflowItem("⏻", str("games.toolbar.exit")) {
+        OverflowSeparator()
+        // Exit, back where it used to live. It moved to the drawer, which put it below every other
+        // destination -- so quitting, one of the most frequent things anyone does here, meant
+        // opening the drawer and scrolling to the bottom every time (issue #460, and shinobumaehara
+        // is right that frequency should decide placement). It stays in the drawer too; this is the
+        // short path, not a replacement.
+        //
+        // The confirmation is the point of the row and travels with it: quitting mid-session
+        // without one loses whatever is not saved.
+        // onExitApp was still a parameter and its confirmation dialog was still wired up — only
+        // the row that reached them had been removed. So this restores the item, not the feature.
+        LibraryOverflowItem(
+            glyph = "⏻",
+            label = str("games.toolbar.exit"),
+            iconRes = com.armsx2.R.drawable.ic_power,
+            iconTint = Color(0xFFE60012),
+        ) {
             closeThen(onExitApp)
         }
     }
+}
+
+@Composable
+private fun OverflowSeparator() {
+    androidx.compose.material3.HorizontalDivider(
+        modifier = Modifier.padding(horizontal = 18.dp, vertical = 6.dp),
+        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.30f),
+    )
 }
 
 @Composable
@@ -795,6 +874,10 @@ private fun LibraryOverflowItem(
     label: String,
     selected: Boolean = false,
     trailing: String? = null,
+    // A real drawable instead of a text glyph. Exit needs this: the power symbol (U+23FB) is not
+    // in the bundled font and rendered as a tofu box. Null keeps the glyph path for every other row.
+    iconRes: Int? = null,
+    iconTint: Color? = null,
     onClick: () -> Unit,
 ) {
     DropdownMenuItem(
@@ -815,12 +898,21 @@ private fun LibraryOverflowItem(
                 color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
             ) {
                 Box(contentAlignment = Alignment.Center) {
-                    Text(
-                        text = glyph,
-                        fontSize = if (glyph.length > 2) 11.sp else 17.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
-                    )
+                    if (iconRes != null) {
+                        androidx.compose.material3.Icon(
+                            painter = androidx.compose.ui.res.painterResource(iconRes),
+                            contentDescription = null,
+                            tint = iconTint ?: MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.size(19.dp),
+                        )
+                    } else {
+                        Text(
+                            text = glyph,
+                            fontSize = if (glyph.length > 2) 11.sp else 17.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
                 }
             }
         },
@@ -864,14 +956,8 @@ private fun GameGridCard(
             game,
             Modifier
                 .fillMaxWidth()
-                .aspectRatio(0.72f)
-                .border(
-                    BorderStroke(
-                        if (selected) 2.dp else 1.dp,
-                        if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.42f),
-                    ),
-                    RoundedCornerShape(12.dp),
-                ),
+                .aspectRatio(coverAspectRatio())
+                .coverFrame(selected, 2.dp, MaterialTheme.colorScheme.primary),
         )
         if (GridLabels.show.value) {
             Spacer(Modifier.height(4.dp))
@@ -892,14 +978,14 @@ private fun GameListCard(game: GameInfo, selected: Boolean, onClick: () -> Unit,
     Surface(
         modifier = Modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onDetails),
         shape = RoundedCornerShape(15.dp),
-        color = MaterialTheme.colorScheme.surface,
+        color = MaterialTheme.colorScheme.surface.copy(alpha = LibraryChromePreferences.libraryOpacity.value / 100f),
         border = BorderStroke(
             if (selected) 2.dp else 1.dp,
             if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.42f),
         ),
     ) {
         Row(Modifier.padding(7.dp), verticalAlignment = Alignment.CenterVertically) {
-            GameCover(game, Modifier.width(54.dp).aspectRatio(0.72f))
+            GameCover(game, Modifier.width(54.dp).aspectRatio(coverAspectRatio()))
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(game.displayTitle(EnglishTitles.enabled.value), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -921,11 +1007,8 @@ private fun RecentGameCard(game: GameInfo, selected: Boolean = false, onClick: (
     ) {
         GameCover(
             game,
-            Modifier.fillMaxWidth().aspectRatio(0.72f).border(
-                if (selected) 2.5.dp else 1.dp,
-                if (selected) Color(0xFF3DA5FF) else MaterialTheme.colorScheme.outline.copy(alpha = 0.42f),
-                RoundedCornerShape(12.dp),
-            ),
+            Modifier.fillMaxWidth().aspectRatio(coverAspectRatio())
+                .coverFrame(selected, 2.5.dp, Color(0xFF3DA5FF)),
         )
         Spacer(Modifier.height(5.dp))
         Text(game.displayTitle(EnglishTitles.enabled.value), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -940,6 +1023,86 @@ private fun GameMetadata(game: GameInfo) {
         if (game.compatibility > 0) {
             Text("★".repeat(game.compatibility), color = Color(0xFFFFC857), fontSize = 9.sp, maxLines = 1)
         }
+        // Playtime and last-known achievement progress, shown only when there is something to show
+        // so an untouched library looks exactly as before. Playtime is app-side per serial; the
+        // achievement counts are whatever the game last reported while running (the core cannot be
+        // asked about a game it has not loaded).
+        val rev = com.armsx2.PlayTime.revision.value
+        val played = remember(game.serial, rev) {
+            com.armsx2.PlayTime.formatPlayed(com.armsx2.PlayTime.playedSeconds(game.serial))
+        }
+        if (played.isNotEmpty()) {
+            Text("⏳ $played", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, maxLines = 1)
+        }
+        val ach = remember(game.serial, rev) { com.armsx2.PlayTime.achievements(game.serial) }
+        ach?.let { p ->
+            // Hardcore and softcore are different accomplishments on RetroAchievements — hardcore
+            // forbids save states, cheats and slow motion — so they get different treatment rather
+            // than being merged into one number. Lead with hardcore when any exists (it is the
+            // stricter figure), and only mention softcore separately when it is actually ahead.
+            val leadHardcore = p.hardcore > 0
+            val shown = if (leadHardcore) p.hardcore else p.softcore
+            val mastered = if (leadHardcore) p.masteredHardcore else p.masteredSoftcore
+            Text(
+                "🏆 $shown/${p.total}",
+                color = when {
+                    mastered && leadHardcore -> Color(0xFFFFC857)  // gold: mastered in hardcore
+                    mastered -> Color(0xFFB9C2CC)                  // silver: completed in softcore
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                fontSize = 11.sp,
+                maxLines = 1,
+            )
+            if (leadHardcore) {
+                Text(
+                    "HC",
+                    color = Color(0xFFFFC857),
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                )
+            }
+            // Softcore ahead of hardcore: show what is still only earned in casual mode, so the gap
+            // is visible instead of the row silently under-reporting the collection.
+            if (leadHardcore && p.softcore > p.hardcore) {
+                Text(
+                    "+${p.softcore - p.hardcore} SC",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 9.sp,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Aspect ratio of a cover slot, matched to the artwork actually served.
+ *
+ * xlenore's 3D case renders are 567x878 (0.646) while the flat 2D scans are 512x736 (0.696). The
+ * slot was hardcoded to 0.72 for both, so with ContentScale.Fit the 3D art — being narrower than
+ * its slot — sat with transparent margins down each side: the "poorly filled square" that 2D does
+ * not show, because 0.696 all but fills 0.72. Reported by Isshin.
+ */
+@Composable
+private fun coverAspectRatio(): Float = if (CoverArtStyle.use3d.value) 0.646f else 0.72f
+
+/**
+ * Frame around a cover slot.
+ *
+ * The idle 1dp frame only makes sense for the flat 2D scans, which fill their slot as a rectangle
+ * so the frame hugs the artwork. A 3D case render is transparent around the angled case, so the
+ * same frame draws a rounded rectangle through empty space beside it — the stray outline and edge
+ * lines reported in grid view. The shelf never showed them because it frames only the selected
+ * cover; do the same here, so 3D gets a selection frame and nothing else.
+ */
+@Composable
+private fun Modifier.coverFrame(selected: Boolean, selectedWidth: Dp, selectedColor: Color): Modifier {
+    val idle = !CoverArtStyle.use3d.value
+    return when {
+        selected -> this.border(selectedWidth, selectedColor, RoundedCornerShape(12.dp))
+        idle -> this.border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.42f), RoundedCornerShape(12.dp))
+        else -> this
     }
 }
 
@@ -1115,6 +1278,12 @@ object HomeInputController {
     fun move(dx: Int, dy: Int): Boolean {
         val viewModel = owner ?: return false
         userNavigated = true
+        // Snapshot the highlight so we blip the nav sound only when it actually moves (not when a
+        // press runs into an edge).
+        val beforeZone = zone.value
+        val beforeToolbar = toolbarIndex.intValue
+        val beforeRecent = recentIndex.intValue
+        val beforeSel = viewModel.state.value.selectedIndex
         when (zone.value) {
             HomeZone.Toolbar -> when {
                 // Toolbar at top: Down descends into the chrome/grid. At bottom: Up
@@ -1166,11 +1335,15 @@ object HomeInputController {
                 }
             }
         }
+        if (zone.value != beforeZone || toolbarIndex.intValue != beforeToolbar ||
+            recentIndex.intValue != beforeRecent || viewModel.state.value.selectedIndex != beforeSel
+        ) com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.NAV)
         return true
     }
 
     fun confirm(): Boolean {
         val viewModel = owner ?: return false
+        com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SELECT)
         when (zone.value) {
             HomeZone.Toolbar -> toolbarActions.getOrNull(toolbarIndex.intValue)?.invoke()
             HomeZone.Search -> searchConfirm?.invoke()
@@ -1196,6 +1369,7 @@ object HomeInputController {
     }
 
     fun back(): Boolean {
+        com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.BACK)
         // B in the Recents / Toolbar zone drops back to the grid; on the grid it
         // opens the nav drawer.
         if (zone.value != HomeZone.Grid) {

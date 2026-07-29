@@ -23,6 +23,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -259,6 +261,7 @@ internal object SettingsControllerNav {
         }
         selectedId.value = ids[next]
         selectedIndex.intValue = next
+        if (next != cur) com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.NAV)
         return true
     }
 
@@ -333,6 +336,7 @@ internal object SettingsControllerNav {
         if (target == null) return false
         selectedId.value = target
         selectedIndex.intValue = orderedIds().indexOf(target)
+        com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.NAV)
         return true
     }
 
@@ -347,7 +351,13 @@ internal object SettingsControllerNav {
 
     fun confirm(): Boolean {
         val item = selectedItem() ?: return false
+        val before = com.armsx2.MenuSfx.lastPlayedAt()
         item.onConfirm?.invoke() ?: return false
+        // If the invoked action was SILENT (didn't already toggle/navigate/etc.), add a generic
+        // select blip. This covers custom controls — RetroAchievements, memory-card, texture-pack,
+        // BIOS-location, patches/cheats — that route through the nav registry but aren't one of the
+        // self-sounding standard widgets. Anything that made its own sound is left alone (no double).
+        if (com.armsx2.MenuSfx.lastPlayedAt() == before) com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SELECT)
         return true
     }
 
@@ -505,18 +515,37 @@ fun SettingsDivider() {
 /** Collapsible settings section: a tappable header (▸ collapsed / ▾ expanded) that
  *  shows or hides its content. Controller-focusable so a gamepad can open it. Shared
  *  by the Fixes / Pad / Performance / Renderer tabs to de-bloat long settings lists.
- *  [initiallyExpanded] lets a tab open its most-used section by default. */
+ *  [initiallyExpanded] lets a tab open its most-used section by default.
+ *
+ *  This is the de-bloating that the settings screens were built around, and it had stopped
+ *  happening: the header rendered as plain text and `content()` was called unconditionally, with
+ *  `initiallyExpanded` marked UNUSED_PARAMETER. Every tab was therefore one flat list of every
+ *  option it owns — the reason the settings became unusable in landscape. Restoring it shortens
+ *  Pad / Renderer / Performance / Advanced all at once.
+ *
+ *  State is [rememberSaveable] so a rotation does not re-collapse what the user just opened —
+ *  landscape being exactly where the long lists hurt most. */
 @Composable
 fun CollapsibleSection(
     title: String,
-    @Suppress("UNUSED_PARAMETER")
     initiallyExpanded: Boolean = false,
     content: @Composable () -> Unit,
 ) {
+    var expanded by androidx.compose.runtime.saveable.rememberSaveable(title) {
+        mutableStateOf(initiallyExpanded)
+    }
+    val toggle = {
+        expanded = !expanded
+        com.armsx2.MenuSfx.play(
+            if (expanded) com.armsx2.MenuSfx.Event.TOGGLE_ON else com.armsx2.MenuSfx.Event.TOGGLE_OFF
+        )
+    }
     Spacer(Modifier.height(12.dp))
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .controllerFocusable("section.$title", onConfirm = toggle)
+            .clickable(onClick = toggle)
             .padding(horizontal = 8.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -527,8 +556,16 @@ fun CollapsibleSection(
             fontWeight = FontWeight.Bold,
             modifier = Modifier.weight(1f),
         )
+        Text(
+            if (expanded) "▾" else "▸",
+            color = MaterialTheme.colorScheme.primary,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold,
+        )
     }
-    content()
+    // Collapsed content is not composed at all, so its rows also drop out of the controller-focus
+    // registry — a pad cannot land on a setting the user cannot see.
+    if (expanded) content()
 }
 
 @Composable
@@ -551,16 +588,23 @@ fun ToggleRow(
     description: String? = null,
     onChange: (Boolean) -> Unit,
 ) {
+    // Menu SFX: a distinct on/off blip on every flip. Touch, the switch, and the controller's
+    // confirm/left/right all route through this, so one wrapper covers every input path; the
+    // left/right guards below keep it silent when nothing actually changes.
+    val emit: (Boolean) -> Unit = {
+        com.armsx2.MenuSfx.play(if (it) com.armsx2.MenuSfx.Event.TOGGLE_ON else com.armsx2.MenuSfx.Event.TOGGLE_OFF)
+        onChange(it)
+    }
     Surface(
-        onClick = { onChange(!value) },
+        onClick = { emit(!value) },
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 5.dp)
             .controllerFocusable(
                 controllerId = "toggle:$label",
-                onConfirm = { onChange(!value) },
-                onLeft = { if (value) onChange(false) },
-                onRight = { if (!value) onChange(true) },
+                onConfirm = { emit(!value) },
+                onLeft = { if (value) emit(false) },
+                onRight = { if (!value) emit(true) },
             ),
         shape = RoundedCornerShape(22.dp),
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
@@ -594,7 +638,7 @@ fun ToggleRow(
                 }
             }
             Spacer(Modifier.width(12.dp))
-            Switch(checked = value, onCheckedChange = onChange)
+            Switch(checked = value, onCheckedChange = emit)
         }
     }
 }
@@ -627,15 +671,20 @@ fun IntSliderRow(
     // DISTINCT registry ids — otherwise one overwrites the other and the controller
     // skips right over it.
     val sliderId = "slider:$label:${androidx.compose.runtime.currentCompositeKeyHash}"
+    // Menu SFX: a soft tick as the value changes (throttled in MenuSfx so a touch drag ticks
+    // instead of buzzing) and the reset blip on Reset. Both cover touch and controller — the
+    // DiscreteSlider drag / reset chip and the controller's left/right/confirm route through here.
+    val onChangeSfx: (Int) -> Unit = { com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SLIDER); onChange(it) }
+    val onResetSfx: (() -> Unit)? = onReset?.let { r -> { com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.RESET); r() } }
     Surface(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 5.dp)
             .controllerFocusable(
                 controllerId = sliderId,
-                onConfirm = onReset,
-                onLeft = { onChange((value - 1).coerceAtLeast(min)) },
-                onRight = { onChange((value + 1).coerceAtMost(max)) },
+                onConfirm = onResetSfx,
+                onLeft = { onChangeSfx((value - 1).coerceAtLeast(min)) },
+                onRight = { onChangeSfx((value + 1).coerceAtMost(max)) },
             ),
         shape = RoundedCornerShape(22.dp),
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
@@ -680,7 +729,7 @@ fun IntSliderRow(
                     // this through the slider's confirm, so a second focus stop per
                     // modified parameter would only pad the D-pad walk.
                     Surface(
-                        onClick = onReset,
+                        onClick = onResetSfx ?: onReset,
                         shape = RoundedCornerShape(12.dp),
                         color = MaterialTheme.colorScheme.primary.copy(alpha = 0.16f),
                     ) {
@@ -699,7 +748,7 @@ fun IntSliderRow(
                 value = value,
                 min = min,
                 max = max,
-                onChange = onChange,
+                onChange = onChangeSfx,
             )
         }
     }
@@ -917,6 +966,9 @@ fun SegmentedRow(
     description: String? = null,
     onChange: (Int) -> Unit,
 ) {
+    // Menu SFX: a select blip when the chosen option changes — covers the chip tap and the
+    // controller's confirm/left/right, which all route through onChange.
+    val emit: (Int) -> Unit = { com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SELECT); onChange(it) }
     Box(
         Modifier
             .fillMaxWidth()
@@ -928,15 +980,15 @@ fun SegmentedRow(
                 controllerId = "segmented:$label",
                 onConfirm = {
                     if (options.isNotEmpty())
-                        onChange((selectedIndex + 1).floorMod(options.size))
+                        emit((selectedIndex + 1).floorMod(options.size))
                 },
                 onLeft = {
                     if (options.isNotEmpty())
-                        onChange((selectedIndex - 1).coerceAtLeast(0))
+                        emit((selectedIndex - 1).coerceAtLeast(0))
                 },
                 onRight = {
                     if (options.isNotEmpty())
-                        onChange((selectedIndex + 1).coerceAtMost(options.lastIndex))
+                        emit((selectedIndex + 1).coerceAtMost(options.lastIndex))
                 },
             )
             .padding(vertical = 14.dp),
@@ -979,7 +1031,7 @@ fun SegmentedRow(
                                 if (on) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.55f),
                                 RoundedCornerShape(12.dp),
                             )
-                            .clickable { onChange(idx) }
+                            .clickable { emit(idx) }
                             .padding(horizontal = 13.dp, vertical = 8.dp),
                     ) {
                         Text(
@@ -1110,10 +1162,25 @@ private fun InfoHint(title: String, message: String) {
         Text("i", color = MaterialTheme.colorScheme.primary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
     }
     if (open) {
+        androidx.compose.runtime.DisposableEffect(Unit) {
+            com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.POPUP_OPEN)
+            onDispose { com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.POPUP_CLOSE) }
+        }
         AlertDialog(
             onDismissRequest = { open = false },
             title = { Text(title) },
-            text = { Text(message) },
+            // AlertDialog does NOT scroll its text slot: a description longer than the slot was
+            // simply CLIPPED mid-sentence with no way to reach the rest, which is most of the
+            // longer setting explanations (reported against Low Latency Mode, which cuts off at
+            // "...turning back off if the frame pacing"). Cap the height and scroll inside it.
+            text = {
+                Text(
+                    message,
+                    modifier = Modifier
+                        .heightIn(max = 340.dp)
+                        .verticalScroll(rememberScrollState()),
+                )
+            },
             confirmButton = {
                 TextButton(onClick = { open = false }) { Text(str("action.close")) }
             },

@@ -102,10 +102,25 @@ fun RendererTab(state: MutableState<Settings>) {
         modifier = Modifier
             .fillMaxWidth(),
     ) {
-        CollapsibleSection(str("renderer.section.displayResolution"), initiallyExpanded = false) {
+        CollapsibleSection(str("renderer.section.displayResolution"), initiallyExpanded = true) {
             // Graphics API (OpenGL / Vulkan) + Vulkan custom-driver picker.
             // from the removed first-run setup renderer page into settings.
             RendererBackendSection(state)
+            SettingsDivider()
+            // GS Multi-threading (GV7 front/back split), placed right under the
+            // renderer/driver picker. Off = today's single-threaded path (the
+            // default — opt-in); On = the GS runs on a dedicated back thread
+            // (Pipelined, enum value 3). The enum's Inline/Lockstep rungs (1/2)
+            // are dev-only and deliberately not exposed. Restart-required (in
+            // RestartOptionsAreEqual); native-lib snapshots the field across a
+            // live apply, so it only takes effect on the next game boot.
+            ToggleRow(
+                str("renderer.gsBackThread.label"),
+                s.gsBackThreadMode >= 3,
+                description = str("renderer.gsBackThread.description"),
+            ) {
+                apply(s.copy(gsBackThreadMode = if (it) 3 else 0))
+            }
             SettingsDivider()
             val upscaleIndex = UPSCALE_OPTIONS
                 .indexOfFirst { abs(it.value - s.upscaleFloat) < 0.01f }
@@ -126,8 +141,11 @@ fun RendererTab(state: MutableState<Settings>) {
             SettingsDivider()
             SegmentedRow(
                 label = str("renderer.displayMode.label"),
-                options = listOf("Stretch", "Auto", "4:3", "16:9", "10:7"),
-                selectedIndex = s.aspectRatio.coerceIn(0, 4),
+                // Adding an option here means widening BOTH clamps: this one and
+                // EmulationMenuViewModel.setAspectRatio. A clamp left at the old maximum does not
+                // fail loudly -- it silently snaps the new choice back to the previous entry.
+                options = listOf("Stretch", "Auto", "4:3", "16:9", "10:7", "21:9"),
+                selectedIndex = s.aspectRatio.coerceIn(0, 5),
                 description = str("renderer.displayMode.description"),
                 onChange = { apply(s.copy(aspectRatio = it)) },
             )
@@ -136,8 +154,8 @@ fun RendererTab(state: MutableState<Settings>) {
             // the aspect above. Handy for games that render FMVs at a different ratio.
             SegmentedRow(
                 label = str("renderer.fmvAspect.label"),
-                options = listOf("Off", "Auto", "4:3", "16:9", "10:7"),
-                selectedIndex = s.fmvAspectRatio.coerceIn(0, 4),
+                options = listOf("Off", "Auto", "4:3", "16:9", "10:7", "21:9"),
+                selectedIndex = s.fmvAspectRatio.coerceIn(0, 5),
                 description = str("renderer.fmvAspect.description"),
                 onChange = { apply(s.copy(fmvAspectRatio = it)) },
             )
@@ -160,6 +178,28 @@ fun RendererTab(state: MutableState<Settings>) {
                     MainActivityRuntime.instance?.applyEmulationOrientation()
                 },
             )
+            SettingsDivider()
+            // GitHub #375: where the render sits in a PORTRAIT window. Top (default) frees the
+            // bottom half for touch controls; Center keeps the old vertical-centered behavior.
+            // Live via NativeApp.setPortraitRenderTop (through applyTo); only affects portrait.
+            SegmentedRow(
+                label = str("renderer.portraitPosition.label"),
+                options = listOf(str("renderer.portraitPosition.top"), str("renderer.portraitPosition.center")),
+                selectedIndex = if (s.portraitRenderTop) 0 else 1,
+                description = str("renderer.portraitPosition.description"),
+                onChange = { apply(s.copy(portraitRenderTop = it == 0)) },
+            )
+            SettingsDivider()
+            // Auto Progressive Scan — holds Triangle+Cross through boot, the combo some titles
+            // probe to offer 480p progressive. Takes effect on the next boot (it is a boot-time
+            // pad hold, not a live setting), and only does anything on games that implement it.
+            ToggleRow(
+                str("renderer.autoProgressive.label"),
+                s.autoProgressiveScan,
+                description = str("renderer.autoProgressive.description"),
+            ) {
+                apply(s.copy(autoProgressiveScan = it))
+            }
             SettingsDivider()
             SegmentedGridRow(
                 label = str("renderer.deinterlacing.label"),
@@ -193,8 +233,11 @@ fun RendererTab(state: MutableState<Settings>) {
             SettingsDivider()
             SegmentedGridRow(
                 label = str("renderer.hardwareDownloadMode.label"),
-                options = listOf("Accurate", "Force Full", "No Readbacks", "Unsync", "Disabled"),
-                selectedIndex = s.hardwareDownloadMode.coerceIn(0, 4),
+                // Index == GSHardwareDownloadMode; "Async" is 5 and must stay last. Keep this list
+                // and the clamp below in sync with the enum AND with the in-game menu's copy in
+                // EmulationMenuScreen — there are two independent pickers for this setting.
+                options = listOf("Accurate", "Force Full", "No Readbacks", "Unsync", "Disabled", "Async"),
+                selectedIndex = s.hardwareDownloadMode.coerceIn(0, 5),
                 columns = 3,
                 description = str("renderer.hardwareDownloadMode.description"),
                 onChange = { apply(s.copy(hardwareDownloadMode = it)) },
@@ -390,6 +433,16 @@ fun RendererTab(state: MutableState<Settings>) {
                 description = str("renderer.rov.description"),
             ) {
                 apply(s.copy(hwRov = it))
+            }
+            SettingsDivider()
+            // Every Android GPU is a tiler, so this is aimed at us even though it landed with
+            // only a desktop UI. Default OFF because it is brand new, not because it is risky.
+            ToggleRow(
+                str("renderer.coalesceRenderPasses.label"),
+                s.coalesceRenderPasses,
+                description = str("renderer.coalesceRenderPasses.description"),
+            ) {
+                apply(s.copy(coalesceRenderPasses = it))
             }
             SettingsDivider()
             ToggleRow(
@@ -674,6 +727,11 @@ private fun GsDumpCaptureRow() {
 private fun activeTextureSerial(): String? {
     return MainActivityRuntime.currentGame.value?.serial?.takeIf { it.isNotBlank() }
         ?: runCatching { NativeApp.getGameSerial() }.getOrNull()?.takeIf { it.isNotBlank() }
+        // Last resort: the game the user most recently had open. Both sources above go blank the
+        // moment you quit to the library (currentGame is nulled so per-game settings scope can't
+        // leak, and the VM's serial dies with the VM), which stranded texture-pack import behind
+        // "Boot a game first" even though the user had just played — and quit — that game.
+        ?: MainActivityRuntime.contextGame.value?.serial?.takeIf { it.isNotBlank() }
 }
 
 private fun importTexturePack(context: Context, uri: Uri, serial: String): Int {

@@ -16,8 +16,11 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ClipboardManager
@@ -28,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import com.armsx2.CustomCovers
 import com.armsx2.CustomNames
 import com.armsx2.GameInfo
+import com.armsx2.PlayTime
 import com.armsx2.config.ConfigStore
 import com.armsx2.i18n.str
 import com.armsx2.ui.common.EmptyState
@@ -57,14 +61,12 @@ fun InfoTab(game: GameInfo?) {
     val serial = game.serial?.takeIf { it.isNotBlank() }
     // CRC only reads true for the currently-running game; skip it otherwise so a
     // library entry doesn't show another game's CRC.
-    val crc = remember(game.uri) {
-        runCatching {
-            if (NativeApp.getGameSerial()?.takeIf { it.isNotBlank() } == serial) {
-                NativeApp.getGameCRC()?.takeIf { it.isNotBlank() && it != "00000000" }
-            } else {
-                null
-            }
-        }.getOrNull()
+    // The running VM is the cheap source, but it only knows the game it booted — so outside a game
+    // the CRC used to be blank, which is the reported "you have to launch it first". Fall back to
+    // identifying the image directly. That reads the boot ELF, so it runs on IO and streams in when
+    // ready rather than blocking composition; the row simply appears a moment later.
+    val crc by androidx.compose.runtime.produceState<String?>(initialValue = null, game.uri) {
+        value = com.armsx2.DiscIdentity.resolve(game.uri, serial)
     }
 
     val exporter = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
@@ -112,11 +114,29 @@ fun InfoTab(game: GameInfo?) {
             Spacer(Modifier.height(10.dp))
             InfoRow(str("info.title"), game.title, clipboard)
             InfoRow(str("info.serial"), serial ?: "—", clipboard)
-            if (crc != null) InfoRow(str("info.crc"), crc, clipboard)
+            // Always present, so the row does not appear mid-identification and shove the rows
+            // below it down. This is the value that goes in the PNACH filename.
+            InfoRow(str("info.crc"), crc ?: "—", clipboard)
             InfoRow(str("info.region"), regionName(game.serial), clipboard)
             InfoRow(str("info.container"), game.extension.takeIf { it.isNotBlank() } ?: "—", clipboard)
             InfoRow(str("info.platform"), game.platform.name, clipboard)
-            InfoRow(str("info.compatibility"), if (game.compatibility > 0) "${game.compatibility} / 5" else "—", clipboard)
+            // Play time replaces the compatibility rating here. Compatibility is blank for most
+            // of the library (it only has a value where the GameDB carries one) so the row was
+            // usually a dash, whereas play time is populated for anything actually played.
+            //
+            // The per-serial totals have been recorded all along - PlayTime.startSession /
+            // endSession bracket the running VM - and only the display was lost in the interface
+            // rebuild, so existing users already have hours waiting here.
+            InfoRow(
+                str("info.playTime"),
+                PlayTime.formatPlayed(PlayTime.playedSeconds(serial)).ifEmpty { "—" },
+                clipboard,
+            )
+            InfoRow(
+                str("info.lastPlayed"),
+                PlayTime.formatLastPlayed(PlayTime.lastPlayedMillis(serial)).ifEmpty { "—" },
+                clipboard,
+            )
             InfoRow(str("info.path"), game.uri.toString(), clipboard)
             if (serial != null) {
                 Spacer(Modifier.height(14.dp))

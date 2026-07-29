@@ -28,6 +28,7 @@
 #include "pcsx2/Config.h"            // EmuConfig, GSConfig
 #include "pcsx2/Host.h"
 #include "pcsx2/Host/AudioStreamTypes.h"
+#include "pcsx2/MTGS.h" // Host::RunOnGSThread
 #include "pcsx2/INISettingsInterface.h"
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/R5900.h"
@@ -227,6 +228,18 @@ namespace Host
         std::fprintf(stderr, "@@CPU_TASK_WAIT_OK@@ id=%llu\n", task->id);
         std::fflush(stderr);
     }
+    // Post to the GS thread from anywhere. Mirrors pcsx2-qt (QtHost.cpp): the MTGS ring is
+    // single-producer and s_WritePos belongs to the CPU thread, so a UI-thread caller has to hop
+    // to the CPU thread first and let it push the packet. Our UIKit callbacks and Swift bridge
+    // entry points all run on the main thread, so this is the only correct route for them.
+    // Fire-and-forget — never block a UIKit callback on the GS thread.
+    void RunOnGSThread(std::function<void()> function)
+    {
+        RunOnCPUThread([fn = std::move(function)]() {
+            if (MTGS::IsOpen())
+                MTGS::RunOnGSThread(std::move(fn));
+        }, false);
+    }
     void ReportInfoAsync(std::string_view, std::string_view) {}
     void ReportErrorAsync(std::string_view title, std::string_view msg) {
         Console.Error("Host::ReportErrorAsync: %s - %s", std::string(title).c_str(), std::string(msg).c_str());
@@ -248,6 +261,19 @@ namespace Host
     void OnAchievementsRefreshed()
     {
         ARMSX2_PostRetroAchievementsStateChanged();
+    }
+    bool HasNativeAchievementNotifications()
+    {
+        // iOS renders achievement notifications through its SwiftUI toast overlay, so the
+        // shared core should hand them to OnAchievementNotification instead of the ImGui
+        // FullscreenUI overlay, which is invisible here and would add per-frame render
+        // cost if it were ever initialized.
+        return true;
+    }
+    void OnAchievementNotification(const char* /*key*/, float duration, const char* title,
+        const char* message, const char* badge_path)
+    {
+        ARMSX2_PostRetroAchievementsNotification(title, message, badge_path, duration);
     }
     void PumpMessagesOnCPUThread()
     {
@@ -738,27 +764,27 @@ namespace FileSystem {
 namespace CocoaTools {
     void InhibitAppNap(const std::string&) {}
     void UninhibitAppNap() {}
-    std::string GetBundlePath() { return [[NSBundle mainBundle].bundlePath UTF8String]; }
+    // Signature must match common/CocoaTools.h (not included here, it's mostly
+    // macOS-only). Return types aren't mangled, so a mismatch still links and
+    // callers read garbage off the stack.
+    std::optional<std::string> GetBundlePath() { return std::string([[NSBundle mainBundle].bundlePath UTF8String]); }
     
-    void* CreateMetalLayer(WindowInfo* wi) {
-        if (!Host::g_sdl_window) return nullptr;
-        
-        // Return existing layer if we already have it
-        if (wi->surface_handle) {
-            return SDL_Metal_GetLayer((SDL_MetalView)wi->surface_handle);
-        }
-        
+    bool CreateMetalLayer(WindowInfo* wi) {
+        if (!Host::g_sdl_window) return false;
+
+        // Already have one
+        if (wi->surface_handle) return true;
+
         // Create the Metal view
         SDL_MetalView view = SDL_Metal_CreateView(Host::g_sdl_window);
         if (!view) {
             Console.Error("SDL_Metal_CreateView failed: %s", SDL_GetError());
-            return nullptr;
+            return false;
         }
-        
-        void* layer = SDL_Metal_GetLayer(view);
+
         wi->surface_handle = view; // Store view handle to destroy later
-        Console.WriteLn("Created Metal Layer: %p from View: %p", layer, view);
-        return layer;
+        Console.WriteLn("Created Metal Layer: %p from View: %p", SDL_Metal_GetLayer(view), view);
+        return true;
     }
     
     void DestroyMetalLayer(WindowInfo* wi) {

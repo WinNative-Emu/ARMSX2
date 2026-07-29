@@ -19,6 +19,8 @@ enum class EmulationMenuTab(val titleKey: String) {
     Controls("tab.controls"),
     Options("action.settings"),
     Achievements("ra.title"),
+    // No Friends tab. It lived at the end of a rail that scrolls, so reaching it meant knowing it
+    // was there and then hunting for it — it is a header button with its own overlay instead.
 }
 
 data class EmulationMenuUiState(
@@ -33,10 +35,17 @@ data class EmulationMenuUiState(
     // Non-null while the hardcore confirm dialog is up; holds the target state.
     val pendingHardcore: Boolean? = null,
     val achievementSummary: String = I18n.get("ra.status.noAchievements.title"),
+    // RA account line for the pause-menu panel (empty / 0 when not logged in).
+    val raUserName: String = "",
+    val raScore: Long = 0,
+    val raSoftcoreScore: Long = 0,
+    val raAvatarUrl: String = "",
     val achievements: List<AchievementItem> = emptyList(),
     // RetroAchievements rich-presence line ("what you're doing right now"); shown in the
     // pause-menu header when a set is loaded. Empty when RA is off / no set.
     val richPresence: String = "",
+    // Current boot ELF CRC — the value that goes in a <SERIAL>_<CRC>.pnach filename.
+    val gameCRC: String = "",
 )
 
 class EmulationMenuViewModel(application: Application) : AndroidViewModel(application) {
@@ -50,8 +59,16 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
         // The native JSON emits the unlock list under "items"; count from that rather
         // than the non-existent "unlocked"/"total" keys the old code read (which always
         // fell through to rich presence). Fall back to rich presence when no set loaded.
-        val items = runCatching { parseAchievementItems(NativeApp.getAchievementsJSON().orEmpty()) }.getOrDefault(emptyList())
+        val raJson = runCatching { NativeApp.getAchievementsJSON().orEmpty() }.getOrDefault("")
+        val items = runCatching { parseAchievementItems(raJson) }.getOrDefault(emptyList())
+        val raRoot = runCatching { org.json.JSONObject(raJson) }.getOrNull()
         val richPresence = runCatching { NativeApp.getRichPresence().orEmpty() }.getOrDefault("")
+        // Cheap: getGameCRC is a plain read of VMManager::GetCurrentCRC(), and with no VM it
+        // reports 00000000 — which the filter below drops rather than showing as a real CRC.
+        val gameCRC = runCatching { NativeApp.getGameCRC().orEmpty().trim().uppercase() }
+            .getOrDefault("")
+            .takeIf { it.matches(com.armsx2.DiscIdentity.CRC_PATTERN) && it != "00000000" }
+            .orEmpty()
         val summary = if (items.isNotEmpty()) {
             "${items.count { it.unlocked }} / ${items.size}"
         } else {
@@ -67,12 +84,19 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
             multitapEnabled = ControllerMappings.multitapEnabled(),
             hardcore = runCatching { NativeApp.isHardcoreMode() }.getOrDefault(false),
             achievementSummary = summary,
+            raUserName = raRoot?.optString("userName").orEmpty(),
+            raScore = (raRoot?.optLong("score") ?: 0L).coerceAtLeast(0),
+            raSoftcoreScore = (raRoot?.optLong("softcoreScore") ?: 0L).coerceAtLeast(0),
+            raAvatarUrl = raRoot?.optString("avatarUrl").orEmpty(),
             achievements = items,
             richPresence = richPresence,
+            gameCRC = gameCRC,
         )
     }
 
     fun selectTab(tab: EmulationMenuTab) {
+        // Nav tick when flipping to a different in-game menu tab (bumpers via cycleTab, or a tap).
+        if (tab != state.value.tab) com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.NAV)
         state.value = state.value.copy(tab = tab, selectedAction = 0)
     }
 
@@ -84,9 +108,10 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
 
     fun moveSelection(delta: Int) {
         val max = actionCount(state.value.tab) - 1
-        state.value = state.value.copy(
-            selectedAction = (state.value.selectedAction + delta).coerceIn(0, max.coerceAtLeast(0)),
-        )
+        val before = state.value.selectedAction
+        val next = (before + delta).coerceIn(0, max.coerceAtLeast(0))
+        if (next != before) com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.NAV)
+        state.value = state.value.copy(selectedAction = next)
     }
 
     fun selectAction(index: Int) {
@@ -200,7 +225,7 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
         NativeApp.renderUpscalemultiplier(normalized)
     }
 
-    fun setAspectRatio(value: Int) = updateSettings { it.copy(aspectRatio = value.coerceIn(0, 4)) }
+    fun setAspectRatio(value: Int) = updateSettings { it.copy(aspectRatio = value.coerceIn(0, 5)) }
 
     fun setTextureFiltering(value: Int) = updateSettings { it.copy(textureFiltering = value.coerceIn(0, 3)) }
 
@@ -208,7 +233,10 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
 
     fun setTexturePreloading(value: Int) = updateSettings { it.copy(texturePreloading = value.coerceIn(0, 2)) }
 
-    fun setHardwareDownloadMode(value: Int) = updateSettings { it.copy(hardwareDownloadMode = value.coerceIn(0, 4)) }
+    // Upper bound MUST track the highest GSHardwareDownloadMode (5 = Asynchronous). At 4 this
+    // silently clamped a tap on "Async" down to Disabled, so the option could never be selected
+    // and quietly picked a different mode instead.
+    fun setHardwareDownloadMode(value: Int) = updateSettings { it.copy(hardwareDownloadMode = value.coerceIn(0, 5)) }
 
     fun setEeCycleRate(value: Int) = updateSettings { it.copy(eeCycleRate = value.coerceIn(-3, 3)) }
 
@@ -314,13 +342,20 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
     fun openAchievements() = com.armsx2.ui.WindowImpl.openInGameScreen(com.armsx2.ui.InGameScreen.Achievements)
 
     fun updateSettings(transform: (Settings) -> Settings) {
-        val updated = transform(state.value.settings)
+        // ★ Transform the LIVE shared settings, not this screen's snapshot. state.value.settings is
+        // only refreshed in load(), so every write here shipped the whole Settings object as it
+        // looked when the menu opened — silently reverting anything changed elsewhere since. That
+        // is the long-standing whole-object clobber, and it is why the FPS cap read back as 0
+        // moments after being set: a later save from a stale snapshot re-pushed the old value.
+        val updated = transform(InGameOverlay.settingsState.value)
         InGameOverlay.saveSettings(updated)
         state.value = state.value.copy(settings = updated)
     }
 
     private fun actionCount(tab: EmulationMenuTab): Int = when (tab) {
-        EmulationMenuTab.Session -> 4
+        // MUST match SessionPane's action list length. This was 4 against a list of 5, so the pad
+        // could never reach Close at all.
+        EmulationMenuTab.Session -> 5
         EmulationMenuTab.Graphics -> 4
         EmulationMenuTab.Fixes -> 0
         EmulationMenuTab.Performance -> 3
@@ -344,6 +379,15 @@ object EmulationMenuInputController {
     // confirm). B (or Left off the first control) returns to the tab column.
     val inContent = androidx.compose.runtime.mutableStateOf(false)
     private val nav get() = com.armsx2.ui.settings.SettingsControllerNav
+
+    // Set by a modal panel drawn OVER the menu (Friends) for as long as it is open; the lambda
+    // closes it.
+    //
+    // Without this the pad kept driving the menu underneath: move() falls through to the tab
+    // column whenever inContent is false, so the D-pad walked tabs behind the panel and the
+    // panel's own buttons — which are in the same registry — could never be reached. The overlay
+    // is on top visually, so it has to be on top for input too.
+    var overlayDismiss: (() -> Unit)? = null
 
     fun bind(viewModel: EmulationMenuViewModel) {
         owner = viewModel
@@ -375,6 +419,14 @@ object EmulationMenuInputController {
     }
 
     fun move(dx: Int, dy: Int): Boolean {
+        // A panel is over the menu: everything is registry nav, there is no tab column to walk.
+        if (overlayDismiss != null) {
+            when {
+                dy != 0 -> nav.moveSpatial(0, dy)
+                dx != 0 -> if (!nav.adjust(dx)) nav.moveSpatial(dx, 0)
+            }
+            return true
+        }
         val viewModel = owner ?: return false
         if (!inContent.value) {
             // Tab column (vertical): Up/Down switch tabs; Right steps into content.
@@ -396,6 +448,9 @@ object EmulationMenuInputController {
 
     /** L1 / R1 always cycle tabs, snapping back to the tab column. */
     fun tab(delta: Int): Boolean {
+        // Swallowed while a panel is up: the tabs are behind it, and silently switching the pane
+        // you cannot see is worse than doing nothing.
+        if (overlayDismiss != null) return true
         val viewModel = owner ?: return false
         if (inContent.value) exitContent()
         viewModel.cycleTab(delta)
@@ -403,6 +458,7 @@ object EmulationMenuInputController {
     }
 
     fun confirm(): Boolean {
+        if (overlayDismiss != null) { nav.confirm(); return true }
         owner ?: return false
         if (!inContent.value) { enterContent(); return true }
         nav.confirm()
@@ -410,6 +466,8 @@ object EmulationMenuInputController {
     }
 
     fun back(): Boolean {
+        // Back closes the panel, not the menu behind it.
+        overlayDismiss?.let { dismiss -> dismiss(); return true }
         if (inContent.value) { exitContent(); return true }
         owner?.resume() ?: return false
         return true

@@ -5,8 +5,52 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+private enum DynamicActionRole {
+    case aim
+    case fire
+    case holdFire
+}
+
+private struct SkinReplacePrompt: Identifiable {
+    let id = UUID()
+    let name: String
+    let existingSkinID: String
+}
+
+private enum SkinReplaceChoice {
+    case replace(String)
+    case keepBoth
+    case cancel
+}
+
+/// Holds the answer the import is waiting on. The view owns one, so leaving the
+/// screen with the dialog still up unblocks the import on the way out instead of
+/// parking it on a continuation nobody is left to resume.
+@MainActor
+private final class SkinReplaceGate {
+    private var continuation: CheckedContinuation<SkinReplaceChoice, Never>?
+
+    func wait() async -> SkinReplaceChoice {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    /// Answers at most once, whichever of the buttons or the dismissal gets here first.
+    func resume(_ choice: SkinReplaceChoice) {
+        guard let continuation else { return }
+        self.continuation = nil
+        continuation.resume(returning: choice)
+    }
+
+    deinit {
+        continuation?.resume(returning: .cancel)
+    }
+}
+
 struct VirtualPadSettingsView: View {
     @State private var settings = SettingsStore.shared
+    @State private var dynamicSettings = DynamicThumbstickSettings.shared
     @State private var layoutPresets = PadLayoutPresetStore.shared
     @State private var skinLibrary = VPadSkinLibraryStore.shared
     @State private var showLayoutEditor = false
@@ -21,6 +65,9 @@ struct VirtualPadSettingsView: View {
     @State private var skinPendingDelete: VPadSkinDescriptor?
     @State private var skinPendingRename: VPadSkinDescriptor?
     @State private var skinRenameDraft = ""
+    @State private var skinReplacePrompt: SkinReplacePrompt?
+    @State private var skinReplaceGate = SkinReplaceGate()
+    @State private var automaticFireBlockedByHardcore = false
 
     var body: some View {
         Form {
@@ -101,6 +148,12 @@ struct VirtualPadSettingsView: View {
                     showSkinImporter = true
                 } label: {
                     Label(settings.localized("Import Skin"), systemImage: "paintpalette")
+                }
+
+                NavigationLink {
+                    SkinBrowserView()
+                } label: {
+                    Label("Browse Skins", systemImage: "square.grid.2x2")
                 }
 
                 Text("Import loose PNG/JPG/WebP button images, a full portrait/landscape controller image, or a zipped skin pack. Button files can be named cross, circle, square, triangle, up, down, left, right, L1, R1, L2, R2, start, select, analog_base, or analog_stick.")
@@ -194,9 +247,382 @@ struct VirtualPadSettingsView: View {
                     }
                 }
             }
+
+            Section {
+                ForEach(BuiltInDynamicControlPreset.allCases) { preset in
+                    Button {
+                        preset.apply(settings: dynamicSettings)
+                    } label: {
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(settings.localized(preset.rawValue))
+                                    .foregroundStyle(.primary)
+                                Text(settings.localized(preset.summary))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .multilineTextAlignment(.leading)
+                                    .lineLimit(nil)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .layoutPriority(1)
+                            Spacer()
+                            if preset.isActive(settings: dynamicSettings) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                                    .fixedSize()
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            } header: {
+                Text(settings.localized("Dynamic Control Presets"))
+            } footer: {
+                Text(settings.localized("Selecting a preset changes only the listed Dynamic Control options. All sensitivity, button assignments, and other Virtual Pad settings are preserved."))
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section {
+                Toggle(
+                    settings.localized("Legacy Thumbsticks"),
+                    isOn: Binding(
+                        get: { dynamicSettings.legacyThumbsticks },
+                        set: { dynamicSettings.setLegacyThumbsticks($0) }
+                    )
+                )
+                Toggle(
+                    settings.localized("Dynamic Thumbsticks"),
+                    isOn: Binding(
+                        get: { dynamicSettings.dynamicThumbsticks },
+                        set: { dynamicSettings.setDynamicThumbsticks($0) }
+                    )
+                )
+                Toggle(settings.localized("Swipe Camera"), isOn: $dynamicSettings.swipeCamera)
+                Toggle(settings.localized("Gyroscope Camera"), isOn: $dynamicSettings.gyroscopeCamera)
+            } header: {
+                Text(settings.localized("Dynamic Controls"))
+            } footer: {
+                Text(settings.localized("Legacy and Dynamic Thumbsticks are mutually exclusive. Dynamic sticks appear where each touch begins. Swipe Camera replaces the right touch stick, while Gyroscope Camera augments the active right-side control."))
+            }
+
+            controlSensitivitySection
+
+            if dynamicSettings.dynamicThumbsticks {
+                thumbstickActionButtonsSection(
+                    title: settings.localized("Action Buttons Left Thumbstick"),
+                    toggleTitle: settings.localized("Dynamic Actions in Left Thumbstick"),
+                    isEnabled: $dynamicSettings.leftThumbstickActionsEnabled,
+                    aim: $dynamicSettings.leftAimButton,
+                    fire: $dynamicSettings.leftFireButton,
+                    holdFire: $dynamicSettings.leftHoldFireButton
+                )
+            }
+
+            if dynamicSettings.swipeCamera || dynamicSettings.dynamicThumbsticks {
+                thumbstickActionButtonsSection(
+                    title: settings.localized("Action Buttons Right Thumbstick"),
+                    toggleTitle: settings.localized("Dynamic Actions in Right Thumbstick"),
+                    isEnabled: $dynamicSettings.rightThumbstickActionsEnabled,
+                    aim: $dynamicSettings.rightAimButton,
+                    fire: $dynamicSettings.rightFireButton,
+                    holdFire: $dynamicSettings.rightHoldFireButton
+                )
+            }
+
+            Section {
+                Toggle(
+                    settings.localized("Dynamic Aiming Crosshair"),
+                    isOn: $dynamicSettings.dynamicCrosshairEnabled
+                )
+                if dynamicSettings.dynamicCrosshairEnabled {
+                    DynamicControlSlider(
+                        title: settings.localized("Crosshair Size"),
+                        value: $dynamicSettings.dynamicCrosshairSize,
+                        range: 12...120,
+                        step: 1,
+                        valueLabel: { "\(Int($0)) pt" }
+                    )
+                    DynamicControlSlider(
+                        title: settings.localized("Crosshair Opacity"),
+                        value: $dynamicSettings.dynamicCrosshairOpacity,
+                        range: 0.10...1,
+                        step: 0.05,
+                        valueLabel: percentageLabel
+                    )
+                    Picker(
+                        settings.localized("Crosshair Type"),
+                        selection: $dynamicSettings.dynamicCrosshairType
+                    ) {
+                        ForEach(DynamicCrosshairType.allCases) { type in
+                            Text(settings.localized(type.title)).tag(type)
+                        }
+                    }
+                    Picker(
+                        settings.localized("Crosshair Animation"),
+                        selection: $dynamicSettings.dynamicCrosshairAnimation
+                    ) {
+                        ForEach(DynamicCrosshairAnimation.allCases) { animation in
+                            Text(settings.localized(animation.title)).tag(animation)
+                        }
+                    }
+                }
+            } header: {
+                Text(settings.localized("Dynamic Crosshair"))
+            } footer: {
+                Text(settings.localized("The crosshair appears only while Aim Mode is active. Every animation follows live swipe, thumbstick, and gyroscope direction and speed, then reacts separately to single shots and automatic fire."))
+            }
+
+            if dynamicSettings.dynamicThumbsticks {
+                Section {
+                    DynamicControlSlider(
+                        title: settings.localized("Maximum Radius"),
+                        value: $dynamicSettings.thumbstickRadius,
+                        range: 40...60,
+                        step: 1,
+                        valueLabel: { "\(Int($0)) pt" }
+                    )
+                    DynamicControlSlider(
+                        title: settings.localized("Dead Zone"),
+                        value: $dynamicSettings.deadZone,
+                        range: 0...0.25,
+                        step: 0.01,
+                        valueLabel: percentageLabel
+                    )
+                    DynamicControlSlider(
+                        title: settings.localized("Thumbstick Opacity"),
+                        value: $dynamicSettings.thumbstickOpacity,
+                        range: 0...1,
+                        step: 0.01,
+                        valueLabel: percentageLabel
+                    )
+                    DynamicControlSlider(
+                        title: settings.localized("Base Opacity"),
+                        value: $dynamicSettings.baseOpacity,
+                        range: 0...1,
+                        step: 0.01,
+                        valueLabel: percentageLabel
+                    )
+                    DynamicControlSlider(
+                        title: settings.localized("Trail Opacity"),
+                        value: $dynamicSettings.trailOpacity,
+                        range: 0...1,
+                        step: 0.01,
+                        valueLabel: percentageLabel
+                    )
+                    Toggle(settings.localized("Activation Haptics"), isOn: $dynamicSettings.activationHaptics)
+                } header: {
+                    Text(settings.localized("Dynamic Thumbstick Feel"))
+                } footer: {
+                    Text(settings.localized("The compact base stays at the initial touch point. Dead zone begins at 0% and progressively reaches the selected value as the stick moves outward. Analog output saturates at the selected radius while the nub and seven-dot trail continue following overdrag."))
+                }
+            }
+
+            if dynamicSettings.gyroscopeCamera {
+                Section {
+                    DynamicControlSlider(
+                        title: settings.localized("Gyro Sensitivity"),
+                        value: $dynamicSettings.gyroSensitivity,
+                        range: 0.5...4.0,
+                        step: 0.1,
+                        valueLabel: { String(format: "%.1fx", $0) }
+                    )
+                    DynamicControlSlider(
+                        title: settings.localized("Gyro Acceleration"),
+                        value: $dynamicSettings.gyroAcceleration,
+                        range: 0...2,
+                        step: 0.05,
+                        valueLabel: percentageLabel
+                    )
+                    DynamicControlSlider(
+                        title: settings.localized("Gyro Smoothing"),
+                        value: $dynamicSettings.gyroSmoothing,
+                        range: 0...0.95,
+                        step: 0.05,
+                        valueLabel: percentageLabel
+                    )
+                    DynamicControlSlider(
+                        title: settings.localized("Gyro Dead Zone"),
+                        value: $dynamicSettings.gyroDeadZone,
+                        range: 0...0.25,
+                        step: 0.01,
+                        valueLabel: { String(format: "%.2f rad/s", $0) }
+                    )
+                    DynamicControlSlider(
+                        title: settings.localized("Maximum Gyro Rate"),
+                        value: $dynamicSettings.gyroMaximumRate,
+                        range: 1...12,
+                        step: 0.5,
+                        valueLabel: { String(format: "%.1f rad/s", $0) }
+                    )
+                    Toggle(settings.localized("Invert Gyro Horizontal"), isOn: $dynamicSettings.invertGyroHorizontal)
+                    Toggle(settings.localized("Invert Gyro Vertical"), isOn: $dynamicSettings.invertGyroVertical)
+                } header: {
+                    Text(settings.localized("Gyroscope"))
+                } footer: {
+                    Text(settings.localized("Gyroscope input is active only while the virtual controller is on screen. If the sensor is unavailable, the selected touch camera continues working normally."))
+                }
+            }
+
+            if dynamicSettings.swipeCamera ||
+                (dynamicSettings.dynamicThumbsticks &&
+                    (dynamicSettings.leftThumbstickActionsEnabled || dynamicSettings.rightThumbstickActionsEnabled)) {
+                Section {
+                    Toggle(
+                        dynamicActionTitle("Hold Aim While Touching Camera", role: .aim),
+                        isOn: Binding(
+                            get: { dynamicSettings.holdAimWhileSwipe },
+                            set: { dynamicSettings.setHoldAimWhileSwipe($0) }
+                        )
+                    )
+                    Toggle(
+                        dynamicActionTitle("Double Tap to Hold Aim", role: .aim),
+                        isOn: Binding(
+                            get: { dynamicSettings.doubleTapToHoldAim },
+                            set: { dynamicSettings.setDoubleTapToHoldAim($0) }
+                        )
+                    )
+                    Toggle(
+                        settings.localized("Enable Single-Tap Action on Non-Aim Mode"),
+                        isOn: Binding(
+                            get: { dynamicSettings.singleTapActionAllowedInNonAimMode },
+                            set: { dynamicSettings.singleTapActionOnNonAimMode = $0 }
+                        )
+                    )
+                    .disabled(
+                        !dynamicSettings.doubleTapToHoldAim ||
+                            dynamicSettings.actionsOnNonAimMode
+                    )
+                    Toggle(
+                        settings.localized("Enable Actions on Non-Aim Mode"),
+                        isOn: Binding(
+                            get: { dynamicSettings.actionsOnNonAimMode },
+                            set: { dynamicSettings.setActionsOnNonAimMode($0) }
+                        )
+                    )
+                    DynamicControlSlider(
+                        title: dynamicActionTitle("Aim Release Delay", role: .aim),
+                        value: $dynamicSettings.aimReleaseDelay,
+                        range: 0...2,
+                        step: 0.05,
+                        valueLabel: durationLabel
+                    )
+                    .disabled(!dynamicSettings.holdAimWhileSwipe && !dynamicSettings.doubleTapToHoldAim)
+                    DynamicControlSlider(
+                        title: dynamicActionTitle("Double-Tap Window", role: .aim),
+                        value: $dynamicSettings.doubleTapWindow,
+                        range: 0.15...0.60,
+                        step: 0.01,
+                        valueLabel: durationLabel
+                    )
+                    .disabled(!dynamicSettings.doubleTapToHoldAim)
+                    Toggle(
+                        dynamicActionTitle("Tap to Fire Single Shots", role: .fire),
+                        isOn: $dynamicSettings.tapToFire
+                    )
+                    DynamicControlSlider(
+                        title: dynamicActionTitle("Single-Shot Tap Duration", role: .fire),
+                        value: $dynamicSettings.tapMaximumDuration,
+                        range: 0.10...0.60,
+                        step: 0.01,
+                        valueLabel: durationLabel
+                    )
+                    DynamicControlSlider(
+                        title: dynamicActionTitle("Single-Shot Travel Tolerance", role: .fire),
+                        value: $dynamicSettings.tapTravelTolerance,
+                        range: 4...30,
+                        step: 1,
+                        valueLabel: { "\(Int($0)) pt" }
+                    )
+                    Toggle(
+                        dynamicActionTitle("Multiple Taps Enable Automatic Fire", role: .holdFire),
+                        isOn: Binding(
+                            get: {
+                                dynamicSettings.rapidTapFireEnabled &&
+                                    !automaticFireBlockedByHardcore
+                            },
+                            set: { enabled in
+                                guard !automaticFireBlockedByHardcore else { return }
+                                dynamicSettings.rapidTapFireEnabled = enabled
+                            }
+                        )
+                    )
+                    .disabled(automaticFireBlockedByHardcore)
+                    DynamicControlSlider(
+                        title: dynamicActionTitle("Multiple-Tap Window", role: .holdFire),
+                        value: $dynamicSettings.rapidTapWindow,
+                        range: 0.10...0.80,
+                        step: 0.01,
+                        valueLabel: durationLabel
+                    )
+                    .disabled(automaticFireControlsDisabled)
+                    DynamicControlSlider(
+                        title: dynamicActionTitle("Taps to Activate", role: .holdFire),
+                        value: Binding(
+                            get: { Double(dynamicSettings.rapidTapActivationCount) },
+                            set: { dynamicSettings.rapidTapActivationCount = Int($0.rounded()) }
+                        ),
+                        range: 2...5,
+                        step: 1,
+                        valueLabel: { "\(Int($0)) taps" }
+                    )
+                    .disabled(automaticFireControlsDisabled)
+                    DynamicControlSlider(
+                        title: dynamicActionTitle("Automatic Fire Interval", role: .holdFire),
+                        value: $dynamicSettings.automaticFireInterval,
+                        range: 0.06...0.50,
+                        step: 0.01,
+                        valueLabel: durationLabel
+                    )
+                    .disabled(automaticFireControlsDisabled)
+                    Toggle(
+                        dynamicActionTitle("Extend Automatic Fire While Dragging", role: .holdFire),
+                        isOn: $dynamicSettings.extendFireWhileDragging
+                    )
+                        .disabled(automaticFireControlsDisabled)
+                    Toggle(
+                        dynamicActionTitle("Release Fire When Touch Ends", role: .holdFire),
+                        isOn: $dynamicSettings.releaseFireWhenTouchEnds
+                    )
+                        .disabled(automaticFireControlsDisabled)
+                    DynamicControlSlider(
+                        title: dynamicActionTitle("Fire Release Delay", role: .holdFire),
+                        value: $dynamicSettings.fireReleaseDelay,
+                        range: 0...1,
+                        step: 0.05,
+                        valueLabel: durationLabel
+                    )
+                    .disabled(
+                        automaticFireControlsDisabled ||
+                            dynamicSettings.releaseFireWhenTouchEnds
+                    )
+                } header: {
+                    Text(settings.localized("Dynamic Actions"))
+                } footer: {
+                    if automaticFireBlockedByHardcore {
+                        Text(settings.localized("Automatic Fire is disabled while RetroAchievements Hardcore Mode is on."))
+                    }
+                }
+            }
+
+            Section {
+                Button(settings.localized("Restore Dynamic Control Defaults"), role: .destructive) {
+                    dynamicSettings.restoreDefaults()
+                }
+            }
         }
         .navigationTitle(settings.localized("Virtual Pad"))
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear(perform: refreshHardcoreAutomaticFireRestriction)
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: Notification.Name("ARMSX2RetroAchievementsStateChanged")
+            )
+        ) { _ in
+            refreshHardcoreAutomaticFireRestriction()
+        }
         .sheet(isPresented: $showLayoutImporter) {
             ImportDocumentPicker(
                 allowedContentTypes: [.json, .data],
@@ -235,14 +661,17 @@ struct VirtualPadSettingsView: View {
             ) { result in
                 switch result {
                 case .success(let urls):
-                    let result = importCustomSkins(urls)
-                    lastSkinImportResult = result.importResult
-                    skinImportMessage = result.message
+                    Task {
+                        let outcome = await importCustomSkins(urls)
+                        lastSkinImportResult = outcome.importResult
+                        skinImportMessage = outcome.message
+                        showSkinImportAlert = true
+                    }
                 case .failure(let error):
                     lastSkinImportResult = nil
                     skinImportMessage = "Skin import failed: \(error.localizedDescription)"
+                    showSkinImportAlert = true
                 }
-                showSkinImportAlert = true
             }
         }
         .alert(settings.localized("Custom Skin"), isPresented: $showSkinImportAlert) {
@@ -306,6 +735,37 @@ struct VirtualPadSettingsView: View {
             }
         } message: { skin in
             Text("This removes the imported skin. Linked layout presets are kept.")
+        }
+        .confirmationDialog(
+            "\(skinReplacePrompt?.name ?? "This skin") is already installed",
+            isPresented: Binding<Bool>(
+                get: { skinReplacePrompt != nil },
+                set: {
+                    if !$0 {
+                        skinReplacePrompt = nil
+                        // A tapped button gets there first. This only catches a
+                        // dialog that went away without one, which would
+                        // otherwise leave the import waiting forever.
+                        DispatchQueue.main.async { resumeSkinReplace(.cancel) }
+                    }
+                }
+            ),
+            presenting: skinReplacePrompt
+        ) { prompt in
+            Button("Replace") {
+                skinReplacePrompt = nil
+                resumeSkinReplace(.replace(prompt.existingSkinID))
+            }
+            Button("Keep Both") {
+                skinReplacePrompt = nil
+                resumeSkinReplace(.keepBoth)
+            }
+            Button("Cancel", role: .cancel) {
+                skinReplacePrompt = nil
+                resumeSkinReplace(.cancel)
+            }
+        } message: { _ in
+            Text("Replace it, or keep both copies?")
         }
         .fullScreenCover(isPresented: $showLayoutEditor) {
             PadLayoutEditView(
@@ -372,7 +832,7 @@ struct VirtualPadSettingsView: View {
         }
     }
 
-    private func importCustomSkins(_ urls: [URL]) -> (message: String, importResult: VPadSkinImportResult?) {
+    private func importCustomSkins(_ urls: [URL]) async -> (message: String, importResult: VPadSkinImportResult?) {
         let stagingDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ARMSX2SkinImport-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
@@ -400,7 +860,7 @@ struct VirtualPadSettingsView: View {
                 try? FileManager.default.copyItem(at: sourceURL, to: destination)
             }
             do {
-                let result = try skinLibrary.importSkin(
+                let result = try await skinLibrary.importSkin(
                     from: looseDirectory,
                     originalImportName: looseFiles.first?.lastPathComponent,
                     layoutPresets: layoutPresets
@@ -435,10 +895,26 @@ struct VirtualPadSettingsView: View {
                 messages.append("No usable skin files were imported from \(sourceURL.lastPathComponent).")
                 continue
             }
+
+            var replacingSkinID: String?
+            let intendedName = skinLibrary.intendedDisplayName(forExtractedSkinAt: archiveDirectory)
+            if let existing = skinLibrary.existingImportedSkin(matchingName: intendedName) {
+                switch await askAboutExistingSkin(named: intendedName, existingSkinID: existing.id) {
+                case .replace(let id):
+                    replacingSkinID = id
+                case .keepBoth:
+                    break
+                case .cancel:
+                    messages.append("Kept the existing '\(intendedName)'.")
+                    continue
+                }
+            }
+
             do {
-                let result = try skinLibrary.importSkin(
+                let result = try await skinLibrary.importSkin(
                     from: archiveDirectory,
                     originalImportName: sourceURL.lastPathComponent,
+                    replacingSkinID: replacingSkinID,
                     layoutPresets: layoutPresets
                 )
                 latestResult = result
@@ -454,6 +930,15 @@ struct VirtualPadSettingsView: View {
         return (message, latestResult)
     }
 
+    private func askAboutExistingSkin(named name: String, existingSkinID: String) async -> SkinReplaceChoice {
+        skinReplacePrompt = SkinReplacePrompt(name: name, existingSkinID: existingSkinID)
+        return await skinReplaceGate.wait()
+    }
+
+    private func resumeSkinReplace(_ choice: SkinReplaceChoice) {
+        skinReplaceGate.resume(choice)
+    }
+
     private func isSkinArchive(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
         return ext == "zip" || ext == "skin" || ext == "manic"
@@ -462,5 +947,212 @@ struct VirtualPadSettingsView: View {
 
     static func canonicalSkinFileName(forImportPath path: String) -> String? {
         VPadSkinLibraryStore.canonicalSkinFileName(forImportPath: path)
+    }
+
+    @ViewBuilder
+    private var controlSensitivitySection: some View {
+        Section {
+            DynamicControlSlider(
+                title: settings.localized("Movement Sensitivity"),
+                value: $dynamicSettings.movementSensitivity,
+                range: 0.33...2.0,
+                step: 0.01,
+                valueLabel: percentageLabel
+            )
+            DynamicControlSlider(
+                title: settings.localized("Look Sensitivity"),
+                value: $dynamicSettings.lookSensitivity,
+                range: 0.43...1.71,
+                step: 0.01,
+                valueLabel: percentageLabel
+            )
+            DynamicSwipeSensitivityControl(
+                title: settings.localized("Swipe Sensitivity"),
+                showsEnableToggle: false,
+                isEnabled: .constant(true),
+                value: $dynamicSettings.swipeSensitivity,
+                horizontalSensitivity: $dynamicSettings.swipeHorizontalSensitivity,
+                verticalSensitivity: $dynamicSettings.swipeVerticalSensitivity
+            )
+            .disabled(!dynamicSettings.swipeCamera)
+            DynamicSwipeSensitivityControl(
+                title: settings.localized("Sensitivity While on Aim Mode"),
+                showsEnableToggle: true,
+                isEnabled: $dynamicSettings.swipeSensitivityWhileAimingEnabled,
+                value: $dynamicSettings.swipeSensitivityWhileAiming,
+                horizontalSensitivity: $dynamicSettings.swipeHorizontalSensitivityWhileAiming,
+                verticalSensitivity: $dynamicSettings.swipeVerticalSensitivityWhileAiming
+            )
+            .disabled(!dynamicSettings.swipeCamera)
+            DynamicSwipeSensitivityControl(
+                title: settings.localized("Sensitivity While Not Aiming"),
+                showsEnableToggle: true,
+                isEnabled: $dynamicSettings.swipeSensitivityWhileNotAimingEnabled,
+                value: $dynamicSettings.swipeSensitivityWhileNotAiming,
+                horizontalSensitivity: $dynamicSettings.swipeHorizontalSensitivityWhileNotAiming,
+                verticalSensitivity: $dynamicSettings.swipeVerticalSensitivityWhileNotAiming
+            )
+            .disabled(!dynamicSettings.swipeCamera)
+        } header: {
+            Text(settings.localized("Dynamic Control Sensitivity"))
+        } footer: {
+            Text(settings.localized("Each swipe profile has overall, horizontal, and vertical sensitivity. Disabled aim-state profiles fall back to Swipe Sensitivity."))
+        }
+    }
+
+    @ViewBuilder
+    private func thumbstickActionButtonsSection(
+        title: String,
+        toggleTitle: String,
+        isEnabled: Binding<Bool>,
+        aim: Binding<VirtualPadActionButton>,
+        fire: Binding<VirtualPadActionButton>,
+        holdFire: Binding<VirtualPadActionButton>
+    ) -> some View {
+        Section {
+            Toggle(toggleTitle, isOn: isEnabled)
+            if isEnabled.wrappedValue {
+                Picker(settings.localized("Aim (Hold Thumbstick)"), selection: aim) {
+                    ForEach(VirtualPadActionButton.allCases) { button in
+                        Text(settings.localized(button.title)).tag(button)
+                    }
+                }
+                Picker(settings.localized("Fire (Tap Thumbstick)"), selection: fire) {
+                    ForEach(VirtualPadActionButton.allCases) { button in
+                        Text(settings.localized(button.title)).tag(button)
+                    }
+                }
+                Picker(settings.localized("Hold Fire (Fast Tap Thumbstick)"), selection: holdFire) {
+                    ForEach(VirtualPadActionButton.allCases) { button in
+                        Text(settings.localized(button.title)).tag(button)
+                    }
+                }
+            }
+        } header: {
+            Text(title)
+        }
+    }
+
+    private func dynamicActionTitle(_ baseTitle: String, role: DynamicActionRole) -> String {
+        var configuredButtons: [VirtualPadActionButton] = []
+        if dynamicSettings.rightThumbstickActionsEnabled {
+            configuredButtons.append(dynamicActionButton(role: role, side: .right))
+        }
+        if dynamicSettings.leftThumbstickActionsEnabled {
+            configuredButtons.append(dynamicActionButton(role: role, side: .left))
+        }
+        if configuredButtons.isEmpty {
+            configuredButtons.append(dynamicActionButton(role: role, side: .right))
+        }
+
+        var seen: Set<VirtualPadActionButton> = []
+        let buttonNames = configuredButtons.compactMap { button -> String? in
+            guard seen.insert(button).inserted else { return nil }
+            return settings.localized(button.title)
+        }
+        return "\(settings.localized(baseTitle)) (\(buttonNames.joined(separator: " / ")))"
+    }
+
+    private func dynamicActionButton(
+        role: DynamicActionRole,
+        side: VirtualPadThumbstickSide
+    ) -> VirtualPadActionButton {
+        switch role {
+        case .aim: return dynamicSettings.aimButton(for: side)
+        case .fire: return dynamicSettings.fireButton(for: side)
+        case .holdFire: return dynamicSettings.holdFireButton(for: side)
+        }
+    }
+
+    private func percentageLabel(_ value: Double) -> String {
+        "\(Int((value * 100).rounded()))%"
+    }
+
+    private func durationLabel(_ value: Double) -> String {
+        String(format: "%.2f s", value)
+    }
+
+    private var automaticFireControlsDisabled: Bool {
+        automaticFireBlockedByHardcore || !dynamicSettings.rapidTapFireEnabled
+    }
+
+    private func refreshHardcoreAutomaticFireRestriction() {
+        automaticFireBlockedByHardcore = DynamicThumbstickSettings.automaticFireBlockedByHardcore()
+    }
+}
+
+private struct DynamicControlSlider: View {
+    let title: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let valueLabel: (Double) -> String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(valueLabel(value))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            Slider(value: $value, in: range, step: step)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct DynamicSwipeSensitivityControl: View {
+    let title: String
+    let showsEnableToggle: Bool
+    @Binding var isEnabled: Bool
+    @Binding var value: Double
+    @Binding var horizontalSensitivity: Double
+    @Binding var verticalSensitivity: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if showsEnableToggle {
+                Toggle(isOn: $isEnabled) {
+                    sensitivityLabel
+                }
+            } else {
+                sensitivityLabel
+            }
+            Slider(value: $value, in: 0.08...0.75, step: 0.01)
+                .disabled(!isEnabled)
+                .accessibilityLabel(title)
+            DynamicControlSlider(
+                title: "Horizontal Swipe Sensitivity",
+                value: $horizontalSensitivity,
+                range: 0.25...2,
+                step: 0.01,
+                valueLabel: percentageLabel
+            )
+            .disabled(!isEnabled)
+            DynamicControlSlider(
+                title: "Vertical Swipe Sensitivity",
+                value: $verticalSensitivity,
+                range: 0.25...2,
+                step: 0.01,
+                valueLabel: percentageLabel
+            )
+            .disabled(!isEnabled)
+        }
+    }
+
+    private var sensitivityLabel: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(String(format: "%.2f°/pt", value))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+    }
+
+    private func percentageLabel(_ value: Double) -> String {
+        "\(Int((value * 100).rounded()))%"
     }
 }

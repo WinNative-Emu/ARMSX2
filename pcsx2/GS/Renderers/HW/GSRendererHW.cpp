@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS/Renderers/HW/GSRendererHW.h"
+#include "GS/Renderers/HW/GSHwHack.h"
+#include "GS/Renderers/HW/GSDrawLog.h"
 #include "GS/Renderers/HW/GSTextureReplacements.h"
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
@@ -54,11 +56,14 @@ void GSRendererHW::Destroy()
 
 void GSRendererHW::PurgeTextureCache(bool sources, bool targets, bool hash_cache)
 {
+	// Queued draw records reach the TC; retire them before mutating it.
+	DrainBackQueue();
 	g_texture_cache->RemoveAll(sources, targets, hash_cache);
 }
 
 void GSRendererHW::ReadbackTextureCache()
 {
+	DrainBackQueue();
 	g_texture_cache->ReadbackAll();
 }
 
@@ -84,12 +89,20 @@ void GSRendererHW::Reset(bool hardware_reset)
 		g_texture_cache->ReadbackAll();
 
 	g_texture_cache->RemoveAll(true, true, true);
+	GSHwHack::ResetState();
 
 	GSRenderer::Reset(hardware_reset);
 }
 
 void GSRendererHW::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
 {
+	if (old_config.HWDownloadMode == GSHardwareDownloadMode::Asynchronous &&
+		GSConfig.HWDownloadMode != GSHardwareDownloadMode::Asynchronous)
+	{
+		// Nothing will ever retire these once the mode is off.
+		g_texture_cache->DiscardPendingDownloads();
+	}
+
 	GSRenderer::UpdateSettings(old_config);
 	m_mipmap = GSConfig.HWMipmap;
 	SetTCOffset();
@@ -97,6 +110,10 @@ void GSRendererHW::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
 
 void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
 {
+	// Retire whatever the GPU finished since the last frame. Runs unconditionally: after the
+	// mode is switched off there can still be a tail of queued downloads to drain.
+	g_texture_cache->ProcessPendingDownloads();
+
 	if (GSConfig.LoadTextureReplacements)
 		GSTextureReplacements::ProcessAsyncLoadedTextures();
 
@@ -1432,7 +1449,12 @@ void GSRendererHW::MergeSprite(GSTextureCache::Source* tex)
 					{
 						bool unique_found = false;
 
-						for (u32 j = i & 1; j < unique_verts; i += 2)
+						// Walk j (not i) over the already-collected unique pairs: j is seeded from i's
+						// parity and stepped by 2. Stepping i here instead left j loop-invariant, so
+						// `j < unique_verts` was permanently true and the only exit was the break —
+						// on equal X values i ran away past m_vertex->tail, reading vertices out of
+						// bounds until it happened to hit a mismatch.
+						for (u32 j = i & 1; j < unique_verts; j += 2)
 						{
 							if (s[i].XYZ.X != s[j].XYZ.X)
 							{
@@ -1473,7 +1495,8 @@ void GSRendererHW::MergeSprite(GSTextureCache::Source* tex)
 					{
 						bool unique_found = false;
 
-						for (u32 j = i & 1; j < unique_verts; i+=2)
+						// Same out-of-bounds walk as the X pass above: step j, not i.
+						for (u32 j = i & 1; j < unique_verts; j += 2)
 						{
 							if (s[i].XYZ.Y != s[j].XYZ.Y)
 							{
@@ -2149,13 +2172,21 @@ bool GSRendererHW::NeedsBlending()
 
 bool GSRendererHW::IsRTWritten()
 {
+	return IsRTWrittenLive(m_context->ALPHA);
+}
+
+// GV7-1d-ii: ALPHA is a parameter so the split front object can evaluate the
+// kick-time coverage-alpha query with ITS live blending regs while the cached
+// ctx / alpha min-max stay this (the back) object's last-executed-draw state —
+// exactly the mixed live/stale read a single object performs.
+bool GSRendererHW::IsRTWrittenLive(const GIFRegALPHA& ALPHA)
+{
 	const GIFRegTEST TEST = m_cached_ctx.TEST;
 	const bool only_z_written = (TEST.ATE && TEST.ATST == ATST_NEVER && TEST.AFAIL == AFAIL_ZB_ONLY);
 	if (only_z_written)
 		return false;
 
 	const u32 written_bits = (~m_cached_ctx.FRAME.FBMSK & GSLocalMemory::m_psm[m_cached_ctx.FRAME.PSM].fmsk);
-	const GIFRegALPHA ALPHA = m_context->ALPHA;
 	return (
 	        // A not masked
 	        (written_bits & 0xFF000000u) != 0) ||
@@ -2331,7 +2362,8 @@ void GSRendererHW::InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GS
 	if (!skip)
 	{
 		const bool recursive_copy = (BITBLTBUF.SBP == BITBLTBUF.DBP) && (m_env.TRXDIR.XDIR == 2);
-		g_texture_cache->InvalidateLocalMem(m_mem.GetOffset(BITBLTBUF.SBP, BITBLTBUF.SBW, BITBLTBUF.SPSM), r, recursive_copy);
+		g_texture_cache->InvalidateLocalMem(m_mem.GetOffset(BITBLTBUF.SBP, BITBLTBUF.SBW, BITBLTBUF.SPSM), r,
+			recursive_copy, m_force_synchronous_local_readback);
 	}
 }
 
@@ -2366,7 +2398,11 @@ void GSRendererHW::Move()
 		return;
 	}
 
+	// The CPU fallback below consumes the source out of local memory immediately, so it cannot
+	// work off a frame-old asynchronous snapshot. Only this uncommon fallback forces the read.
+	m_force_synchronous_local_readback = true;
 	GSRenderer::Move();
+	m_force_synchronous_local_readback = false;
 }
 
 u16 GSRendererHW::Interpolate_UV(float alpha, int t0, int t1)
@@ -2753,6 +2789,108 @@ void GSRendererHW::RoundSpriteOffset()
 	}
 }
 
+namespace
+{
+	/// Closes the per-draw debugger label and the open draw-log row on every exit from
+	/// Draw(), which has many early returns.
+	struct ScopedDrawLabel
+	{
+		bool active = false;
+		~ScopedDrawLabel()
+		{
+			if (active)
+				g_gs_device->PopDrawLabel();
+
+			// Unconditional: a draw that returns before submit still gets a row, marked
+			// unsubmitted, because "which draws were skipped" is itself a useful signal.
+			GSDrawLog::FinishDraw();
+		}
+	};
+} // namespace
+
+void GSRendererHW::RecordDrawLogEntry() const
+{
+	const GIFRegTEST& TEST = m_cached_ctx.TEST;
+	const GIFRegALPHA& ALPHA = m_context->ALPHA;
+
+	GSDrawLog::Record rec = {};
+	rec.frame = static_cast<u32>(g_perfmon.GetFrame());
+	rec.draw = static_cast<u32>(s_n);
+	rec.prim_type = static_cast<u8>(PRIM->PRIM);
+	rec.prim_count = static_cast<u16>(std::min<u32>(m_index->tail, 0xFFFFu));
+
+	rec.frame_block = m_cached_ctx.FRAME.Block();
+	rec.frame_psm = static_cast<u8>(m_cached_ctx.FRAME.PSM);
+	rec.frame_fbw = static_cast<u8>(m_cached_ctx.FRAME.FBW);
+	rec.frame_fbmsk = m_cached_ctx.FRAME.FBMSK;
+
+	rec.z_block = m_cached_ctx.ZBUF.Block();
+	rec.z_psm = static_cast<u8>(m_cached_ctx.ZBUF.PSM);
+	rec.z_ztst = static_cast<u8>(TEST.ZTST);
+
+	rec.tex_tbp0 = m_cached_ctx.TEX0.TBP0;
+	rec.tex_psm = static_cast<u8>(m_cached_ctx.TEX0.PSM);
+	rec.tex_tbw = static_cast<u8>(m_cached_ctx.TEX0.TBW);
+	rec.tex_tw = static_cast<u8>(m_cached_ctx.TEX0.TW);
+	rec.tex_th = static_cast<u8>(m_cached_ctx.TEX0.TH);
+
+	rec.alpha = static_cast<u16>((ALPHA.A << 6) | (ALPHA.B << 4) | (ALPHA.C << 2) | ALPHA.D);
+	rec.atst = static_cast<u8>(TEST.ATST);
+	rec.afail = static_cast<u8>(TEST.AFAIL);
+	rec.datm = static_cast<u8>(TEST.DATM);
+
+	rec.flags = static_cast<u8>((PRIM->TME ? GSDrawLog::FlagTextured : 0) |
+								(PRIM->ABE ? GSDrawLog::FlagBlend : 0) |
+								(TEST.ATE ? GSDrawLog::FlagAlphaTest : 0) |
+								(TEST.DATE ? GSDrawLog::FlagDate : 0) |
+								(TEST.ZTE ? GSDrawLog::FlagZTest : 0) |
+								(m_cached_ctx.ZBUF.ZMSK ? GSDrawLog::FlagZMask : 0));
+
+	GSDrawLog::BeginDraw(rec);
+}
+
+std::string GSRendererHW::DescribeDraw() const
+{
+	const GIFRegTEST& TEST = m_cached_ctx.TEST;
+	const bool textured = PRIM->TME;
+
+	std::string desc = fmt::format("Draw {} | {} x{} | FB {:05x} {} BW{}",
+		s_n, GSUtil::GetPrimName(PRIM->PRIM), m_index->tail,
+		m_cached_ctx.FRAME.Block(), GSUtil::GetPSMName(m_cached_ctx.FRAME.PSM), m_cached_ctx.FRAME.FBW);
+
+	if (m_cached_ctx.FRAME.FBMSK)
+		desc += fmt::format(" FBMSK {:08x}", m_cached_ctx.FRAME.FBMSK);
+
+	if (TEST.ZTE)
+	{
+		desc += fmt::format(" | Z {:05x} {} ZTST{}{}", m_cached_ctx.ZBUF.Block(),
+			GSUtil::GetPSMName(m_cached_ctx.ZBUF.PSM), static_cast<u32>(TEST.ZTST),
+			m_cached_ctx.ZBUF.ZMSK ? " ZMSK" : "");
+	}
+
+	if (textured)
+	{
+		desc += fmt::format(" | TEX {:05x} {} BW{} {}x{}", m_cached_ctx.TEX0.TBP0,
+			GSUtil::GetPSMName(m_cached_ctx.TEX0.PSM), m_cached_ctx.TEX0.TBW,
+			1 << m_cached_ctx.TEX0.TW, 1 << m_cached_ctx.TEX0.TH);
+	}
+
+	if (PRIM->ABE)
+	{
+		const GIFRegALPHA& ALPHA = m_context->ALPHA;
+		desc += fmt::format(" | BLEND {}{}{}{}", static_cast<u32>(ALPHA.A), static_cast<u32>(ALPHA.B),
+			static_cast<u32>(ALPHA.C), static_cast<u32>(ALPHA.D));
+	}
+
+	if (TEST.ATE)
+		desc += fmt::format(" | ATST{} AFAIL{}", static_cast<u32>(TEST.ATST), static_cast<u32>(TEST.AFAIL));
+
+	if (TEST.DATE)
+		desc += fmt::format(" | DATE{}", static_cast<u32>(TEST.DATM));
+
+	return desc;
+}
+
 void GSRendererHW::Draw()
 {
 	static u32 num_skipped_channel_shuffle_draws = 0;
@@ -2889,6 +3027,19 @@ void GSRendererHW::Draw()
 	m_full_screen_shuffle = false;
 	m_channel_shuffle_finish = false;
 	m_channel_shuffle_src_valid = GSVector4i::zero();
+
+	// Per-draw debugger label. Separate from the GL_PUSH below, which is Devel-only and
+	// requires a validation-layer device; this one is compiled into every build so a
+	// capture taken on a handheld perf build still names its draws.
+	ScopedDrawLabel draw_label;
+	if (GSConfig.DebugLabels) [[unlikely]]
+	{
+		g_gs_device->PushDrawLabel(DescribeDraw());
+		draw_label.active = true;
+	}
+
+	if (GSDrawLog::IsActive()) [[unlikely]]
+		RecordDrawLogEntry();
 
 	GL_PUSH("HW: Draw %lld (Context %u)", s_n, PRIM->CTXT);
 	GL_INS("HW: FLUSH REASON: %s%s", GetFlushReasonString(m_state_flush_reason),
@@ -5619,9 +5770,22 @@ void GSRendererHW::EmulateZbuffer(const GSTextureCache::Target* ds)
 	m_conf.cb_ps.TA_MaxDepth_Af.z = 0.0f;
 	m_conf.ps.zclamp = false;
 
+	// The floor only does something while one PS2 Z unit is finer than a float32 ULP at that
+	// depth. A ULP at z is 2^(exp(z) - 23) and a Z unit is 2^-32, so from z >= 2^-9 -- i.e.
+	// integer Z >= 2^23 -- they are the same size and floor(z * 2^32) * 2^-32 == z for every
+	// value the draw can produce. All that is left is the gl_FragDepth write itself, which
+	// moves the depth this pass stores off the fixed-function path that a later read-only pass
+	// tests against; the two need not agree bit-for-bit, and where they don't, a GEQUAL retest
+	// of the same geometry fails. God of War II's Athena statue draws its stone layer over an
+	// env-map layer exactly that way and speckles wherever the retest drops out. Skipping a
+	// provably-identity floor keeps the arithmetic and restores early-ZS.
+	const bool zfloor_is_noop = static_cast<u32>(GSVector4i(m_vt.m_min.p).z) >= (1u << 23);
+
 	// Even when Z is read-only, Z floor must be enabled with ZTST_GREATER since otherwise there
 	// can be false passing if the incoming Z is not floored when the buffer value is floored.
-	m_conf.ps.zfloor = !flat_z &&
+	// On tilers (Mali), the device can opt out: declaring gl_FragDepth disables early-ZS for
+	// the entire pipeline. zclamp (large_z) is independent and stays correct.
+	m_conf.ps.zfloor = !flat_z && !zfloor_is_noop && !g_gs_device->Features().no_ps2_z_quantization &&
 		(m_cached_ctx.DepthWrite() || (m_cached_ctx.DepthRead() && m_cached_ctx.TEST.ZTST == ZTST_GREATER));
 
 	if (m_cached_ctx.DepthWrite() && large_z)
@@ -6567,7 +6731,7 @@ __ri u32 GSRendererHW::EmulateChannelShuffle(GSTextureCache::Target* src, bool t
 		const GSLocalMemory::psm_t& t_psm = GSLocalMemory::m_psm[m_cached_ctx.TEX0.PSM];
 		const GSLocalMemory::psm_t& f_psm = GSLocalMemory::m_psm[m_cached_ctx.FRAME.PSM];
 		GSVector4i block_offset = GSVector4i(min_uv.x / t_psm.bs.x, min_uv.y / t_psm.bs.y).xyxy();
-		GSVector4i m_r_block_offset = GSVector4i((m_r.x & (f_psm.pgs.x - 1)) / f_psm.bs.x, (m_r.y & (f_psm.pgs.y - 1)) / f_psm.bs.y);
+		[[maybe_unused]] GSVector4i m_r_block_offset = GSVector4i((m_r.x & (f_psm.pgs.x - 1)) / f_psm.bs.x, (m_r.y & (f_psm.pgs.y - 1)) / f_psm.bs.y);
 
 		// Adjust it back to the page boundary
 		min_uv.x -= block_offset.x * t_psm.bs.x;
@@ -6869,12 +7033,19 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 	// Replace Ad with As, blend flags will be used from As since we are chaging the blend_index value.
 	// Must be done before index calculation, after blending equation optimizations
 	const bool blend_ad = m_conf.ps.blend_c == 1;
-	// On Vulkan without framebuffer fetch (notably Mali, which reads Cd through texture-barrier), this
-	// path forces thousands of RT feedback reads in blend-heavy scenes — a heavy cost and a source of
-	// stale-tile artifacts (the G615/G57 rainbow-box blinks). Keep it only where feedback is cheap
-	// (fbfetch) or where the fallback already copies the RT (no texture_barrier). Ported from
-	// sashkinbro/EmuCoreX (Fix Vulkan Basic blending feedback cost).
-	const bool fast_ad_alpha_masked_feedback = features.framebuffer_fetch || !features.texture_barrier;
+	// This path forces an RT feedback read per Ad-masked draw. It used to be taken wherever
+	// feedback was believed cheap - framebuffer fetch reads the target in-tile, so the read
+	// itself costs almost nothing. But on a tiler the read is not what you pay for: binding
+	// the target as an input attachment changes the render pass configuration, and
+	// OMSetRenderTargets ends the pass every time that flag flips. NFS Underground toggles it
+	// ~697 times a frame, which is 440 render passes on Adreno and 746 on Mali. Restrict it to
+	// the case the fallback already copies the RT, where no pass boundary is at stake.
+	//
+	// Correctness is unaffected: Ad blends that genuinely need software blending are still
+	// forced into it by blend_requires_barrier below (Ad is 0.5 not 1 for 128). Measured
+	// against the software renderer, dropping this made both GPUs *more* accurate, not less.
+	// Ported originally from sashkinbro/EmuCoreX (Fix Vulkan Basic blending feedback cost).
+	const bool fast_ad_alpha_masked_feedback = !features.texture_barrier;
 	bool blend_ad_alpha_masked = blend_ad && !m_conf.colormask.wa && fast_ad_alpha_masked_feedback;
 	const bool is_basic_blend = GSConfig.AccurateBlendingUnit != AccBlendLevel::Minimum;
 	if (blend_ad_alpha_masked && ((is_basic_blend || (COLCLAMP.CLAMP == 0) || m_conf.require_one_barrier)))
@@ -9539,6 +9710,10 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 	{
 		GSHWDrawConfig::DumpConfig(GetDrawDumpPath("%05d_hwconfig.txt", s_n), m_conf);
 	}
+
+	// Completes the row opened at the top of Draw() with the backend view, which only
+	// exists here.
+	GSDrawLog::EndDraw(m_conf);
 
 	if (!m_channel_shuffle_width)
 		g_gs_device->RenderHW(m_conf);

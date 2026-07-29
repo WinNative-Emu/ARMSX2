@@ -35,10 +35,10 @@
 
 #include "GS/GSVector.h"
 
+#include <algorithm>
 #include <bit>
 #include <cstdlib>
 #include <map>
-#include <unordered_set>
 #include <unordered_map>
 
 #define FASTMEM_LOG(...)
@@ -88,7 +88,7 @@ static std::unique_ptr<SharedMemoryMappingArea> s_fastmem_area;
 static std::vector<u32> s_fastmem_virtual_mapping; // maps vaddr -> mainmem offset
 static std::unordered_multimap<u32, u32> s_fastmem_physical_mapping; // maps mainmem offset -> vaddr
 static std::unordered_map<uptr, LoadstoreBackpatchInfo> s_fastmem_backpatch_info;
-static std::unordered_set<u32> s_fastmem_faulting_pcs;
+static std::vector<u32> s_fastmem_faulting_pcs; // sorted; lookups via binary search
 
 // Sticky: the 4 GB fastmem area allocation failed on this device at least once.
 // Process-lifetime flag so LoadSettings's config reload can't silently re-enable
@@ -532,7 +532,8 @@ static __ri void vtlb_Miss(u32 addr, u32 mode)
 	if (EmuConfig.Gamefixes.GoemonTlbHack)
 		GoemonTlbMissDebug();
 
-	// Hack to handle expected tlb miss by some games.
+	// Interpreter: raise the exception, then CancelInstruction stops the current
+	// instruction so the exception vector is dispatched immediately.
 	if (Cpu == &intCpu)
 	{
 		if (mode)
@@ -540,7 +541,6 @@ static __ri void vtlb_Miss(u32 addr, u32 mode)
 		else
 			cpuTlbMissR(addr, cpuRegs.branch);
 
-		// Exception handled. Current instruction need to be stopped
 		Cpu->CancelInstruction();
 		return;
 	}
@@ -555,9 +555,23 @@ static __ri void vtlb_Miss(u32 addr, u32 mode)
 		return;
 	}
 
+#ifdef __aarch64__
+	// arm64 recompiler: raise the TLB-miss exception here. cpuTlbMissR/W sets
+	// cpuRegs.pc to the exception vector, which the rec picks up at the next
+	// dispatch — no CancelInstruction longjmp (which is interpreter-only; the
+	// arm64 rec returns and lets the exception state take effect at block end).
+	if (mode)
+		cpuTlbMissW(addr, cpuRegs.branch);
+	else
+		cpuTlbMissR(addr, cpuRegs.branch);
+#else
+	// x86 recompiler: upstream behavior — log and continue without raising
+	// (x86 recCancelInstruction is a stub, so the arm64 exception path above
+	// must not run here).
 	static int spamStop = 0;
 	if (spamStop++ < 50 || IsDevBuild)
 		Console.Error(message);
+#endif
 }
 
 // BusError exception: more serious than a TLB miss.  If properly emulated the PS2 kernel
@@ -733,6 +747,11 @@ __ri vtlbHandler vtlb_RegisterHandler(vtlbMemR8FP* r8, vtlbMemR16FP* r16, vtlbMe
 	vtlbHandler rv = vtlb_NewHandler();
 	vtlb_ReassignHandler(rv, r8, r16, r32, r64, r128, w8, w16, w32, w64, w128);
 	return rv;
+}
+
+bool vtlb_IsUnmappedHandlerID(vtlbHandler id)
+{
+	return id == UnmappedVirtHandler || id == UnmappedPhyHandler;
 }
 
 
@@ -1077,12 +1096,19 @@ bool vtlb_ResolveFastmemMapping(uptr* addr)
 
 bool vtlb_GetGuestAddress(uptr host_addr, u32* guest_addr)
 {
-	uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
-	uptr fastmem_end = fastmem_start + 0xFFFFFFFFu;
-	if (host_addr < fastmem_start || host_addr > fastmem_end)
+	// Explicit unsigned bound rather than `fastmem_start + 0xFFFFFFFF` + a
+	// two-sided compare: that addition overflows a 64-bit uptr when the fastmem
+	// mapping lands within 4 GB of the top of the address space (exotic kernels /
+	// high-mmap allocators), wrapping fastmem_end below fastmem_start and silently
+	// rejecting every valid in-range address. Subtraction-first wraps a below-base
+	// host to a huge offset, so a single `offset >= FASTMEM_AREA_SIZE` check is
+	// overflow-proof regardless of base.
+	const uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
+	const uptr offset = host_addr - fastmem_start;
+	if (offset >= FASTMEM_AREA_SIZE)
 		return false;
 
-	*guest_addr = static_cast<u32>(host_addr - fastmem_start);
+	*guest_addr = static_cast<u32>(offset);
 	return true;
 }
 
@@ -1156,14 +1182,16 @@ bool vtlb_BackpatchLoadStore(uptr code_address, uptr fault_address)
 	Cpu->Clear(info.guest_pc, 1);
 
 	// and store the pc in the faulting list, so that we don't emit another fastmem loadstore
-	s_fastmem_faulting_pcs.insert(info.guest_pc);
+	auto it = std::lower_bound(s_fastmem_faulting_pcs.begin(), s_fastmem_faulting_pcs.end(), info.guest_pc);
+	if (it == s_fastmem_faulting_pcs.end() || *it != info.guest_pc)
+		s_fastmem_faulting_pcs.insert(it, info.guest_pc);
 	s_fastmem_backpatch_info.erase(iter);
 	return true;
 }
 
 bool vtlb_IsFaultingPC(u32 guest_pc)
 {
-	return (s_fastmem_faulting_pcs.find(guest_pc) != s_fastmem_faulting_pcs.end());
+	return std::binary_search(s_fastmem_faulting_pcs.begin(), s_fastmem_faulting_pcs.end(), guest_pc);
 }
 
 //virtual mappings

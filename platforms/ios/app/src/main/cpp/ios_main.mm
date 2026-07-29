@@ -318,12 +318,20 @@ void ARMSX2ConfigureImGuiFonts(const char* reason)
     int h = std::max(1, (int)(self.bounds.size.height * scale + 0.5));
     float s = (float)scale;
 
-    // Indent corner-anchored OSD by a small fixed clearance so it isn't clipped by the display's rounded corners
-    constexpr double kOsdCornerInsetPt = 18.0;
-    const float osd_inset = (float)(kOsdCornerInsetPt * scale);
-    MTGS::RunOnGSThread([w, h, s, osd_inset]() {
+    // Keep corner-anchored OSD out of the notch, the Dynamic Island and the home indicator. UIKit
+    // already knows where those are; a flat constant was both too much on a device with square
+    // corners and nowhere near enough on one with a cut-out.
+    const UIEdgeInsets safe = self.safeAreaInsets;
+    ImGuiManager::SetOSDSafeAreaInsets((float)(safe.left * scale), (float)(safe.top * scale),
+                                       (float)(safe.right * scale), (float)(safe.bottom * scale));
+
+    // -layoutSubviews is UIKit, i.e. the main thread, and it fires on every rotation and resize
+    // with the VM running. The MTGS ring is single-producer and belongs to the CPU thread, so hop
+    // there first (Host::RunOnGSThread chains RunOnCPUThread -> MTGS::RunOnGSThread). The insets
+    // go direct because that hop drops anything queued while the GS thread is closed, which is
+    // every layout pass before a game boots — the OSD then drew unindented until the first rotate.
+    Host::RunOnGSThread([w, h, s]() {
         GSResizeDisplayWindow(w, h, s);
-        ImGuiManager::SetOSDSafeAreaInsets(osd_inset, osd_inset, osd_inset, osd_inset);
     });
 }
 @end
@@ -520,7 +528,7 @@ void ARMSX2IOSApplyRetroAchievementsOverlayDefaults(SettingsInterface* si, const
     EmuConfig.Achievements.OverlayPosition = AchievementOverlayPosition::TopLeft;
     EmuConfig.Achievements.NotificationPosition = OsdOverlayPos::TopCenter;
 
-    Console.WriteLn("@@RA_IOS_OVERLAY_DEFAULTS@@ reason=%s overlay=top_left notification=top_center notifications=1 overlays=1",
+    Console.WriteLn("iOS RetroAchievements overlay defaults applied (reason: %s)",
         reason ? reason : "unknown");
 }
 
@@ -723,8 +731,11 @@ static const ARMSX2IOSDeviceStatsCache& ARMSX2IOSRefreshDeviceStatsCacheLocked()
         return s_device_stats_cache;
     }
 
+    // Mirror the rule the Swift side loads with, so a fresh install with the key still absent agrees
+    // with the preset instead of showing stats at Off.
     s_device_stats_cache.show = s_settings_interface ?
-        s_settings_interface->GetBoolValue("ARMSX2iOS/UI", "OsdShowDeviceStats", true) : true;
+        s_settings_interface->GetBoolValue("ARMSX2iOS/UI", "OsdShowDeviceStats",
+            s_settings_interface->GetIntValue("ARMSX2iOS/UI", "OsdPreset", 0) != 0) : false;
 
     @autoreleasepool {
         UIDevice* device = [UIDevice currentDevice];
@@ -771,8 +782,15 @@ extern "C" int ARMSX2_iOSGetDeviceStatsOverlaySeverity()
 
 extern "C" const char* ARMSX2_iOSGetDeviceStatsOverlayLine()
 {
-    std::lock_guard<std::mutex> lock(s_device_stats_mutex);
-    return ARMSX2IOSRefreshDeviceStatsCacheLocked().line.c_str();
+    // Handing back a pointer into the cached string leaves the caller reading it after the lock has
+    // gone, and another thread refreshing the cache can reallocate it underneath them. Copy into
+    // storage the calling thread owns instead.
+    static thread_local std::string copy;
+    {
+        std::lock_guard<std::mutex> lock(s_device_stats_mutex);
+        copy = ARMSX2IOSRefreshDeviceStatsCacheLocked().line;
+    }
+    return copy.c_str();
 }
 
 // Structured device stats for the SwiftUI VoiceOver HUD mirror. Reads the same
@@ -967,6 +985,17 @@ extern "C" void ARMSX2_PostRuntimeMenuStateChanged(void)
 {
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter] postNotificationName:@"ARMSX2iOSRuntimeMenuStateChanged" object:nil];
+    });
+}
+
+extern "C" void ARMSX2_PostEmulationOnlyStartupReady(void)
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (VMManager::IsEmulationOnlyMode())
+            return;
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"ARMSX2iOSEmulationOnlyStartupReady"
+            object:nil];
     });
 }
 

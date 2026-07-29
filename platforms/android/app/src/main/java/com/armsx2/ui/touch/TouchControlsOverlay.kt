@@ -72,9 +72,13 @@ import com.armsx2.ui.InGameOverlay
 import com.armsx2.ui.WindowImpl
 import kotlinx.coroutines.delay
 import kr.co.iefriends.pcsx2.NativeApp
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.IntOffset
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /** Root entry point. Place this in the same fillMaxSize() container as
  *  the AndroidView surface. Renders nothing when the VM isn't running
@@ -106,6 +110,10 @@ fun TouchControlsOverlay() {
             // layout: resolve it here and it's up from the first frame, rather than
             // whenever the Skins tab happens to be opened.
             ControllerSkinStore.applyForSerial(skinCtx, gameSerial)
+        } else {
+            // Out of game the layout is the global profile's, and nothing re-read it on rotate —
+            // so the editor kept whichever orientation was loaded when it opened.
+            TouchControls.applyActiveProfileForOrientation()
         }
     }
     // ---- Gyroscope / motion controls -------------------------------------
@@ -273,6 +281,26 @@ fun TouchControlsOverlay() {
             )
         }
 
+        // Snap-grid overlay: faint square grid the widgets' centres snap to, so the user can see
+        // the crosses they're aiming for. Composed after the dim backdrop and before the widget
+        // loop, so it sits above the dim but below every draggable widget.
+        if (edit && TouchControls.gridSnap.value) {
+            val gpx = widthPx / GRID_COLS
+            androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+                val line = Color.White.copy(alpha = 0.13f)
+                var gx = 0f
+                while (gx <= size.width) {
+                    drawLine(line, Offset(gx, 0f), Offset(gx, size.height), strokeWidth = 1f)
+                    gx += gpx
+                }
+                var gy = 0f
+                while (gy <= size.height) {
+                    drawLine(line, Offset(0f, gy), Offset(size.width, gy), strokeWidth = 1f)
+                    gy += gpx
+                }
+            }
+        }
+
         val faceMulti = !edit && TouchControls.faceMultiTouch.value
         if (!faceMulti) {
             if (unifiedPressed.isNotEmpty()) unifiedPressed = emptySet()
@@ -297,15 +325,32 @@ fun TouchControlsOverlay() {
                 onPressedChange = { unifiedPressed = it },
             )
         }
+        // Full-half invisible analog sticks: an invisible layer owning each screen half, composed
+        // z-BELOW the visual widgets so a finger starting on a button drives the button, not a stick.
+        if (!edit && TouchControls.fullHalfSticks.value) {
+            FullHalfStickLayer(layout = layout, widthPx = widthPx, heightPx = heightPx)
+        }
         for (cfg in layout.buttons) {
             if (!cfg.enabled && !edit) continue
+            // With full-half sticks on, the invisible half-screen layer owns the analogs — hide the
+            // normal L/R stick widgets during play (edit mode still shows them so they stay editable).
+            if (!edit && TouchControls.fullHalfSticks.value && cfg.id.kind == TouchButtonId.Kind.STICK) continue
             // Drawn above during play (outside the auto-hide / "Never" gate) so it can't be
             // hidden away; skip it here or it would render twice. Edit mode still gets it from
             // the loop, so it stays draggable/resizable like every other widget.
             if (cfg.id == TouchButtonId.PAUSE && !edit) continue
             val size = cfg.sizeDp.dp
-            val cx = w * cfg.xFrac
-            val cy = h * cfg.yFrac
+            // Grid snap (editor only): render the centre anchor on the nearest cross so it visibly
+            // clicks into place while dragging. The underlying cfg.xFrac keeps the raw free-drag
+            // value (snapping only the displayed fraction avoids fighting the transform-gesture
+            // delta accumulation, which would make the widget feel stuck); the committed layout is
+            // snapped on finger-up in editGestures.
+            val snapping = edit && TouchControls.gridSnap.value
+            val gridPx = if (snapping) widthPx / GRID_COLS else 0f
+            val xFrac = if (snapping) snapFracToGrid(cfg.xFrac, widthPx, gridPx) else cfg.xFrac
+            val yFrac = if (snapping) snapFracToGrid(cfg.yFrac, heightPx, gridPx) else cfg.yFrac
+            val cx = w * xFrac
+            val cy = h * yFrac
             val left = cx - size / 2
             val top = cy - size / 2
             Box(
@@ -338,11 +383,29 @@ fun TouchControlsOverlay() {
         }
 
         if (edit) {
-            EditToolbar(
-                modifier = Modifier
+            // The editor panel is draggable + pinch-resizable (grip handle at its top) so it can be
+            // moved off the buttons being edited. Offset is applied on the outer Box (real px); resize
+            // scales LocalDensity for the panel subtree, which keeps layout AND touch targets correct
+            // (a graphicsLayer / Modifier.scale would move the visuals but leave the hit-boxes behind).
+            val outerDensity = LocalDensity.current
+            val isLandscape = widthPx > heightPx
+            val dxState = TouchControls.editorPanelDx(isLandscape)
+            val dyState = TouchControls.editorPanelDy(isLandscape)
+            val panelScale = TouchControls.editorPanelScale(isLandscape).floatValue
+            Box(
+                Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = 12.dp),
-            )
+                    .padding(top = 12.dp)
+                    .offset {
+                        IntOffset(dxState.floatValue.roundToInt(), dyState.floatValue.roundToInt())
+                    },
+            ) {
+                CompositionLocalProvider(
+                    LocalDensity provides Density(outerDensity.density * panelScale, outerDensity.fontScale),
+                ) {
+                    EditToolbar()
+                }
+            }
         }
 
         if (TouchControls.profileDialogOpen.value) {
@@ -445,6 +508,12 @@ private fun skinKeyFor(id: TouchButtonId): String? = when (id) {
     TouchButtonId.R3 -> "r3"
     TouchButtonId.START -> "start"
     TouchButtonId.SELECT -> "select"
+    // Macros are skinnable too: a pack that ships ic_controller_macro1_button.png (or m1) gets
+    // its own artwork on them instead of the generic M1-M4 label.
+    TouchButtonId.MACRO1 -> "macro1"
+    TouchButtonId.MACRO2 -> "macro2"
+    TouchButtonId.MACRO3 -> "macro3"
+    TouchButtonId.MACRO4 -> "macro4"
     else -> null
 }
 
@@ -465,7 +534,7 @@ private fun drawableFor(id: TouchButtonId, pressed: Boolean): Int = when (id) {
     TouchButtonId.DPAD, TouchButtonId.L_STICK, TouchButtonId.R_STICK,
     TouchButtonId.PAUSE, TouchButtonId.PRESSURE, TouchButtonId.FAST_FORWARD,
     TouchButtonId.MACRO1, TouchButtonId.MACRO2, TouchButtonId.MACRO3, TouchButtonId.MACRO4,
-    TouchButtonId.SAVE_STATE, TouchButtonId.LOAD_STATE -> R.drawable.pad_cross
+    TouchButtonId.SAVE_STATE, TouchButtonId.LOAD_STATE, TouchButtonId.SCREENSHOT -> R.drawable.pad_cross
 }
 
 /** Pressure-sensitivity modifier button. Emits no PS2 keycode; while held it
@@ -761,12 +830,23 @@ private fun PauseWidget(cfg: TouchButtonCfg, edit: Boolean) {
     }
 }
 
+/** [opacity] with a legibility [floor] applied — except that an opacity heading for 0 still reaches
+ *  0. At or above [floor] this is exactly `opacity.coerceIn(floor, 1f)`, so every tuned appearance
+ *  is unchanged; below it the result fades linearly so a deliberate 0% means invisible instead of
+ *  bottoming out at the floor (#428). Only the drawn alpha is affected — touch targets are sized
+ *  and hit-tested independently, so invisible controls still respond. */
+private fun legibleAlpha(opacity: Float, floor: Float): Float =
+    opacity.coerceIn(floor, 1f) * (opacity / floor).coerceIn(0f, 1f)
+
 /** Nether-style ⏸: two rounded bars on a soft dark disc. Everything scales off the widget's own
  *  size so resizing it in the editor keeps the proportions. Deliberately low-alpha — it shares the
  *  top-right corner with the performance OSD and shouldn't compete with it. */
 @Composable
 private fun PauseGlyph(sizeDp: Float, opacity: Float) {
     val a = opacity.coerceIn(0.20f, 1f)
+    // Scales the floors below to 0 as opacity approaches 0 so a deliberate 0% hides the glyph
+    // entirely (#428). At >= 0.20 this is 1f, leaving the tuned appearance untouched.
+    val fade = (opacity / 0.20f).coerceIn(0f, 1f)
     val disc = (sizeDp * 0.66f).dp
     val barW = (sizeDp * 0.095f).dp
     val barH = (sizeDp * 0.34f).dp
@@ -777,7 +857,7 @@ private fun PauseGlyph(sizeDp: Float, opacity: Float) {
         modifier = Modifier
             .size(disc)
             .clip(CircleShape)
-            .background(Color.Black.copy(alpha = (0.55f * a).coerceIn(0.32f, 0.60f))),
+            .background(Color.Black.copy(alpha = (0.55f * a).coerceIn(0.32f, 0.60f) * fade)),
         contentAlignment = Alignment.Center,
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(barW)) {
@@ -786,7 +866,7 @@ private fun PauseGlyph(sizeDp: Float, opacity: Float) {
                     Modifier
                         .size(barW, barH)
                         .background(
-                            Color.White.copy(alpha = (0.95f * a).coerceIn(0.72f, 1.0f)),
+                            Color.White.copy(alpha = (0.95f * a).coerceIn(0.72f, 1.0f) * fade),
                             RoundedCornerShape(barW / 2),
                         )
                 )
@@ -823,7 +903,7 @@ private fun FastForwardWidget(cfg: TouchButtonCfg, edit: Boolean) {
         ) {
             Text(
                 "▶▶",
-                color = Color.White.copy(alpha = opacity.coerceIn(0.35f, 1f)),
+                color = Color.White.copy(alpha = legibleAlpha(opacity, 0.35f)),
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold,
             )
@@ -875,31 +955,52 @@ private fun MacroWidget(cfg: TouchButtonCfg, edit: Boolean) {
         }
     } else {
         val opacity = TouchControls.opacity.floatValue
+        // A skin can replace the M1-M4 label with its own artwork. Adding the skin KEY and the
+        // skinKeyFor mapping was not enough on its own: this widget drew a Text and never consulted
+        // skinPainter at all, so a pack shipping ic_controller_macro1_button.png was parsed,
+        // stored, and then silently never drawn. Reported by Duda, who had analog_base working and
+        // reasonably assumed the macro name was wrong.
+        val skin = skinPainter(skinKeyFor(cfg.id))
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .clip(CircleShape)
-                .background(Color.Black.copy(alpha = 0.30f * opacity))
+                // No dark circle behind custom art — the pack draws its own shape, and the backing
+                // would show as a disc behind a square button.
+                .then(if (skin == null) Modifier.clip(CircleShape).background(Color.Black.copy(alpha = 0.30f * opacity)) else Modifier)
                 .macroPressGestures(cfg.id),
             contentAlignment = Alignment.Center,
         ) {
-            Text(
-                cfg.id.label,
-                color = Color.White.copy(alpha = opacity.coerceIn(0.35f, 1f)),
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-            )
+            if (skin != null) {
+                Image(
+                    painter = skin,
+                    contentDescription = cfg.id.label,
+                    contentScale = ContentScale.Fit,
+                    alpha = opacity,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Text(
+                    cfg.id.label,
+                    color = Color.White.copy(alpha = legibleAlpha(opacity, 0.35f)),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
         }
     }
 }
 
-/** On-screen Save-State / Load-State button. Edit mode renders an outlined
- *  "SAVE"/"LOAD" box; in play mode a tap opens the pause overlay's slot picker so the
- *  user chooses which slot to save to / load from (the physical SAVE_STATE/LOAD_STATE
- *  hotkeys remain quick-to-current-slot). Opt-in (disabled in the default layout). */
+/** On-screen Save-State / Load-State button. Edit mode renders an outlined "SAVE"/"LOAD" box;
+ *  in play mode a quick TAP saves/loads the current slot directly (no menu — native shows an OSD
+ *  confirmation), and a LONG-PRESS opens the slot picker to choose a slot. Opt-in (disabled in the
+ *  default layout). */
 @Composable
 private fun StateActionWidget(cfg: TouchButtonCfg, edit: Boolean) {
-    val label = if (cfg.id == TouchButtonId.SAVE_STATE) str("touch.stateAction.save") else str("touch.stateAction.load")
+    val label = when (cfg.id) {
+        TouchButtonId.SAVE_STATE -> str("touch.stateAction.save")
+        TouchButtonId.LOAD_STATE -> str("touch.stateAction.load")
+        else -> str("touch.stateAction.screenshot")
+    }
     if (edit) {
         Box(
             modifier = Modifier.fillMaxSize().editGestures(cfg),
@@ -916,16 +1017,33 @@ private fun StateActionWidget(cfg: TouchButtonCfg, edit: Boolean) {
                 .clip(CircleShape)
                 .background(Color.Black.copy(alpha = 0.30f * opacity))
                 .pointerInput(cfg.id) {
-                    detectTapGestures(onTap = {
-                        if (cfg.id == TouchButtonId.SAVE_STATE) InGameOverlay.openSaveStatePicker()
-                        else InGameOverlay.openLoadStatePicker()
-                    })
+                    detectTapGestures(
+                        // Quick TAP = save/load the current slot directly (native shows an OSD
+                        // confirmation). LONG-PRESS = open the slot picker to choose a slot.
+                        onTap = {
+                            when (cfg.id) {
+                                TouchButtonId.SAVE_STATE -> MainActivityRuntime.instance?.saveState()
+                                TouchButtonId.LOAD_STATE -> MainActivityRuntime.instance?.loadState()
+                                else -> MainActivityRuntime.instance?.applicationContext?.let {
+                                    com.armsx2.Screenshots.capture(it)
+                                }
+                            }
+                        },
+                        onLongPress = {
+                            // Screenshot has no slots, so nothing to pick.
+                            when (cfg.id) {
+                                TouchButtonId.SAVE_STATE -> InGameOverlay.openSaveStatePicker()
+                                TouchButtonId.LOAD_STATE -> InGameOverlay.openLoadStatePicker()
+                                else -> Unit
+                            }
+                        },
+                    )
                 },
             contentAlignment = Alignment.Center,
         ) {
             Text(
                 label,
-                color = Color.White.copy(alpha = opacity.coerceIn(0.35f, 1f)),
+                color = Color.White.copy(alpha = legibleAlpha(opacity, 0.35f)),
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Bold,
             )
@@ -1306,6 +1424,93 @@ private fun releaseStick(codes: StickCodes, last: StickEmit) {
 }
 
 /* -------------------------------------------------------------------- */
+/*  Full-half invisible analog sticks (RPCSX-style)                      */
+/* -------------------------------------------------------------------- */
+
+/** Per-finger state for [FullHalfStickLayer]: which half it owns, its floating origin, last emit. */
+private class HalfStickTrack(val leftHalf: Boolean, val origin: Offset) {
+    var last: StickEmit = StickEmit()
+}
+
+/** Invisible full-screen layer: the LEFT half drives the left analog, the RIGHT half the right one.
+ *  Each finger is tracked independently (both halves work simultaneously) and drives its stick from
+ *  its touch-down point (floating origin). A DOWN that a widget above already consumed, or that lands
+ *  on an enabled button, is ignored — so every on-screen button keeps working. Composed z-below the
+ *  widgets and renders nothing. */
+@Composable
+private fun FullHalfStickLayer(layout: TouchLayout, widthPx: Float, heightPx: Float) {
+    if (widthPx <= 0f || heightPx <= 0f) return
+    val density = LocalDensity.current
+    // Foreign regions: every enabled non-stick widget (D-pad, face, shoulders, menu, L3/R3, Pause,
+    // FF, macro, state, pressure). A finger starting on one of these drives the button, not a stick.
+    val foreignBounds = layout.buttons
+        .filter { it.enabled && it.id.kind != TouchButtonId.Kind.STICK }
+        .map { cfg ->
+            val sizePx = with(density) { cfg.sizeDp.dp.toPx() }
+            val cx = widthPx * cfg.xFrac
+            val cy = heightPx * cfg.yFrac
+            UnifiedRect(cx - sizePx / 2f, cy - sizePx / 2f, cx + sizePx / 2f, cy + sizePx / 2f)
+        }
+    val leftCodes = StickCodes(xPos = 111, xNeg = 113, yPos = 112, yNeg = 110)
+    val rightCodes = StickCodes(xPos = 121, xNeg = 123, yPos = 122, yNeg = 120)
+    // Deflection radius from the floating origin: a comfortable thumb reach gives full tilt.
+    val capPx = with(density) { 100.dp.toPx() }
+    val dims = widthPx to heightPx
+
+    Box(
+        modifier = Modifier.fillMaxSize().pointerInput(foreignBounds, dims) {
+            fun inForeign(pos: Offset) = foreignBounds.any {
+                pos.x >= it.left && pos.x <= it.right && pos.y >= it.top && pos.y <= it.bottom
+            }
+            fun codesFor(leftHalf: Boolean) = if (leftHalf) leftCodes else rightCodes
+            awaitPointerEventScope {
+                val tracks = mutableMapOf<androidx.compose.ui.input.pointer.PointerId, HalfStickTrack>()
+                try {
+                    while (true) {
+                        val ev = awaitPointerEvent()
+                        for (ch in ev.changes) {
+                            if (ch.changedToDown()) {
+                                // Claim this finger for a stick unless a widget above took the DOWN or
+                                // it landed on a button. Which screen half decides which stick.
+                                if (!ch.isConsumed && !inForeign(ch.position)) {
+                                    tracks[ch.id] = HalfStickTrack(ch.position.x < widthPx / 2f, ch.position)
+                                }
+                            }
+                            if (!ch.pressed) {
+                                tracks.remove(ch.id)?.let { t ->
+                                    if (t.last.any()) releaseStick(codesFor(t.leftHalf), t.last)
+                                }
+                                continue
+                            }
+                            val t = tracks[ch.id] ?: continue
+                            val leftStick = t.leftHalf
+                            val dx = ch.position.x - t.origin.x
+                            val dy = ch.position.y - t.origin.y
+                            val r = hypot(dx, dy)
+                            val scale = if (r > capPx) capPx / r else 1f
+                            var nx = ((dx * scale) / capPx).coerceIn(-1f, 1f)
+                            var ny = ((dy * scale) / capPx).coerceIn(-1f, 1f)
+                            if (ControllerMappings.stickSwapXY(leftStick)) { val tmp = nx; nx = ny; ny = tmp }
+                            if (ControllerMappings.stickInvertX(leftStick)) nx = -nx
+                            if (ControllerMappings.stickInvertY(leftStick)) ny = -ny
+                            val emit = computeStickEmit(nx, ny, leftStick)
+                            if (emit != t.last) {
+                                applyStickDiff(codesFor(leftStick), t.last, emit)
+                                t.last = emit
+                            }
+                        }
+                    }
+                } finally {
+                    // Zero every held axis on cancel/dispose so nothing sticks on.
+                    tracks.values.forEach { t -> if (t.last.any()) releaseStick(codesFor(t.leftHalf), t.last) }
+                    tracks.clear()
+                }
+            }
+        },
+    )
+}
+
+/* -------------------------------------------------------------------- */
 /*  Gesture helpers                                                      */
 /* -------------------------------------------------------------------- */
 
@@ -1408,7 +1613,24 @@ private fun Modifier.pressGestures(
 private fun Modifier.editGestures(cfg: TouchButtonCfg): Modifier =
     pointerInput(cfg.id, "press") {
         detectTapGestures(
-            onPress = { TouchControls.selectedButton.value = cfg.id },
+            onPress = {
+                TouchControls.selectedButton.value = cfg.id
+                // Snap-to-grid commits on release: the transform handler below free-drags the raw
+                // fraction (smooth), then on finger-up the centre anchor is rounded to the nearest
+                // grid cross and persisted so the saved layout stays aligned. Read id, not the
+                // stale captured cfg (see the note above about the frozen pointerInput key).
+                val released = tryAwaitRelease()
+                val overlay = OverlayDims.last
+                if (released && TouchControls.gridSnap.value && overlay != null) {
+                    val gridPx = overlay.widthPx / GRID_COLS
+                    TouchControls.updateButton(cfg.id) { c ->
+                        c.copy(
+                            xFrac = snapFracToGrid(c.xFrac, overlay.widthPx, gridPx),
+                            yFrac = snapFracToGrid(c.yFrac, overlay.heightPx, gridPx),
+                        )
+                    }
+                }
+            },
         )
     }.pointerInput(cfg.id) {
         detectTransformGestures(panZoomLock = false) { _, pan, zoom, _ ->
@@ -1422,9 +1644,44 @@ private fun Modifier.editGestures(cfg: TouchButtonCfg): Modifier =
         }
     }
 
+/** Round every widget's centre onto the grid, matching exactly what the editor was drawing.
+ *
+ *  A no-op when the grid is off or the overlay has never been measured -- in both cases the raw
+ *  fractions ARE what was displayed, so there is nothing to reconcile. */
+private fun snapLayoutToGrid() {
+    if (!TouchControls.gridSnap.value) return
+    val overlay = OverlayDims.last ?: return
+    val gridPx = overlay.widthPx / GRID_COLS
+    if (gridPx <= 0f) return
+    // One pass over the layout rather than updateButton per id: updateButton rebuilds the whole
+    // button list each call, so doing it ~25 times would be 25 list copies for one save.
+    val current = TouchControls.activeLayout.value
+    TouchControls.activeLayout.value = current.copy(
+        buttons = current.buttons.map { c ->
+            c.copy(
+                xFrac = snapFracToGrid(c.xFrac, overlay.widthPx, gridPx),
+                yFrac = snapFracToGrid(c.yFrac, overlay.heightPx, gridPx),
+            )
+        },
+    )
+}
+
 private object OverlayDims {
     @Volatile var last: Dims? = null
     data class Dims(val widthPx: Float, val heightPx: Float)
+}
+
+/** Editor snap-to-grid: the overlay width is divided into this many columns; rows use the same
+ *  pixel pitch so cells are square and a widget's centre anchor lands on a grid cross. */
+private const val GRID_COLS = 24f
+
+/** Round a centre-anchor fraction to the nearest grid line. Works in pixel space so both axes
+ *  share one square pitch, then converts back to a fraction (clamped to the same 0.02..0.98 the
+ *  drag handler uses so a snapped widget can never leave the screen). */
+private fun snapFracToGrid(frac: Float, dimPx: Float, gridPx: Float): Float {
+    if (gridPx <= 0f || dimPx <= 0f) return frac
+    val snappedPx = (frac * dimPx / gridPx).roundToInt() * gridPx
+    return (snappedPx / dimPx).coerceIn(0.02f, 0.98f)
 }
 
 /* -------------------------------------------------------------------- */
@@ -1470,6 +1727,60 @@ private fun EditToolbar(modifier: Modifier = Modifier) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
+        // Grip row: drag the centre grip to MOVE the panel off the buttons, tap −/＋ to RESIZE it,
+        // double-tap the grip to snap back to default. Pinch-on-grip also resizes, but the strip is
+        // thin so a two-finger pinch rarely lands on it -- the −/＋ buttons are the reliable path.
+        // Pan is raw px (matches the outer Box offset); scale drives the panel's LocalDensity.
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            PanelSizeButton("－") {
+                val ls = OverlayDims.last?.let { it.widthPx > it.heightPx } ?: true
+                TouchControls.editorPanelScale(ls).floatValue =
+                    (TouchControls.editorPanelScale(ls).floatValue - 0.1f).coerceIn(0.6f, 1.35f)
+            }
+            Box(
+                Modifier
+                    .weight(1f)
+                    .height(26.dp)
+                    .pointerInput(Unit) {
+                        detectTransformGestures { _, pan, zoom, _ ->
+                            val dims = OverlayDims.last
+                            val ls = (dims?.widthPx ?: 1f) > (dims?.heightPx ?: 0f)
+                            val maxX = (dims?.widthPx ?: 2400f) * 0.42f
+                            val maxY = (dims?.heightPx ?: 1080f) * 0.78f
+                            TouchControls.editorPanelDx(ls).floatValue =
+                                (TouchControls.editorPanelDx(ls).floatValue + pan.x).coerceIn(-maxX, maxX)
+                            TouchControls.editorPanelDy(ls).floatValue =
+                                (TouchControls.editorPanelDy(ls).floatValue + pan.y).coerceIn(0f, maxY)
+                            TouchControls.editorPanelScale(ls).floatValue =
+                                (TouchControls.editorPanelScale(ls).floatValue * zoom).coerceIn(0.6f, 1.35f)
+                        }
+                    }
+                    .pointerInput(Unit) {
+                        detectTapGestures(onDoubleTap = {
+                            val ls = OverlayDims.last?.let { it.widthPx > it.heightPx } ?: true
+                            TouchControls.resetEditorPanel(ls)
+                        })
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    Modifier
+                        .width(44.dp)
+                        .height(5.dp)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(Color(0x99FFFFFF)),
+                )
+            }
+            PanelSizeButton("＋") {
+                val ls = OverlayDims.last?.let { it.widthPx > it.heightPx } ?: true
+                TouchControls.editorPanelScale(ls).floatValue =
+                    (TouchControls.editorPanelScale(ls).floatValue + 0.1f).coerceIn(0.6f, 1.35f)
+            }
+        }
         // Scope hint: with no game running the editor edits the GLOBAL Default
         // layout (per-game layouts need a running disc).
         Text(
@@ -1486,6 +1797,19 @@ private fun EditToolbar(modifier: Modifier = Modifier) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             ToolbarChip(str("action.save")) {
+                // Commit the snap HERE, not only on finger-up.
+                //
+                // The editor draws every widget snapped to the grid, but the underlying fraction
+                // stays raw while dragging (snapping it live fights the transform gesture's delta
+                // accumulation and makes the widget feel stuck). The commit was supposed to happen
+                // in editGestures' tryAwaitRelease -- except that lives in detectTapGestures, and a
+                // real DRAG is consumed by the neighbouring detectTransformGestures, which cancels
+                // the tap detector so tryAwaitRelease returns false and the snap never ran. So the
+                // layout looked aligned while editing and reverted to the raw positions on save.
+                //
+                // Snapping at save time makes the saved layout equal what was on screen, whatever
+                // route the widget took to get there.
+                snapLayoutToGrid()
                 TouchControls.saveLiveLayoutToActive()
                 TouchControls.exitEditMode()
             }
@@ -1512,10 +1836,17 @@ private fun EditToolbar(modifier: Modifier = Modifier) {
             ToolbarChip(if (TouchControls.floatingStick.value) str("touch.editor.floatingStickOn") else str("touch.editor.floatingStickOff")) {
                 TouchControls.setFloatingStick(!TouchControls.floatingStick.value)
             }
+            ToolbarChip(if (TouchControls.fullHalfSticks.value) str("touch.editor.fullHalfSticksOn") else str("touch.editor.fullHalfSticksOff")) {
+                TouchControls.setFullHalfSticks(!TouchControls.fullHalfSticks.value)
+            }
+            // Snap-to-grid: aligns dragged widgets to a square grid so buttons line up cleanly.
+            ToolbarChip(if (TouchControls.gridSnap.value) str("touch.editor.gridOn") else str("touch.editor.gridOff")) {
+                TouchControls.setGridSnap(!TouchControls.gridSnap.value)
+            }
         }
         // Opacity slider — controls the live HUD alpha so the user sees
-        // the change immediately while editing. Range 0.20..1.00 mirrors
-        // TouchControls.setOpacity's clamp.
+        // the change immediately while editing. Range 0.00..1.00 mirrors
+        // TouchControls.setOpacity's clamp; 0 = invisible but still touchable (#428).
         Row(
             // Wrap-content width + Column's CenterHorizontally alignment
             // centers the alpha bar horizontally inside the toolbar
@@ -1527,7 +1858,7 @@ private fun EditToolbar(modifier: Modifier = Modifier) {
             androidx.compose.material3.Slider(
                 value = TouchControls.opacity.floatValue,
                 onValueChange = { TouchControls.setOpacity(it) },
-                valueRange = 0.20f..1.0f,
+                valueRange = 0.0f..1.0f,
                 modifier = Modifier
                     .width(280.dp)
                     .height(28.dp),
@@ -1648,6 +1979,21 @@ private fun ToolbarChip(label: String, onClick: () -> Unit) {
             .padding(horizontal = 10.dp, vertical = 6.dp),
     ) {
         Text(label, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** Compact −/＋ button that resizes the editor panel (steps editorPanelScale). */
+@Composable
+private fun PanelSizeButton(label: String, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color(0xFF1F1F2C))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 2.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
     }
 }
 

@@ -46,6 +46,9 @@ object ConfigStore {
     // their legacy global prefs, so updating doesn't reset a user's rotation lock or GPU driver.
     private const val KEY_ORIENTATION_DRIVER_MIGRATED = "config.migrated.orientationDriver"
     // One-time flip of existing saves to the new Adreno framebuffer-fetch default-on.
+    // One-time seed of the (now per-game) output-scaler fields from their legacy
+    // global-only prefs, so updating doesn't reset a user's display resolution.
+    private const val KEY_OUTPUT_SCALE_MIGRATED = "config.migrated.outputScale"
     private const val KEY_ADRENO_FBFETCH_MIGRATED = "config.migrated.adrenoFbFetchOn"
     // One-time flip of existing all-on OSD saves to the new default-off.
     private const val KEY_OSD_OFF_MIGRATED = "config.migrated.osdDefaultOff"
@@ -66,6 +69,20 @@ object ConfigStore {
             Settings()
         }
         var dirty = false
+
+        // Legacy: the HW scaler + screen-resolution override were global-only prefs
+        // before they became per-game scoped. Adopt whatever the user had set.
+        if (!MainActivityRuntime.prefs.getBoolean(KEY_OUTPUT_SCALE_MIGRATED, false))
+        {
+            val legacyScaler = MainActivityRuntime.prefs.getInt("ui.hwScaler", 0)
+            val legacyRes = MainActivityRuntime.prefs.getString("ui.screenResOverride", "auto") ?: "auto"
+            if (legacyScaler != 0 || legacyRes != "auto")
+            {
+                parsed = parsed.copy(hwScaler = legacyScaler, screenResOverride = legacyRes)
+                dirty = true
+            }
+            MainActivityRuntime.prefs.edit { putBoolean(KEY_OUTPUT_SCALE_MIGRATED, true) }
+        }
 
         // Legacy: "Basic" blending migration.
         if (raw != null && !MainActivityRuntime.prefs.getBoolean(KEY_BLEND_BASIC_MIGRATED, false) &&
@@ -177,6 +194,46 @@ object ConfigStore {
         writeBackupMirror()
     }
 
+    /**
+     * Persist capability-aware defaults only when this is genuinely a fresh install.
+     *
+     * Call after [reconcileReusedFolder]: a reused data directory gets first chance to
+     * restore its prior global settings, while an empty install starts with the
+     * zero-frame GS queue on capable devices. Low-end devices retain the smoother
+     * two-frame queue. Once persisted, this never changes an existing user's choice.
+     */
+    fun seedFreshInstallDefaults(context: android.content.Context) {
+        if (MainActivityRuntime.prefs.getString(KEY_GLOBAL, null) != null) return
+        // Low Latency (zero-frame GS queue) is NOT the default any more — it was briefly seeded on
+        // capable devices, but a zero-frame queue gives the GS thread no slack and cost smoothness
+        // on too many setups. Everyone starts on PCSX2's two-frame queue and can opt in from the
+        // Performance tab. Settings.vsyncQueueSize already defaults to 2, so this just materialises
+        // the global save that the rest of the config layer keys "is this a fresh install?" off.
+        saveGlobal(Settings())
+    }
+
+    // Migration 1 (config.migrated.lowLatencyDefault) flipped existing capable devices ON. It is
+    // retired rather than deleted: the key must never be reused, or an install that already ran it
+    // would skip the correction below.
+    private const val KEY_LOWLATENCY_OFF_MIGRATED = "config.migrated.lowLatencyOff"
+    /**
+     * One-time correction that undoes migration 1: puts existing installs back on the two-frame GS
+     * queue. Keyed separately so it runs exactly once even on devices that already took the earlier
+     * flip, and after it runs the user's own choice sticks.
+     *
+     * Caveat, deliberately accepted: this cannot distinguish "queue 0 because migration 1 set it"
+     * from "queue 0 because the user chose it", so anyone who opted in during the short window that
+     * shipped the ON default gets reset once and has to re-enable it.
+     */
+    fun migrateLowLatencyOff(context: android.content.Context) {
+        if (MainActivityRuntime.prefs.getBoolean(KEY_LOWLATENCY_OFF_MIGRATED, false)) return
+        MainActivityRuntime.prefs.edit().putBoolean(KEY_LOWLATENCY_OFF_MIGRATED, true).apply()
+        // Fresh installs are handled by seedFreshInstallDefaults; only touch an existing global save.
+        if (MainActivityRuntime.prefs.getString(KEY_GLOBAL, null) == null) return
+        val g = loadGlobal()
+        if (g.vsyncQueueSize == 0) saveGlobal(g.copy(vsyncQueueSize = 2))
+    }
+
     /** Load the sparse per-game override blob, or null if there are none. */
     fun loadOverrides(serial: String): JSONObject? {
         val raw = MainActivityRuntime.prefs.getString(keyForGame(serial), null) ?: return null
@@ -236,13 +293,32 @@ object ConfigStore {
             // Every field, so a pinned key can be given its CURRENT value even when that
             // value equals global's (the diff above necessarily omits it).
             val full = updated.toJson()
+            val existing = loadOverrides(serial)
             val pinned = LinkedHashSet<String>()
-            loadOverrides(serial)?.keys()?.forEach { pinned.add(it) }
+            existing?.keys()?.forEach { pinned.add(it) }
             // What the user just changed, pinned even if it landed on global's value —
             // otherwise editing a field in Game scope could silently un-pin it.
-            previous?.let { Settings.diff(it, updated).keys().forEach { k -> pinned.add(k) } }
+            val changedNow = LinkedHashSet<String>()
+            previous?.let { Settings.diff(it, updated).keys().forEach { k -> changedNow.add(k); pinned.add(k) } }
             pinned.forEach { key ->
-                if (!overrides.has(key) && full.has(key)) overrides.put(key, full.get(key))
+                if (overrides.has(key))
+                    return@forEach
+                // ★ For a pinned key the caller did NOT touch in this save, keep the value ALREADY
+                // STORED rather than re-pinning whatever `updated` happens to hold. Every screen
+                // writes the whole Settings object, so `updated` can be a stale snapshot; the old
+                // unconditional `full.get(key)` then wrote that stale value straight back over a
+                // good override. That is how a per-game FPS cap of 30 came back as 0 and STAYED 0 —
+                // the pin made the wrong value sticky, so it survived even after the writers were
+                // fixed. Only trust `updated` for keys `previous` proves the caller just changed.
+                //
+                // When `previous` is absent the caller cannot tell us what it changed, so fall back
+                // to the original behaviour rather than silently altering semantics for those paths.
+                val trustUpdated = changedNow.contains(key) || previous == null
+                when {
+                    trustUpdated && full.has(key) -> overrides.put(key, full.get(key))
+                    existing != null && existing.has(key) -> overrides.put(key, existing.get(key))
+                    full.has(key) -> overrides.put(key, full.get(key))
+                }
             }
             saveOverrides(serial, overrides)
         } else {

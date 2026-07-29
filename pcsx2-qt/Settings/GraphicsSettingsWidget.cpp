@@ -244,11 +244,13 @@ GraphicsSettingsWidget::GraphicsSettingsWidget(SettingsWindow* settings_dialog, 
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_advanced.disableShaderCache, "EmuCore/GS", "DisableShaderCache", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_advanced.disableVertexShaderExpand, "EmuCore/GS", "DisableVertexShaderExpand", false);
 	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_advanced.gsDownloadMode, "EmuCore/GS", "HWDownloadMode", static_cast<int>(GSHardwareDownloadMode::Enabled));
+	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_advanced.gsBackThreadMode, "EmuCore/GS", "GSBackThreadMode", static_cast<int>(GSBackThreadMode::Off));
 	SettingWidgetBinder::BindWidgetToFloatSetting(sif, m_advanced.ntscFrameRate, "EmuCore/GS", "FrameRateNTSC", 59.94f);
 	SettingWidgetBinder::BindWidgetToFloatSetting(sif, m_advanced.palFrameRate, "EmuCore/GS", "FrameRatePAL", 50.00f);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_advanced.spinCPUDuringReadbacks, "EmuCore/GS", "HWSpinCPUForReadbacks", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_advanced.spinGPUDuringReadbacks, "EmuCore/GS", "HWSpinGPUForReadbacks", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_advanced.rovBarriersVK, "EmuCore/GS", "HWROVBarriersVK", false);
+	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_advanced.coalesceRenderPasses, "EmuCore/GS", "CoalesceRenderPasses", false);
 	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_advanced.texturePreloading, "EmuCore/GS", "texture_preloading", static_cast<int>(TexturePreloadingLevel::Off));
 
 	setTabVisible(m_advanced_tab, QtHost::ShouldShowAdvancedSettings());
@@ -559,6 +561,12 @@ GraphicsSettingsWidget::GraphicsSettingsWidget(SettingsWindow* settings_dialog, 
 			tr("Submits useless work to the GPU during readbacks to prevent it from going into powersave modes. "
 			   "May improve performance during readbacks but with a significant increase in power usage."));
 
+		dialog()->registerWidgetHelp(m_advanced.coalesceRenderPasses, tr("Coalesce Render Passes"), tr("Unchecked"),
+			tr("Holds draws back so that consecutive draws to the same render target share one render pass, instead of "
+			   "starting a new one every time a game alternates between two targets. Intended for tiling GPUs, where "
+			   "every pass boundary costs a full tile load and store - it does nothing useful on a desktop GPU. Rendering "
+			   "is unchanged either way. Games known to benefit have it enabled automatically."));
+
 		// Software
 		dialog()->registerWidgetHelp(m_sw.extraSWThreads, tr("Software Rendering Threads"), tr("2 threads"),
 			tr("Number of rendering threads: 0 for single thread, 2 or more for multithread (1 is for debugging). "
@@ -796,6 +804,12 @@ GraphicsSettingsWidget::GraphicsSettingsWidget(SettingsWindow* settings_dialog, 
 			tr("Skips synchronizing with the GS thread and host GPU for GS downloads. "
 			   "Can result in a large speed boost on slower systems, at the cost of many broken graphical effects. "
 			   "If games are broken and you have this option enabled, please disable it first."));
+
+		dialog()->registerWidgetHelp(m_advanced.gsBackThreadMode, tr("GS Back Thread"), tr("Disabled"),
+			tr("Pipelined splits GS emulation across two threads: one parses GIF data and builds vertices while the other runs draws, "
+			   "the texture cache, and the GPU device. Can significantly reduce GS thread time on multi-core systems with spare cores, "
+			   "but competes for cores with the EE/VU threads. The Inline Records and Lockstep modes are debugging tools and much "
+			   "slower — do not use them for play."));
 
 		dialog()->registerWidgetHelp(m_advanced.ntscFrameRate, tr("NTSC Frame Rate"), tr("59.94 Hz"),
 			tr("Determines what frame rate NTSC games run at."));

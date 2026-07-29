@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -59,6 +60,8 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -259,6 +262,12 @@ fun RoundAction(
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text(
+                // Empirical nudge. Font metrics alone don't land these glyphs on the optical
+                // centre: arrows and symbols like ← ↺ ⌕ carry no descender, so their ink sits
+                // above the baseline-derived box centre and they read low once the box itself is
+                // centred. Removing the font padding (below) fixes the box; this fixes the ink.
+                // Tuned against the back arrow, which is the most-looked-at of the set.
+                modifier = Modifier.offset(y = (-1.5).dp),
                 text = glyph,
                 color = glyphColor
                     ?: if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
@@ -268,6 +277,13 @@ fun RoundAction(
                     else -> 22.sp
                 },
                 fontWeight = FontWeight.Bold,
+                // The Box centres the text's LAYOUT BOX, but Android pads that box with the
+                // font's full ascent/descent by default, so a glyph with no descender (←, ↑, ⌕)
+                // doesn't land where the eye expects. Dropping the font padding is the part of
+                // this that is unambiguously right. A first attempt also added
+                // LineHeightStyle(Center + Trim.Both) on top, which overshot and pushed the
+                // arrow BELOW centre — trimming the leading and re-centring double-corrects.
+                style = TextStyle(platformStyle = PlatformTextStyle(includeFontPadding = false)),
             )
         }
     }
@@ -300,39 +316,41 @@ fun StatusChip(text: String, color: Color = MaterialTheme.colorScheme.primary) {
     }
 }
 
+/** Tappable search bar — deliberately NOT an editable TextField, so it never summons the Android
+ *  system IME. Tapping it (or the controller's A on the Search zone) opens the app's own D-pad +
+ *  touch keyboard (LibraryKeyboard), which owns and edits the query. Shows the current query, or
+ *  the placeholder when empty; mirrors the old field's look (rounded, leading ⌕, selected border). */
 @Composable
 fun SearchField(
     value: String,
-    onValueChange: (String) -> Unit,
+    onClick: () -> Unit,
     modifier: Modifier = Modifier,
     placeholder: String = "",
-    focusRequester: FocusRequester? = null,
     selected: Boolean = false,
 ) {
-    TextField(
-        value = value,
-        onValueChange = onValueChange,
-        modifier = modifier
-            .height(56.dp)
-            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-            .then(
-                if (selected) {
-                    Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(18.dp))
-                } else {
-                    Modifier
-                },
-            ),
-        singleLine = true,
-        placeholder = { Text(placeholder) },
-        leadingIcon = { Text("⌕", fontSize = 21.sp, fontWeight = FontWeight.Bold) },
+    Surface(
+        onClick = onClick,
+        modifier = modifier.height(56.dp),
         shape = RoundedCornerShape(18.dp),
-        colors = TextFieldDefaults.colors(
-            focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
-            unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
-            focusedIndicatorColor = Color.Transparent,
-            unfocusedIndicatorColor = Color.Transparent,
-        ),
-    )
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        border = if (selected) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("⌕", fontSize = 21.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.width(12.dp))
+            Text(
+                text = value.ifEmpty { placeholder },
+                color = if (value.isEmpty()) MaterialTheme.colorScheme.onSurfaceVariant
+                else MaterialTheme.colorScheme.onSurface,
+                fontSize = 16.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
 }
 
 @Composable

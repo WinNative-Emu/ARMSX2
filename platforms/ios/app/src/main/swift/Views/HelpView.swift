@@ -106,6 +106,14 @@ struct HelpView: View {
     @State private var selectedTopic: HelpTopic? = .item(section: 0, item: 0)
 #endif
 
+    private var backgroundConfigured: Bool {
+        settings.hasCustomBackground && settings.backgroundEnabledInSettings
+    }
+
+    private var backgroundActive: Bool {
+        backgroundConfigured
+    }
+
     var body: some View {
 #if targetEnvironment(macCatalyst)
         NavigationSplitView {
@@ -137,53 +145,53 @@ struct HelpView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .navigationSplitViewStyle(.balanced)
+        .containerBackground(backgroundActive ? Color.clear : Color(uiColor: .systemGroupedBackground), for: .navigation)
 #else
-        NavigationStack {
-            List {
-                ForEach(helpData) { section in
-                    Section {
-                        ForEach(section.items) { item in
-                            DisclosureGroup {
-                                Text(settings.localized(item.answer))
-                                    .font(.body)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.vertical, 4)
-                            } label: {
-                                Text(settings.localized(item.question))
-                                    .font(.body)
-                                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                                    .contentShape(Rectangle())
-                            }
-                        }
-                    } header: {
-                        Label(settings.localized(section.title), systemImage: section.icon)
-                    }
-                }
-
+        List {
+            ForEach(helpData) { section in
                 Section {
-                    HStack {
-                        Text(settings.localized("Version"))
-                        Spacer()
-                        Text(ARMSX2Bridge.buildVersion())
-                            .foregroundStyle(.secondary)
-                            .font(.caption)
-                    }
-                    Button {
-                        copyTroubleshootingInfo()
-                    } label: {
-                        Label(settings.localized("Copy Troubleshooting Info"), systemImage: "doc.on.doc")
-                    }
-                    if let copyStatusMessage {
-                        Text(settings.localized(copyStatusMessage))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    ForEach(section.items) { item in
+                        DisclosureGroup {
+                            Text(settings.localized(item.answer))
+                                .font(.body)
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 4)
+                        } label: {
+                            Text(settings.localized(item.question))
+                                .font(.body)
+                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
                     }
                 } header: {
-                    Label(settings.localized("About"), systemImage: "info.circle")
+                    Label(settings.localized(section.title), systemImage: section.icon)
                 }
             }
-            .navigationTitle(settings.localized("Help"))
+
+            Section {
+                HStack {
+                    Text(settings.localized("Version"))
+                    Spacer()
+                    Text(ARMSX2Bridge.buildVersion())
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                }
+                Button {
+                    copyTroubleshootingInfo()
+                } label: {
+                    Label(settings.localized("Copy Troubleshooting Info"), systemImage: "doc.on.doc")
+                }
+                if let copyStatusMessage {
+                    Text(settings.localized(copyStatusMessage))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Label(settings.localized("About"), systemImage: "info.circle")
+            }
         }
+        .navigationTitle(settings.localized("Help"))
+        .navigationBarTitleDisplayMode(.inline)
 #endif
     }
 

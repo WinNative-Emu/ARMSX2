@@ -255,11 +255,12 @@ bool AdapterUtils::GetAdapterAuto(Adapter* adapter, AdapterBuffer* buffer)
 #endif
 
 #if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
-			// iOS and Android don't expose the host routing table to apps
-			// (Android's /proc/net/route is SELinux-restricted, so GetGateways()
-			// returns empty and the gateway probe would reject every interface).
-			// Sockets mode only needs a usable IPv4 interface — the internal DHCP
-			// server injects the gateway — so accept on IPv4 alone.
+			// iOS and Android sandboxes cannot read the host route table
+			// (getifaddrs exposes no gateway; /proc/net/route is blocked on
+			// Android's scoped network on recent target SDKs). Sockets mode only
+			// needs a usable IPv4 interface; the internal DHCP gateway is injected
+			// later. Without this, Auto selection fails and net.cpp force-disables
+			// DEV9 ("connection device not found") even when wlan0 is up.
 			if (hasIPv4)
 			{
 				Console.WriteLn("DEV9: Socket: Auto selected adapter '%s' without gateway probe", pAdapter->ifa_name);
@@ -609,6 +610,15 @@ std::vector<IP_Address> AdapterUtils::GetDNS(const Adapter* adapter)
 		collection.push_back(IP_Address{{{8, 8, 8, 8}}});
 		return collection;
 #else
+		// Android is DELIBERATELY not in the fallback above. Advertising real public
+		// resolvers makes the PS2 send DNS queries out through the sockets UDP forward
+		// path, whose session timing is wall-clock (steady_clock); under fast-forward the
+		// emulated retransmit/timeout cadence outruns the real round-trip and DNS fails
+		// (#379, worked on 2.6.3 which returned an empty list here). Leaving it empty
+		// restores 2.6.3 behaviour. A user who needs name resolution can set DNS to
+		// Internal in Network settings, which resolves host-side via getaddrinfo and is
+		// fast-forward-safe. The GetAdapterAuto gateway-probe skip (the actual "adapter
+		// not found" fix) is a separate hunk and stays.
 		Console.Error("DEV9: Failed to open /etc/resolv.conf");
 		return collection;
 #endif

@@ -381,6 +381,7 @@ enum DynamicBackgroundGeometry {
 
 struct DynamicParticleOverlay: View {
   let theme: DynamicBackgroundTheme
+  @Environment(\.menuBackgroundSessionStart) private var menuBackgroundSessionStart
 
   @ViewBuilder
   var body: some View {
@@ -388,6 +389,7 @@ struct DynamicParticleOverlay: View {
       PlayStation3XMBMartMetalSurface(
         settings: settings.playStation3XMB,
         theme: theme,
+        sessionStartTime: menuBackgroundSessionStart.timeIntervalSinceReferenceDate,
         renderMode: .particlesOnly,
         particleControls: martParticleControls
       )
@@ -395,7 +397,7 @@ struct DynamicParticleOverlay: View {
     } else {
       TimelineView(.animation(minimumInterval: 1 / 30)) { timeline in
         let time = timeline.date.timeIntervalSinceReferenceDate
-        Canvas { context, size in
+        Canvas(rendersAsynchronously: true) { context, size in
           context.blendMode = .plusLighter
           drawParticles(
             context: &context,

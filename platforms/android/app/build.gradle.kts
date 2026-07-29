@@ -11,6 +11,9 @@ val armsx2NativeLibName = providers.gradleProperty("armsx2.nativeLibName").orEls
 val armsx2Pgo = providers.gradleProperty("armsx2.pgo").orElse("none") // none | generate | optimize
 val armsx2PgoProfile = providers.gradleProperty("armsx2.pgoProfile").orElse("") // abs path to merged .profdata (optimize)
 val armsx2HostPageSize = providers.gradleProperty("armsx2.hostPageSize").orElse("0x1000")
+// DIAGNOSTIC ONLY (-Parmsx2.recTestHooks=true): compiles the EERecFallback opcode-group
+// interpreter bisect into the EE recompiler. Never set for a shipped build.
+val armsx2RecTestHooks = providers.gradleProperty("armsx2.recTestHooks").orElse("false")
 val armsx2ApplicationId = providers.gradleProperty("armsx2.applicationId").orElse("com.armsx2")
 val armsx2SigningPropertiesFile = rootProject.file("armsx2_keystore.properties")
 val armsx2SigningProperties = Properties().apply {
@@ -25,6 +28,43 @@ val armsx2PlaySigningReady = listOf("storeFile", "storePassword", "keyAlias", "k
 if (armsx2SigningPropertiesFile.isFile && !armsx2PlaySigningReady) {
     throw GradleException("armsx2_keystore.properties is missing one or more required signing keys.")
 }
+
+// Runtime resources (GameDB, shaders, fonts, icons) have a single canonical copy
+// at <repo>/bin/resources — the same tree the desktop/Linux build ships via
+// pcsx2_copy_runtime_resources. Rather than commit a third drifting copy under
+// src/main/assets, generate the APK's assets/resources from it at build time:
+// sync bin/resources (minus the Windows-only dx11 shaders the mobile backends
+// never compile) plus the canonical mobile GameDB overlay into a generated
+// assets root. Genuine Android-only extras (patches.zip, the Noto color emoji
+// font) stay committed under src/main/assets/resources and AGP merges the roots.
+val generateSharedResources by tasks.registering(Sync::class) {
+    val repoRoot = rootProject.layout.projectDirectory.dir("../..")
+    from(repoRoot.dir("bin/resources")) {
+        // Windows-only DX11 shaders the mobile backends never compile. The path is
+        // shaders/dx11/ (relative to bin/resources), so "dx11/**" alone never matched.
+        exclude("**/dx11/**")
+    }
+    from(repoRoot.file("bin/resources-overlay/armsx2_overrides.yaml"))
+    into(layout.buildDirectory.dir("generated/sharedResources/resources"))
+}
+
+// AGP 9.2.1 rejects a Provider in assets.srcDir (the sourceSets block below uses a concrete path),
+// so wire the dependency bmd's Provider form would have carried implicitly. The generated assets
+// dir is consumed by several AGP tasks — asset merge AND lint's model/analyze passes — so declare
+// generateSharedResources as a dependency of every one, plus the preBuild anchor. Gradle 9's strict
+// validation fails the build otherwise ("uses this output without declaring a dependency").
+tasks.matching { t ->
+    t.name == "preBuild" || t.name.endsWith("Assets") || t.name.contains("Lint")
+}.configureEach {
+    dependsOn(generateSharedResources)
+}
+
+// Private, optional Discord SDK location. Set by release CI; absent in every public clone.
+// Deliberately not a product flavour: one release variant, and the only difference is whether this
+// directory was there at build time.
+val armsx2DiscordSdkDir: String? =
+    (System.getenv("DISCORD_SDK_DIR") ?: providers.gradleProperty("DISCORD_SDK_DIR").orNull)
+        ?.takeIf { File(it, "include/discordpp.h").isFile }
 
 android {
     namespace = "com.armsx2"
@@ -52,6 +92,22 @@ android {
         }
     }
 
+    // The SDK's .so comes from the private directory, never from the repository.
+    sourceSets {
+        getByName("main") {
+            if (armsx2DiscordSdkDir != null) jniLibs.srcDir(armsx2DiscordSdkDir)
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // The Discord .aar ships this .so AND the private dir supplies an identical copy for CMake
+            // to link against. Byte-identical (same file, extracted from the same .aar), so taking
+            // either is correct — without this the merger fails on the duplicate.
+            pickFirsts += "**/libdiscord_partner_sdk.so"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -73,7 +129,13 @@ android {
                 cmake {
                     arguments += "-DANDROID=true"
                     arguments += "-DANDROID_STL=c++_static"
+                    // Passed explicitly rather than relying on the environment leaking through to
+                    // the CMake invocation, so a build is reproducible from the Gradle property
+                    // alone. Absent = Discord compiles out.
+                    armsx2DiscordSdkDir?.let { arguments += "-DDISCORD_SDK_DIR=$it" }
                     arguments += "-DCMAKE_BUILD_TYPE=Release"
+                    if (armsx2RecTestHooks.get() == "true")
+                        arguments += "-DENABLE_RECOMPILER_TEST_HOOKS=ON"
                     // PGO (profile-guided optimization), opt-in via -Parmsx2.pgo:
                     //   generate -> instrumented build (writes .profraw on-device); LTO OFF
                     //              for a faster/cleaner instrument pass.
@@ -110,6 +172,10 @@ android {
                 cmake {
                     arguments += "-DANDROID=true"
                     arguments += "-DANDROID_STL=c++_static"
+                    // Passed explicitly rather than relying on the environment leaking through to
+                    // the CMake invocation, so a build is reproducible from the Gradle property
+                    // alone. Absent = Discord compiles out.
+                    armsx2DiscordSdkDir?.let { arguments += "-DDISCORD_SDK_DIR=$it" }
                     arguments += "-DCMAKE_BUILD_TYPE=Debug"
                     arguments += "-DARMSX2_EMUCORE_LIBRARY_NAME=${armsx2NativeLibName.get()}"
                     arguments += "-DARMSX2_ANDROID_HOST_PAGE_SIZE=${armsx2HostPageSize.get()}"
@@ -132,12 +198,28 @@ android {
         create("github") {
             dimension = "store"
             buildConfigField("boolean", "STORAGE_ALL_FILES", "true")
+            // In-app GitHub-release updater. Github flavor only — Play forbids self-updating,
+            // so the real updater + REQUEST_INSTALL_PACKAGES live in src/github and this stays
+            // false for play (which uses the src/play no-op stub).
+            buildConfigField("boolean", "IN_APP_UPDATER", "true")
         }
         create("play") {
             dimension = "store"
             buildConfigField("boolean", "STORAGE_ALL_FILES", "false")
+            buildConfigField("boolean", "IN_APP_UPDATER", "false")
         }
     }
+    // Merge the generated bin/resources tree in as a second assets root. Passing
+    // the task's output provider (not a bare path) makes AGP's asset-merge tasks
+    // depend on generateSharedResources, so the tree is materialized before it is
+    // packaged. destinationDir is .../resources; its parent is the assets root.
+    sourceSets.named("main") {
+        // Concrete File — AGP 9.2.1's SourceSet API rejects Provider instances (bmd's
+        // `generateSharedResources.map { }` form throws "cannot add Provider instances"). The
+        // task dependency that materialises this tree is wired via tasks.matching above.
+        assets.srcDir(layout.buildDirectory.dir("generated/sharedResources").get().asFile)
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
@@ -191,6 +273,30 @@ tasks.named("clean") {
 }
 
 dependencies {
+    // Discord Social SDK, staged by hand rather than consumed as an .aar. The .aar's manifest
+    // declares RECORD_AUDIO plus four foreground-service permissions and Bluetooth, all for its
+    // voice features, and the manifest merger would fold every one of them into ARMSX2 -- the Play
+    // listing would then show "Microphone" and need a data-safety declaration for a feature we do
+    // not ship. Taking the pieces we want means we inherit no permissions at all: the native lib
+    // lives in jniLibs, the headers under cpp/3rdparty/discord, and AuthenticationActivity is
+    // declared in our own manifest. libwebrtc is here because the SDK's audio classes reference it
+    // and would otherwise NoClassDefFoundError if any init path touches them.
+    // The .aar, not its unpacked pieces: this is what delivers the SDK's manifest entries, its
+    // consumer proguard rules and its transitive dependencies. Reconstructing those by hand cost
+    // three separate bugs (boot crash, missing <queries>, missing androidx.browser).
+    // Only when a private SDK directory was supplied. A public clone has none, so the whole
+    // feature compiles out rather than failing to resolve — see DISCORD_SDK_DIR in cpp/CMakeLists.
+    if (armsx2DiscordSdkDir != null) {
+        implementation(group = "", name = "discord_partner_sdk", ext = "aar")
+    }
+    // REQUIRED by the Social SDK's authorization flow — its AuthenticationActivity drives sign-in
+    // through Custom Tabs, and without these classes the OAuth round trip completes and the result
+    // is then dropped on the Java side, with no error anywhere. Discord's Android guide lists it as
+    // a dependency; we never got it because hand-staging the .aar bypasses the mechanism that
+    // delivers a library's transitive dependencies. Third time that has bitten (proguard keeps,
+    // <queries>, now this) — assume anything an .aar would have brought is missing until checked.
+    implementation(libs.androidx.browser)
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)

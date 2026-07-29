@@ -10,8 +10,13 @@
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
 #include "GSDumpReplayer.h"
+#ifdef ENABLE_VULKAN
+#include "GS/Renderers/Vulkan/VKLibretro.h"
+#endif
 #include "Host.h"
 #include "PerformanceMetrics.h"
+#include "common/Console.h" // @@ANDROID_STALEFRAMES@@ diagnostic
+#include "common/HostSys.h" // GetCPUTicks — present-cap pacer
 #include "pcsx2/Config.h"
 #include "VMManager.h"
 
@@ -52,6 +57,15 @@ static Common::Timer::Value s_last_gpu_reset_time;
 
 // Screen alignment
 static GSDisplayAlignment s_display_alignment = GSDisplayAlignment::Center;
+// Android portrait (GitHub #375): top-align the render instead of vertically centering it,
+// so the bottom of a tall screen is free for touch controls. Applied only when the window
+// is portrait (height > width); read live per-present. Default on; user can switch to Center.
+static bool s_portrait_render_top = true;
+// Pixels to leave clear at the top of a portrait window when top-aligning. Supplied by the Android
+// side from the display cutout, so a punch-hole or notch camera does not sit on top of the image.
+// Zero everywhere else; only consulted on the top-align path, which by definition has spare room
+// below it (that space is what the touch controls occupy).
+static int s_portrait_render_top_inset = 0;
 
 // Defined further down alongside the present path. Forward-declared because Merge() needs the
 // frame's on-screen rect to size the RetroArch shader chain, and it runs before them.
@@ -357,6 +371,8 @@ static float GetCurrentAspectRatioFloat(bool is_progressive)
 			return 16.0f / 9.0f;
 		case AspectRatioType::R10_7:
 			return 10.0f / 7.0f;
+		case AspectRatioType::R21_9:
+			return 21.0f / 9.0f;
 	}
 }
 
@@ -388,6 +404,10 @@ static GSVector4 CalculateDrawDstRect(s32 window_width, s32 window_height, const
 	else if (EmuConfig.CurrentAspectRatio == AspectRatioType::R10_7)
 	{
 		targetAr = 10.0f / 7.0f;
+	}
+	else if (EmuConfig.CurrentAspectRatio == AspectRatioType::R21_9)
+	{
+		targetAr = 21.0f / 9.0f;
 	}
 
 	const float crop_adjust = (static_cast<float>(src_rect.width()) / static_cast<float>(src_size.x)) /
@@ -464,7 +484,12 @@ static GSVector4 CalculateDrawDstRect(s32 window_width, s32 window_height, const
 	}
 	else
 	{
-		switch (alignment)
+		// Android #375: top-align the render in a PORTRAIT window (bottom stays free for
+		// touch controls). Vertical only — horizontal alignment (target_x) is unchanged.
+		GSDisplayAlignment v_align = alignment;
+		if (s_portrait_render_top && window_height > window_width)
+			v_align = GSDisplayAlignment::LeftOrTop;
+		switch (v_align)
 		{
 			case GSDisplayAlignment::Center:
 				target_y = (f_height - target_height) * 0.5f;
@@ -474,7 +499,12 @@ static GSVector4 CalculateDrawDstRect(s32 window_width, s32 window_height, const
 				break;
 			case GSDisplayAlignment::LeftOrTop:
 			default:
-				target_y = 0.0f;
+				// Push clear of a notch/punch-hole camera when the host asked for it. Only applies
+				// to the top-align case; this branch already knows the render is shorter than the
+				// window, so shifting it down cannot clip the bottom.
+				target_y = (s_portrait_render_top && window_height > window_width)
+					? static_cast<float>(s_portrait_render_top_inset)
+					: 0.0f;
 				break;
 		}
 	}
@@ -626,6 +656,25 @@ void GSRenderer::EndPresentFrame()
 	ImGuiManager::NewFrame();
 }
 
+void GSRenderer::SubmitVsync(u32 field, bool registers_written)
+{
+	GSBackQueue::VsyncRecord rec;
+	rec.field = field;
+	rec.registers_written = registers_written;
+	rec.idle_frame = IsIdleFrame(); // front-computable: compares serials against the last frame's
+
+	// VSYNC is never queued: present runs on the MTGS thread behind a drain, so
+	// the back thread stays off the GSDevice on present paths entirely (which
+	// is also what keeps SW + GL-present devices legal in queued modes).
+	DrainBackQueue();
+	ExecVsyncRecord(rec);
+}
+
+void GSRenderer::ExecVsyncRecord(const GSBackQueue::VsyncRecord& rec)
+{
+	VSync(rec.field, rec.registers_written, rec.idle_frame);
+}
+
 void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 {
 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
@@ -679,10 +728,121 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		}
 	}
 
+	// ★ Manual frame skip and the max-presented-FPS cap. Both were fully implemented in GS.cpp with
+	// JNI setters wired to live UI controls, and both had ZERO readers — GSGetManualFrameSkip() and
+	// GSGetMaxPresentInterval() were never called, so the in-game "Frame Skip" picker (0..5) and the
+	// FPS cap silently did nothing. The GS.cpp comments named this exact function as the reader, so
+	// the consumer was lost rather than never written. Restored here.
+	//
+	// Both skip only the PRESENT: Merge() and the rest of the frame still run below, so emulation
+	// and GS state are untouched and only display rate changes.
+	// Set when the user ASKED for a dropped present, so the stale-frame diagnostic below doesn't
+	// report their own frame-skip/FPS-cap settings as a fault.
+	bool deliberate_present_skip = false;
+	{
+		const u32 manual_skip = GSGetManualFrameSkip();
+		if (manual_skip > 0)
+		{
+			// Present 1 frame in every (manual_skip + 1).
+			m_manual_frameskip_phase = (m_manual_frameskip_phase + 1) % (manual_skip + 1);
+			if (m_manual_frameskip_phase != 0)
+			{
+				skip_frame = true;
+				deliberate_present_skip = true;
+			}
+		}
+		else
+		{
+			m_manual_frameskip_phase = 0;
+		}
+	}
+	if (!skip_frame && !GSGetPresentCapSuspended())
+	{
+		// Accumulator pacer, not a simple "too soon?" test: advancing the deadline by exactly one
+		// interval holds the requested AVERAGE rate even when it isn't a whole division of the
+		// source (47 or 55 fps work, not just 30/20/15). Resynchronise when we fall more than one
+		// interval behind, so a hitch can't bank credit and then burst.
+		const u64 interval = GSGetMaxPresentInterval();
+		if (interval > 0)
+		{
+			const u64 now = GetCPUTicks();
+			if (m_next_present_deadline == 0 || now + interval < m_next_present_deadline)
+				m_next_present_deadline = now; // first frame, or the clock jumped backwards
+			if (now < m_next_present_deadline)
+			{
+				skip_frame = true;
+				deliberate_present_skip = true;
+			}
+			else if ((now - m_next_present_deadline) > interval)
+				m_next_present_deadline = now + interval; // far behind: restart the cadence
+			else
+				m_next_present_deadline += interval;
+		}
+		else
+		{
+			m_next_present_deadline = 0;
+		}
+	}
+
 	const bool blank_frame = !Merge(field);
+
+	// ★ @@ANDROID_STALEFRAMES@@ — diagnostic for "the picture freezes but emulation keeps running".
+	// Measured on a Retroid Pocket 6: SurfaceFlinger presents steadily at 120 Hz straight through
+	// the freeze (worst present gap across a whole session was 142 ms, frame count never dipped),
+	// so frame DELIVERY is healthy and a stale image can only come from frame PRODUCTION here.
+	// There are exactly three ways this function fails to put something new on screen: the
+	// duplicate-frame skip above, the device's present throttle, and Merge() yielding nothing.
+	// Logged only when a RUN of such frames ends, and only if it was long enough to be visible, so
+	// a healthy frame costs one branch. GS thread only, hence plain statics.
+	{
+		const bool stale = !deliberate_present_skip &&
+			(skip_frame || blank_frame || g_gs_device->ShouldSkipPresentingFrame());
+		static u32 s_stale_run = 0, s_stale_skipdup = 0, s_stale_blank = 0, s_stale_throttle = 0;
+		if (stale)
+		{
+			s_stale_run++;
+			if (skip_frame)
+				s_stale_skipdup++;
+			if (blank_frame)
+				s_stale_blank++;
+			if (g_gs_device->ShouldSkipPresentingFrame())
+				s_stale_throttle++;
+		}
+		else
+		{
+			// ~10 frames is the shortest run a person could notice; below that it is normal churn.
+			if (s_stale_run >= 10)
+			{
+				Console.Warning("@@ANDROID_STALEFRAMES@@ run=%u frames (skipdup=%u blank=%u "
+								"throttle=%u) fpsmethod=%d",
+					s_stale_run, s_stale_skipdup, s_stale_blank, s_stale_throttle,
+					static_cast<int>(PerformanceMetrics::GetInternalFPSMethod()));
+			}
+			s_stale_run = 0;
+			s_stale_skipdup = 0;
+			s_stale_blank = 0;
+			s_stale_throttle = 0;
+		}
+	}
 
 	m_last_draw_n = s_n;
 	m_last_transfer_n = s_transfer_n;
+
+	// ★ Age the texture pool on EVERY frame, including skipped presents. AgePool() is what trims
+	// stale textures and it is the ONLY place GSDevice::m_frame advances, so parking it on the skip
+	// path had two compounding costs:
+	//   - the pool stops being trimmed and grows to its limit, at which point FetchSurface starts
+	//     handing back textures recycled in the current frame instead of fresh ones;
+	//   - m_frame freezes, so every texture recycled during the run looks "used this frame" and the
+	//     fallback above is taken even more often.
+	// Reported as "the game runs slow in some scenes, and changing ANY on-screen-display option
+	// makes it full speed again" — that is not the OSD, it is the settings apply calling
+	// g_gs_device->PurgePool() (GS.cpp:334/:1029) and emptying the bloated pool. With
+	// SkipDuplicateFrames on by default, plus the frame-skip and FPS-cap paths above, skipped
+	// presents are common, so the pool could go a long time without aging. Aging is about texture
+	// lifetime, not presentation, so it belongs on both paths.
+	if (!idle_frame)
+		g_gs_device->AgePool();
 
 	// Skip presentation when running uncapped while vsync is on.
 	if (skip_frame || g_gs_device->ShouldSkipPresentingFrame())
@@ -694,8 +854,6 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	}
 	else
 	{
-		if (!idle_frame)
-			g_gs_device->AgePool();
 
 		g_perfmon.EndFrame(idle_frame);
 
@@ -708,9 +866,40 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		GSTexture* current = g_gs_device->GetCurrent();
 		if (current && !blank_frame)
 		{
+#ifdef ENABLE_VULKAN
+			// Libretro: the output canvas is a backbuffer this side sizes, not
+			// a real window, so track the merged frame — expanded to the target
+			// aspect ratio (the internal-resolution screenshot rule) and
+			// clamped to the geometry advertised to the frontend — so internal
+			// upscale survives the present pass. Resize before the draw rect
+			// below is computed so the whole frame stays consistent.
+			if (VKLibretro::Active)
+			{
+				const float aspect = GetCurrentAspectRatioFloat(GetVideoMode() == GSVideoMode::SDTV_480P);
+				float fwidth = static_cast<float>(current->GetWidth());
+				float fheight = static_cast<float>(current->GetHeight());
+				if (fwidth / fheight >= aspect)
+					fheight = fwidth / aspect;
+				else
+					fwidth = fheight * aspect;
+				const float clamp_scale = std::min({1.0f,
+					static_cast<float>(VKLibretro::kMaxCanvasWidth) / fwidth,
+					static_cast<float>(VKLibretro::kMaxCanvasHeight) / fheight});
+				const u32 canvas_width = std::max(1, static_cast<int>(std::lround(fwidth * clamp_scale)));
+				const u32 canvas_height = std::max(1, static_cast<int>(std::lround(fheight * clamp_scale)));
+				if (canvas_width != static_cast<u32>(g_gs_device->GetWindowWidth()) ||
+					canvas_height != static_cast<u32>(g_gs_device->GetWindowHeight()))
+				{
+					g_gs_device->ResizeWindow(canvas_width, canvas_height, g_gs_device->GetWindowScale());
+					ImGuiManager::WindowResized();
+				}
+			}
+#endif
+
 			src_rect = CalculateDrawSrcRect(current, m_real_size);
 			src_uv = GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy();
-			draw_rect = CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
+			const GSVector2i pres_size = g_gs_device->GetPresentationSize();
+			draw_rect = CalculateDrawDstRect(pres_size.x, pres_size.y,
 				src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
 				GetVideoMode() == GSVideoMode::SDTV_480P);
 			s_last_draw_rect = draw_rect;
@@ -1034,7 +1223,8 @@ void GSRenderer::PresentCurrentFrame()
 		{
 			const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
 			const GSVector4 src_uv(GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy());
-			const GSVector4 draw_rect(CalculateDrawDstRect(g_gs_device->GetWindowWidth(), g_gs_device->GetWindowHeight(),
+			const GSVector2i pres_size = g_gs_device->GetPresentationSize();
+			const GSVector4 draw_rect(CalculateDrawDstRect(pres_size.x, pres_size.y,
 				src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
 				GetVideoMode() == GSVideoMode::SDTV_480P));
 			s_last_draw_rect = draw_rect;
@@ -1080,8 +1270,21 @@ void GSSetDisplayAlignment(GSDisplayAlignment alignment)
 	s_display_alignment = alignment;
 }
 
+void GSSetPortraitRenderTopInset(int pixels)
+{
+	s_portrait_render_top_inset = (pixels > 0) ? pixels : 0;
+}
+
+void GSSetPortraitRenderTopAlign(bool enabled)
+{
+	s_portrait_render_top = enabled;
+}
+
 bool GSRenderer::BeginCapture(std::string filename, const GSVector2i& size)
 {
+	// GV7-2: capture start/stop can run mid-frame on the MTGS thread; teardown
+	// frees download textures on the device the back thread may be drawing on.
+	DrainBackQueue();
 	const GSVector2i capture_resolution = (size.x != 0 && size.y != 0) ?
 											  size :
 											  (GSConfig.VideoCaptureAutoResolution ?
@@ -1095,6 +1298,7 @@ bool GSRenderer::BeginCapture(std::string filename, const GSVector2i& size)
 
 void GSRenderer::EndCapture()
 {
+	DrainBackQueue(); // see BeginCapture
 	GSCapture::EndCapture();
 }
 
@@ -1111,6 +1315,11 @@ bool GSRenderer::IsIdleFrame() const
 bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
 	u32* width, u32* height, std::vector<u32>* pixels)
 {
+	// GV7-2: mid-frame screenshot issues device calls (CreateRenderTarget /
+	// StretchRect) on the MTGS thread; the back thread may be mid-draw on the
+	// same device. The vsync-path callers are already post-drain (no-op there).
+	DrainBackQueue();
+
 	GSTexture* const current = g_gs_device->GetCurrent();
 	if (!current)
 	{

@@ -47,8 +47,12 @@ namespace ImGuiManager
 	/// Updates scaling of the on-screen elements.
 	void RequestScaleUpdate();
 
-	/// Sets safe-area insets for OSD elements (iOS rounded-corner clearance).
+	/// Sets safe-area insets for OSD elements, in physical pixels. Safe to call from any thread,
+	/// so the frontend can push straight from its layout callback.
 	void SetOSDSafeAreaInsets(float left, float top, float right, float bottom);
+
+	/// Returns the safe-area insets, in physical pixels. Any pointer may be null.
+	void GetOSDSafeAreaInsets(float* left, float* top, float* right, float* bottom);
 
 	/// Rebuilds the ImGui font atlas using current settings.
 	void ReloadFonts();

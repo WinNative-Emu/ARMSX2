@@ -60,6 +60,11 @@ import java.io.File
 fun PatchManagerScreen(onBack: () -> Unit, game: GameInfo? = null, viewModel: PatchManagerViewModel = viewModel()) {
     val state = viewModel.state.value
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(viewModel::import) }
+    // Folder import: cheats arrive as a folder of files far more often than one at a time, and the
+    // single-file picker made adding a set a repetitive chore. Requested by Fun (SD712).
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        uri?.let(viewModel::importFolder)
+    }
     // Keyed on the game (this screen shares one Activity-scoped VM with the settings tab), and
     // resets the online browser first so a previous game's fetched results don't linger here.
     LaunchedEffect(game?.uri) { viewModel.resetOnlineForGame(); viewModel.refresh() }
@@ -71,9 +76,11 @@ fun PatchManagerScreen(onBack: () -> Unit, game: GameInfo? = null, viewModel: Pa
                 leading = { RoundAction("←", str("action.back"), onBack) },
                 actions = {
                     RoundAction("＋", str("action.import"), { picker.launch(arrayOf("text/plain", "application/octet-stream", "*/*")) })
+                    RoundAction("🗀", str("patches.import.folder"), { folderPicker.launch(null) })
                     RoundAction("↻", str("games.card.refresh"), viewModel::refresh)
                 },
             )
+            PatchDisclaimer()
             OnlineBrowser(state, viewModel, game, Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp))
             BoxWithConstraints(Modifier.fillMaxWidth()) {
                 val compact = maxWidth < 820.dp
@@ -96,12 +103,37 @@ fun PatchManagerScreen(onBack: () -> Unit, game: GameInfo? = null, viewModel: Pa
         }
     }
     (state.error ?: state.message)?.let { message ->
+        androidx.compose.runtime.DisposableEffect(Unit) {
+            com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.POPUP_OPEN)
+            onDispose { com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.POPUP_CLOSE) }
+        }
         AlertDialog(
             onDismissRequest = viewModel::dismissMessage,
             title = { Text(if (state.error == null) str("action.ok") else str("patches.dialog.patchesAndCheats")) },
             text = { Text(message) },
             confirmButton = { TextButton(onClick = viewModel::dismissMessage) { Text(str("action.ok")) } },
         )
+    }
+}
+
+// Outdated cheats/patches (built for the old 1.7 core) are our #1 cause of false "it broke
+// in the new version" reports — this warning sits on both patch-screen entry points.
+@Composable
+private fun PatchDisclaimer() {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Text("⚠", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+            Text(str("patches.disclaimer"), style = MaterialTheme.typography.bodySmall)
+        }
     }
 }
 
@@ -130,6 +162,7 @@ fun PatchesSettingsTab(game: GameInfo? = null, viewModel: PatchManagerViewModel 
             RoundAction("＋", str("action.import"), { picker.launch(arrayOf("text/plain", "application/octet-stream", "*/*")) })
             RoundAction("↻", str("games.card.refresh"), viewModel::refresh)
         }
+        PatchDisclaimer()
         OnlineBrowser(state, viewModel, game, Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp))
         BoxWithConstraints(Modifier.fillMaxWidth()) {
             val compact = maxWidth < 820.dp
@@ -151,6 +184,10 @@ fun PatchesSettingsTab(game: GameInfo? = null, viewModel: PatchManagerViewModel 
         }
     }
     (state.error ?: state.message)?.let { message ->
+        androidx.compose.runtime.DisposableEffect(Unit) {
+            com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.POPUP_OPEN)
+            onDispose { com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.POPUP_CLOSE) }
+        }
         AlertDialog(
             onDismissRequest = viewModel::dismissMessage,
             title = { Text(if (state.error == null) str("action.ok") else str("patches.dialog.patchesAndCheats")) },
@@ -255,6 +292,25 @@ private fun OnlineBrowser(
                     if (state.onlineTitle.isNotBlank()) {
                         Text(state.onlineTitle, style = MaterialTheme.typography.titleSmall)
                     }
+                    // Install/Refresh sit ABOVE the lists. They used to render after both sections,
+                    // so with a large cheat list (54 for GoW2, often far more) the Install button
+                    // was pushed off the bottom of the screen: users ticked a patch, found no way
+                    // to apply it, and backed out — and the tick is only a transient selection, so
+                    // nothing was ever installed and the tick was gone on return. Pinned above the
+                    // lists, the action stays reachable no matter how long they get.
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Button(
+                            onClick = viewModel::installSelected,
+                            enabled = state.onlineSelected.isNotEmpty(),
+                            modifier = Modifier.controllerFocusable("patches.online.install", onConfirm = { if (state.onlineSelected.isNotEmpty()) viewModel.installSelected() }),
+                        ) {
+                            Text("${str("patches.online.install")} (${state.onlineSelected.size})")
+                        }
+                        TextButton(
+                            onClick = { viewModel.fetchOnline(game) },
+                            modifier = Modifier.controllerFocusable("patches.online.refresh", onConfirm = { viewModel.fetchOnline(game) }),
+                        ) { Text(str("games.card.refresh")) }
+                    }
                     // Patches and cheats each get their own collapsible section. Patches (few — the
                     // whole point of searching) expand by default; cheats (often thousands) collapse
                     // by default, which kills BOTH the endless scroll AND the lag: a collapsed
@@ -275,19 +331,6 @@ private fun OnlineBrowser(
                                 OnlineEntryRow(entry, entry.name in state.onlineSelected) { viewModel.toggleOnline(entry.name) }
                             }
                         }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Button(
-                            onClick = viewModel::installSelected,
-                            enabled = state.onlineSelected.isNotEmpty(),
-                            modifier = Modifier.controllerFocusable("patches.online.install", onConfirm = { if (state.onlineSelected.isNotEmpty()) viewModel.installSelected() }),
-                        ) {
-                            Text("${str("patches.online.install")} (${state.onlineSelected.size})")
-                        }
-                        TextButton(
-                            onClick = { viewModel.fetchOnline(game) },
-                            modifier = Modifier.controllerFocusable("patches.online.refresh", onConfirm = { viewModel.fetchOnline(game) }),
-                        ) { Text(str("games.card.refresh")) }
                     }
                 }
             }
@@ -364,11 +407,42 @@ private fun CollapsibleOnlineSection(
 
 @Composable
 private fun PatchFiles(state: PatchManagerUiState, viewModel: PatchManagerViewModel, modifier: Modifier) {
+    // The whole installed list folds away. A pnach pulled from the downloader can carry hundreds of
+    // codes, and with the list open there was no way past it to the rest of the screen.
+    var listOpen by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(true) }
     Column(modifier) {
-        SectionTitle(str("patches.installedHeader"), state.files.size.toString())
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { listOpen = !listOpen },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SectionTitle(
+                str("patches.installedHeader"),
+                state.files.size.toString(),
+                Modifier.weight(1f),
+            )
+            if (state.files.isNotEmpty()) {
+                Text(
+                    if (listOpen) "▾" else "▸",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                )
+            }
+        }
+        if (state.bundledEntry.isNotBlank()) {
+            BundledPatchCard(
+                entry = state.bundledEntry,
+                cheats = state.bundledCheats,
+                unlabelled = state.bundledUnlabelled,
+                onExtract = viewModel::extractBundled,
+            )
+            Spacer(Modifier.height(8.dp))
+        }
         if (state.files.isEmpty()) {
             PatchFilesEmptyState()
-        } else {
+        } else if (listOpen) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 state.files.forEach { file ->
                     val expanded = state.localExpandedPath == file.absolutePath
@@ -378,10 +452,60 @@ private fun PatchFiles(state: PatchManagerUiState, viewModel: PatchManagerViewMo
                         cheats = if (expanded) state.localCheats else emptyList(),
                         onExpand = { viewModel.expandLocal(file) },
                         onToggleCheat = viewModel::toggleLocalCheat,
+                        onSetAllCheats = viewModel::setAllLocalCheats,
                         onDelete = { viewModel.delete(file) },
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * What ARMSX2's own patches.zip is doing to this game.
+ *
+ * Exists because that was previously invisible: the OSD would say "3 game patches are active" and
+ * the manager showed an empty list, because it only knows about files on disk. Reported by Rei
+ * Ayanami, who correctly concluded there was nothing to find.
+ */
+@Composable
+private fun BundledPatchCard(
+    entry: String,
+    cheats: List<PatchRepo.LocalCheat>,
+    unlabelled: Int,
+    onExtract: () -> Unit,
+) {
+    Surface(
+        Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.46f)),
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                str("patches.bundled.header"),
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                str("patches.bundled.explain"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(entry, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            cheats.forEach { cheat ->
+                val unnamed = cheat.name.equals("Unlabelled", true)
+                Text(
+                    if (unnamed) "• ${cheat.name} — ${str("patches.bundled.alwaysOn")}" else "• ${cheat.name}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (unnamed) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurface,
+                )
+            }
+            TextButton(
+                onClick = onExtract,
+                modifier = Modifier.controllerFocusable("patches.bundled.extract", onConfirm = onExtract),
+            ) { Text(str("patches.bundled.extract")) }
         }
     }
 }
@@ -439,6 +563,7 @@ private fun PatchFileRow(
     cheats: List<PatchRepo.LocalCheat>,
     onExpand: () -> Unit,
     onToggleCheat: (String) -> Unit,
+    onSetAllCheats: (Boolean) -> Unit,
     onDelete: () -> Unit,
 ) {
     Surface(
@@ -470,6 +595,34 @@ private fun PatchFileRow(
                     )
                 } else {
                     Column(Modifier.padding(start = 34.dp, end = 12.dp, bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        // Above the list, not below it: a community pnach can run to a hundred
+                        // entries, and a control you have to scroll past all of them to reach is
+                        // no better than flipping them one at a time.
+                        if (cheats.size > 1) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                val anyOff = cheats.any { !it.enabled }
+                                val anyOn = cheats.any { it.enabled }
+                                TextButton(
+                                    onClick = { onSetAllCheats(true) },
+                                    enabled = anyOff,
+                                    modifier = Modifier.controllerFocusable(
+                                        "patches.allOn.${file.absolutePath}",
+                                        onConfirm = { if (anyOff) onSetAllCheats(true) },
+                                    ),
+                                ) { Text(str("patches.action.allOn")) }
+                                TextButton(
+                                    onClick = { onSetAllCheats(false) },
+                                    enabled = anyOn,
+                                    modifier = Modifier.controllerFocusable(
+                                        "patches.allOff.${file.absolutePath}",
+                                        onConfirm = { if (anyOn) onSetAllCheats(false) },
+                                    ),
+                                ) { Text(str("patches.action.allOff")) }
+                            }
+                        }
                         cheats.forEach { cheat -> LocalCheatRow(cheat) { onToggleCheat(cheat.name) } }
                     }
                 }

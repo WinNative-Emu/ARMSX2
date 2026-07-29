@@ -18,7 +18,9 @@ struct AppearanceSettingsView: View {
     @State private var showPrimaryPicker = false
     @State private var showLandscapePicker = false
     @State private var isAppearanceVisible = false
+    @State private var ownsExclusiveBackgroundPreview = false
     @Environment(\.menuTabIsActive) private var menuTabIsActive
+    @Environment(\.menuBackgroundHost) private var menuBackgroundHost
 
     var body: some View {
         Form {
@@ -45,7 +47,7 @@ struct AppearanceSettingsView: View {
                 ) { showLandscapePicker = true }
                 .modifier(BackgroundSourcePicker(isPresented: $showLandscapePicker, role: .landscape, existingAsset: { settings.backgroundLandscapeAsset }) { updateLandscape($0) })
             } header: {
-                Text(settings.localized("Library Background"))
+                Text(settings.localized("Background"))
             } footer: {
                 Text(settings.localized("Each orientation keeps its own background. Setting one never overwrites the other."))
             }
@@ -102,6 +104,32 @@ struct AppearanceSettingsView: View {
                 }
                 .padding(.vertical, 4)
             }
+
+            Section {
+                Toggle(isOn: $settings.backgroundEnabledInBIOS) {
+                    Label(settings.localized("BIOS"), systemImage: "cpu")
+                }
+                Toggle(isOn: $settings.backgroundEnabledInSettings) {
+                    Label(settings.localized("Settings"), systemImage: "gearshape")
+                }
+            } header: {
+                Text(settings.localized("Show Background In"))
+            } footer: {
+                Text(settings.localized("The background always shows behind Games. BIOS and Settings can be toggled independently. Dim or mute from the settings above."))
+            }
+
+            Section {
+                Toggle(isOn: $settings.clearLiquidGlassUI) {
+                    Label(settings.localized("Clear Liquid Glass UI"), systemImage: "rectangle.on.rectangle")
+                }
+                Toggle(isOn: $settings.gameCardZoomAnimationEnabled) {
+                    Label(settings.localized("Game-Card Zoom Animation"), systemImage: "rectangle.inset.filled.and.person.filled")
+                }
+            } header: {
+                Text(settings.localized("Interface"))
+            } footer: {
+                Text(settings.localized("Uses the clear Liquid Glass style for menu cards and controls. Turn this off to use the more opaque regular Liquid Glass style."))
+            }
         }
         .navigationTitle(settings.localized("Appearance"))
         .sheet(item: $presentedEditor, onDismiss: paletteEditorDidDismiss) { _ in
@@ -116,10 +144,15 @@ struct AppearanceSettingsView: View {
         }
         .onAppear {
             isAppearanceVisible = true
+            synchronizeExclusivePreview()
             dynamicPreferences = settings.dynamicAppearancePreferences
+        }
+        .onChange(of: menuTabIsActive) { _, _ in
+            synchronizeExclusivePreview()
         }
         .onDisappear {
             isAppearanceVisible = false
+            synchronizeExclusivePreview()
         }
     }
 
@@ -127,6 +160,21 @@ struct AppearanceSettingsView: View {
         isAppearanceVisible
             && menuTabIsActive
             && presentedEditor == nil
+    }
+
+    private func synchronizeExclusivePreview() {
+        let shouldOwnPreview = isAppearanceVisible && menuTabIsActive
+        guard shouldOwnPreview != ownsExclusiveBackgroundPreview,
+              let menuBackgroundHost else {
+            return
+        }
+
+        if shouldOwnPreview {
+            menuBackgroundHost.beginExclusivePreview()
+        } else {
+            menuBackgroundHost.endExclusivePreview()
+        }
+        ownsExclusiveBackgroundPreview = shouldOwnPreview
     }
 
     @ViewBuilder
@@ -172,11 +220,13 @@ struct AppearanceSettingsView: View {
 
     private func updatePrimary(_ asset: BackgroundAsset?) {
         if asset == nil { BackgroundStorage.remove(settings.backgroundPrimaryAsset) }
+        if asset != nil { settings.dynamicBackgroundsEnabled = false }
         settings.backgroundPrimaryAsset = asset
     }
 
     private func updateLandscape(_ asset: BackgroundAsset?) {
         if asset == nil { BackgroundStorage.remove(settings.backgroundLandscapeAsset) }
+        if asset != nil { settings.dynamicBackgroundsEnabled = false }
         settings.backgroundLandscapeAsset = asset
     }
 }

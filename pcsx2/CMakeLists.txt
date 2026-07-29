@@ -13,6 +13,10 @@ target_compile_features(PCSX2_FLAGS INTERFACE cxx_std_17)
 target_compile_definitions(PCSX2_FLAGS INTERFACE "${PCSX2_DEFS}")
 target_compile_options(PCSX2_FLAGS INTERFACE "${PCSX2_WARNINGS}")
 
+if(ENABLE_RECOMPILER_TEST_HOOKS)
+	target_compile_definitions(PCSX2_FLAGS INTERFACE PCSX2_RECOMPILER_TESTS)
+endif()
+
 # Check that people use the good file
 if(NOT TOP_CMAKE_WAS_SOURCED)
 	message(FATAL_ERROR "
@@ -133,7 +137,11 @@ set(pcsx2Sources
 	VU0microInterp.cpp
 	VU1micro.cpp
 	VU1microInterp.cpp
+	VU1Trace.cpp
 	VUflags.cpp
+	vu_capture.cpp
+	microVU_Divtrace.cpp
+	ee_divtrace.cpp
 	VUmicroMem.cpp
 	VUops.cpp
 )
@@ -195,10 +203,14 @@ set(pcsx2Headers
 	SupportURLs.h
 	StateWrapper.h
 	Vif_Dma.h
+	vu_capture.h
+	microVU_Divtrace.h
+	ee_divtrace.h
 	Vif.h
 	Vif_Unpack.h
 	VMManager.h
 	vtlb.h
+	VU1Trace.h
 	VUflags.h
 	VUmicro.h
 	VUops.h)
@@ -290,6 +302,7 @@ set(pcsx2DEV9Sources
 	DEV9/InternalServers/DHCP_Server.cpp
 	DEV9/InternalServers/DNS_Logger.cpp
 	DEV9/InternalServers/DNS_Server.cpp
+	DEV9/LocalLinkAdapter.cpp
 	DEV9/PacketReader/ARP/ARP_Packet.cpp
 	DEV9/PacketReader/ARP/ARP_PacketEditor.cpp
 	DEV9/PacketReader/IP/ICMP/ICMP_Packet.cpp
@@ -511,10 +524,23 @@ set(pcsx2GSSources
 	GS/Renderers/Common/GSDevice.cpp
 	GS/Renderers/Common/GSDirtyRect.cpp
 	GS/Renderers/Common/GSFunctionMap.cpp
+	# The GPU driver-bug database is keyed on the DRIVER, not the platform: Turnip, PanVK and the
+	# Qualcomm blob all ship outside Android too (ARM Linux handhelds — Rocknix, Batocera). Building
+	# these only under ANDROID made every rule dead on exactly the hardware we test on, which is how
+	# #442 went unmatched. The one Android-only dependency (sys/system_properties.h) is guarded
+	# inside GSGPUProfile.cpp.
+	GS/Renderers/Common/GSGPUDriverProfile.cpp
+	GS/Renderers/Common/GSGPUProfile.cpp
+	GS/Renderers/Common/GSGPUProfileMali.cpp
+	GS/Renderers/Common/GSGPUProfileAdreno.cpp
+	GS/Renderers/Common/GSGPUProfilePowerVR.cpp
+	GS/Renderers/Common/GSPassScheduler.cpp
 	GS/Renderers/Common/GSRenderer.cpp
 	GS/Renderers/Common/GSTexture.cpp
 	GS/Renderers/Common/GSVertexTrace.cpp
+	GS/Renderers/Null/GSDeviceNone.cpp
 	GS/Renderers/Null/GSRendererNull.cpp
+	GS/Renderers/HW/GSDrawLog.cpp
 	GS/Renderers/HW/GSHwHack.cpp
 	GS/Renderers/HW/GSRendererHW.cpp
 	GS/Renderers/HW/GSTextureCache.cpp
@@ -527,6 +553,7 @@ set(pcsx2GSSources
 set(pcsx2GSHeaders
 	GS/GSAlignedClass.h
 	GS/GSBlock.h
+	GS/GSBackQueue.h
 	GS/GSCapture.h
 	GS/GSClut.h
 	GS/GSDrawingContext.h
@@ -543,6 +570,7 @@ set(pcsx2GSHeaders
 	GS/GSPng.h
 	GS/GSRingHeap.h
 	GS/GSState.h
+	GS/GSVertexKick.h
 	GS/GSTables.h
 	GS/GSUtil.h
 	GS/GSVector.h
@@ -552,12 +580,17 @@ set(pcsx2GSHeaders
 	GS/Renderers/Common/GSDirtyRect.h
 	GS/Renderers/Common/GSFastList.h
 	GS/Renderers/Common/GSFunctionMap.h
+	GS/Renderers/Common/GSGPUProfile.h
+	GS/Renderers/Common/GSGPUProfilePrivate.h
+	GS/Renderers/Common/GSPassScheduler.h
 	GS/Renderers/Common/GSRenderer.h
 	GS/Renderers/Common/GSShaderEnums.h
 	GS/Renderers/Common/GSTexture.h
 	GS/Renderers/Common/GSVertex.h
 	GS/Renderers/Common/GSVertexTrace.h
+	GS/Renderers/Null/GSDeviceNone.h
 	GS/Renderers/Null/GSRendererNull.h
+	GS/Renderers/HW/GSDrawLog.h
 	GS/Renderers/HW/GSHwHack.h
 	GS/Renderers/HW/GSRendererHW.h
 	GS/Renderers/HW/GSTextureCache.h
@@ -641,14 +674,20 @@ if(USE_VULKAN)
 		GS/Renderers/Vulkan/GSTextureVK.cpp
 		GS/Renderers/Vulkan/vk_mem_alloc.cpp
 		GS/Renderers/Vulkan/VKBuilders.cpp
+		GS/Renderers/Vulkan/VKLibretro.cpp
 		GS/Renderers/Vulkan/VKLoader.cpp
 		GS/Renderers/Vulkan/VKShaderCache.cpp
 		GS/Renderers/Vulkan/VKStreamBuffer.cpp
 		GS/Renderers/Vulkan/VKSwapChain.cpp
 	)
+	# VKLibretro.cpp needs the libretro Vulkan HW-render interface header.
+	# Link it PRIVATE to PCSX2 (not the shared PCSX2_FLAGS) so the header path
+	# doesn't leak onto every target that consumes PCSX2_FLAGS.
+	target_link_libraries(PCSX2 PRIVATE libretro-headers)
 	list(APPEND pcsx2GSHeaders
 		GS/Renderers/Vulkan/GSDeviceVK.h
 		GS/Renderers/Vulkan/GSTextureVK.h
+		GS/Renderers/Vulkan/VKLibretro.h
 		GS/Renderers/Vulkan/VKBuilders.h
 		GS/Renderers/Vulkan/VKEntryPoints.h
 		GS/Renderers/Vulkan/VKEntryPoints.inl
@@ -1062,51 +1101,48 @@ set(pcsx2x86Headers
 	)
 
 # ARM64
-#
-# EE recompiler (aR5900*): a SINGLE canonical Phase-7 backend for every arm64 target
-# (PC macOS/Linux/Windows + Android). The Android mac-port graft fork was dropped after a
-# device A/B (canonical EE+VU + force-float, PGO tuned for the mac-port so rigged against
-# canonical) showed canonical EE at refresh parity on Android — GoW2 combat EE ~12.8ms,
-# 100% speed / 60fps. The real Android perf lever is the force-float in
-# VMManager::SetEmuThreadAffinities, not the recompiler backend. See REFACTOR_STATUS.md.
-set(pcsx2arm64EESources
-	arm64/aR5900.cpp
-	arm64/aR5900Analysis.cpp
-	arm64/aR5900LoadStore.cpp
-	arm64/aR5900Arith.cpp
-	arm64/aR5900MultDiv.cpp
-	arm64/aR5900Branch.cpp
-	arm64/aR5900FPU.cpp
-	arm64/aR5900MMI.cpp
-	)
-
 set(pcsx2arm64Sources
 	arm64/AsmHelpers.cpp
+	arm64/iCore-arm64.cpp
+	arm64/iR3000A-arm64.cpp
+	arm64/iR3000Atables-arm64.cpp
+	arm64/iR5900-arm64.cpp
+	arm64/iR5900Templates-arm64.cpp
+	x86/BaseblockEx.cpp  # arch-neutral baseblock manager, shared with the x86 build
+	arm64/iR5900Arit-arm64.cpp
+	arm64/iR5900AritImm-arm64.cpp
+	arm64/iR5900Branch-arm64.cpp
+	arm64/iR5900Jump-arm64.cpp
+	arm64/iR5900LoadStore-arm64.cpp
+	arm64/recVTLB-arm64.cpp
+	arm64/iR5900Move-arm64.cpp
+	arm64/iR5900MultDiv-arm64.cpp
+	arm64/iR5900Shift-arm64.cpp
+	arm64/iR5900Misc-arm64.cpp
+	arm64/iCOP2-arm64.cpp
+	arm64/iCOP0-arm64.cpp
+	arm64/iFPU-arm64.cpp
+	arm64/iFPUd-arm64.cpp
+	arm64/iMMI-arm64.cpp
 	arm64/Vif_Dynarec.cpp
 	arm64/Vif_UnpackNEON.cpp
 	arm64/RecStubs.cpp
-	arm64/aR3000A.cpp
-	${pcsx2arm64EESources}
-	arm64/aVU.cpp
+	arm64/microVU-arm64.cpp
+	x86/iR5900Analysis.cpp  # arch-neutral EE instruction-liveness analysis, shared with the x86 build
 	)
 
 set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
-	arm64/aR5900.h
-	arm64/aR5900Analysis.h
-	arm64/aVU.h
-	arm64/aVU_IR.h
-	arm64/aVU_Misc.h
-	arm64/aVU_Analyze.inl
-	arm64/aVU_Alloc.inl
-	arm64/aVU_Clamp.inl
-	arm64/aVU_Misc.inl
-	arm64/aVU_Upper.inl
-	arm64/aVU_Lower.inl
-	arm64/aVU_Tables.inl
-	arm64/aVU_Flags.inl
-	arm64/aVU_Branch.inl
-	arm64/aVU_Compile.inl
+	arm64/iCore-arm64.h
+	arm64/iR3000A-arm64.h
+	arm64/iR5900-arm64.h
+	arm64/iR5900Analysis.h
+	arm64/microVU-arm64.h
+	arm64/microVU_Persist-arm64.h
+	arm64/microVU_Persist-arm64.inl
+	arm64/microVU_ProgCache-arm64.h
+	arm64/microVU_ProgCache-arm64.inl
+	arm64/microVU_Misc-arm64.h
 )
 
 # Mobile (arm64) platform sources, relocated from the former android/iOS core
@@ -1129,13 +1165,7 @@ if(ARCH_ARM64 OR ANDROID OR ARMSX2_IOS)
 	list(APPEND pcsx2SPU2Sources
 		SPU2/spu2_neon.cpp)
 	list(APPEND pcsx2SPU2Headers
-		SPU2/spu2_neon.h
-		SPU2/spu2_neon_dcfilter.h
-		SPU2/spu2_neon_mixer.h
-		SPU2/spu2_neon_reverb_ex.h
-		SPU2/spu2_optimize.h
-		SPU2/spu2_sve2_fir.h
-		SPU2/spu2_mt6899_tuning.h)
+		SPU2/spu2_neon.h)
 endif()
 
 if(ANDROID)
@@ -1143,27 +1173,13 @@ if(ANDROID)
 		Host/OboeAudioStream.cpp)
 	list(APPEND pcsx2GSSources
 		GS/Renderers/OpenGL/GLContextEGL.cpp
-		GS/Renderers/OpenGL/GLContextEGLAndroid.cpp
-		GS/Renderers/Common/GSGPUProfile.cpp
-		GS/Renderers/Common/GSGPUProfileMali.cpp
-		GS/Renderers/Common/GSGPUProfileAdreno.cpp
-		GS/Renderers/Common/GSGPUProfilePowerVR.cpp)
+		GS/Renderers/OpenGL/GLContextEGLAndroid.cpp)
 	list(APPEND pcsx2GSHeaders
 		GS/Renderers/OpenGL/GLContextEGL.h
-		GS/Renderers/OpenGL/GLContextEGLAndroid.h
-		GS/Renderers/Common/GSGPUProfile.h
-		GS/Renderers/Common/GSGPUProfilePrivate.h)
+		GS/Renderers/OpenGL/GLContextEGLAndroid.h)
 	list(APPEND pcsx2Sources
 		Android/AndroidStubs.cpp
-		Android/AndroidPcapStubs.cpp
-		VU1Fingerprint.cpp
-		EEDiffVerify.cpp)
-	list(APPEND pcsx2Headers
-		VU1Fingerprint.h
-		EEDiffVerify.h
-		AndroidEEOpHist.h
-		AndroidPerfBuckets.h
-		PS1DrvTrace.h)
+		Android/AndroidPcapStubs.cpp)
 	# Oboe is the Android audio backend consumed by Host/OboeAudioStream.cpp.
 	# The `oboe` target (created in SearchForStuff.cmake) exports its `include/`
 	# dir as PUBLIC, so linking it into PCSX2_FLAGS propagates <oboe/Oboe.h> to
@@ -1176,15 +1192,9 @@ endif()
 if(ARMSX2_IOS)
 	list(APPEND pcsx2Sources
 		MacOSStubs.cpp
-		QAProbe.cpp
-		TestHarness.cpp
 		# iOS has no libpcap, so pcap_io.cpp is excluded above; reuse the (platform-
 		# agnostic) Android stub to supply the PCAPAdapter definitions DEV9 references.
 		Android/AndroidPcapStubs.cpp)
-	list(APPEND pcsx2Headers
-		QAProbe.h
-		TestHarness.h
-		SifRingBuffer.h)
 endif()
 
 # These ones benefit a lot from LTO
@@ -1213,6 +1223,14 @@ if(LTO_PCSX2_CORE)
 		target_compile_definitions(PCSX2_LTO PRIVATE MULTI_ISA_SHARED_COMPILATION)
 	endif()
 	target_link_libraries(PCSX2_LTO PRIVATE PCSX2_FLAGS)
+	if(USE_VULKAN)
+		# VKLibretro.cpp lives in the GS sources, which move to PCSX2_LTO under
+		# LTO_PCSX2_CORE. The libretro-headers include path is attached to PCSX2
+		# (target_link_libraries above), but PCSX2_LTO is a *dependency* of PCSX2
+		# so that PRIVATE include never reaches it — attach it directly, or
+		# VKLibretro.cpp can't find libretro_vulkan.h under LTO.
+		target_link_libraries(PCSX2_LTO PRIVATE libretro-headers)
+	endif()
 	target_link_libraries(PCSX2 PRIVATE PCSX2_LTO)
 	set_target_properties(PCSX2_LTO PROPERTIES INTERPROCEDURAL_OPTIMIZATION true)
 	fixup_file_properties(PCSX2_LTO)
@@ -1351,6 +1369,19 @@ target_include_directories(PCSX2_FLAGS INTERFACE
 )
 
 set_source_files_properties(PrecompiledHeader.cpp PROPERTIES HEADER_FILE_ONLY TRUE)
+
+# VUops.cpp (VU interp) and FPU.cpp (EE COP1 interp) must produce bit-exact
+# results matching PS2 hardware (which has no FMA). The project-wide
+# -ffp-contract=fast is fine on x86 (no FMA emitted without -mfma) but on aarch64
+# it lets the compiler contract `acc + fs * ft` to `fmadd` (single-rounded),
+# breaking bit-exactness vs the recompilers (separate fmul + fadd). In VUops.cpp
+# this would produce 1-ULP MADDA divergences. FPU.cpp has the identical hazard in
+# MADDA_S/MSUBA_S (`_FAValf_ += fs*ft` / `-= fs*ft` are single-expression
+# accumulates that fuse on aarch64 while the EE FPU rec emits two roundings) — a
+# +1-ULP float drift vs the rec.
+if(NOT MSVC)
+	set_source_files_properties(VUops.cpp FPU.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 if(COMMAND target_precompile_headers)
 	message("Using precompiled headers.")
 	target_precompile_headers(PCSX2_FLAGS INTERFACE PrecompiledHeader.h)
@@ -1369,6 +1400,49 @@ function(pcsx2_resource target path basedir)
 			COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${path}" "$<TARGET_FILE_DIR:${target}>/resources/${subdir}")
 	endif()
 	source_group(Resources/${subdir} FILES ${path})
+endfunction()
+
+# Copy the bin/resources tree (and, off-Windows, bin/docs) next to a built
+# executable so it can find them at runtime via AppRoot/resources. Shared by
+# every user-facing frontend (pcsx2-qt, pcsx2-sdl) so they stay in lockstep.
+function(pcsx2_copy_runtime_resources target)
+	file(GLOB_RECURSE RESOURCE_FILES ${CMAKE_SOURCE_DIR}/bin/resources/*)
+	foreach(path IN LISTS RESOURCE_FILES)
+		get_filename_component(file ${path} NAME)
+		if("${file}" MATCHES "^\\.") # Don't copy macOS garbage (mainly Finder's .DS_Store files) into application
+			continue()
+		endif()
+		if (NOT WIN32 AND "${path}" MATCHES "/dx11/") # Don't include unneccessary stuff
+			continue()
+		endif()
+		if (NOT BUNDLE_EMOJI_FONT AND "${path}" MATCHES "fonts/Twemoji")
+			continue()
+		endif()
+		pcsx2_resource(${target} ${path} ${CMAKE_SOURCE_DIR}/bin/resources/)
+	endforeach()
+
+	# Mobile-GPU GameDB overlay (ARM64 Linux handheld tilers). It lives OUTSIDE
+	# bin/resources/ so the GLOB above never ships it on a desktop GPU; copy it in
+	# only when explicitly enabled. It lands flat as resources/armsx2_overrides.yaml,
+	# where the GameDatabase override loader finds it (and silently skips it when
+	# it's not present, i.e. everywhere the option is off).
+	if(ENABLE_MOBILE_GAMEDB_OVERLAY)
+		pcsx2_resource(${target}
+			${CMAKE_SOURCE_DIR}/bin/resources-overlay/armsx2_overrides.yaml
+			${CMAKE_SOURCE_DIR}/bin/resources-overlay/)
+	endif()
+
+	# Add docs to resources for not-Windows, since they don't use the bin directory.
+	if(NOT WIN32)
+		file(GLOB_RECURSE DOCS_FILES ${CMAKE_SOURCE_DIR}/bin/docs/*)
+		foreach(path IN LISTS DOCS_FILES)
+			get_filename_component(file ${path} NAME)
+			if("${file}" MATCHES "^\\.") # Don't copy macOS garbage (mainly Finder's .DS_Store files) into application
+				continue()
+			endif()
+			pcsx2_resource(${target} ${path} ${CMAKE_SOURCE_DIR}/bin/)
+		endforeach()
+	endif()
 endfunction()
 
 if (NOT APPLE)
@@ -1401,40 +1475,19 @@ if (APPLE)
 			${COREMEDIA_LIBRARY}
 		)
 	endif()
-	# Weak-link MetalFX so older OS versions still load; each use is @available-guarded.
-	target_link_options(PCSX2_FLAGS INTERFACE "SHELL:-weak_framework MetalFX")
+	# Weak-link MetalFX so older OS versions still load. Skip on the iOS simulator:
+	# MetalFX.framework isn't in the iphonesimulator SDK (see PCSX2_HAS_METALFX in
+	# GSDeviceMTL.h), so linking it there fails with "framework not found".
+	if(ARMSX2_REAL_DEVICE OR NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+		target_link_options(PCSX2_FLAGS INTERFACE "SHELL:-weak_framework MetalFX")
+	endif()
 endif()
 
 set_property(GLOBAL PROPERTY PCSX2_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set_property(GLOBAL PROPERTY PCSX2_METAL_SHADERS ${pcsx2GSMetalShaders})
 
 function(setup_main_executable target)
-	file(GLOB_RECURSE RESOURCE_FILES ${CMAKE_SOURCE_DIR}/bin/resources/*)
-	foreach(path IN LISTS RESOURCE_FILES)
-		get_filename_component(file ${path} NAME)
-		if("${file}" MATCHES "^\\.") # Don't copy macOS garbage (mainly Finder's .DS_Store files) into application
-			continue()
-		endif()
-		if (NOT WIN32 AND "${path}" MATCHES "/dx11/") # Don't include unneccessary stuff
-			continue()
-		endif()
-		if (NOT BUNDLE_EMOJI_FONT AND "${path}" MATCHES "fonts/Twemoji")
-			continue()
-		endif()
-		pcsx2_resource(${target} ${path} ${CMAKE_SOURCE_DIR}/bin/resources/)
-	endforeach()
-
-	# Add docs to resources for not-Windows, since they don't use the bin directory.
-	if(NOT WIN32)
-		file(GLOB_RECURSE DOCS_FILES ${CMAKE_SOURCE_DIR}/bin/docs/*)
-		foreach(path IN LISTS DOCS_FILES)
-			get_filename_component(file ${path} NAME)
-			if("${file}" MATCHES "^\\.") # Don't copy macOS garbage (mainly Finder's .DS_Store files) into application
-				continue()
-			endif()
-			pcsx2_resource(${target} ${path} ${CMAKE_SOURCE_DIR}/bin/)
-		endforeach()
-	endif()
+	pcsx2_copy_runtime_resources(${target})
 
 	get_property(PCSX2_SOURCE_DIR GLOBAL PROPERTY PCSX2_SOURCE_DIR)
 	get_property(PCSX2_METAL_SHADERS GLOBAL PROPERTY PCSX2_METAL_SHADERS)
