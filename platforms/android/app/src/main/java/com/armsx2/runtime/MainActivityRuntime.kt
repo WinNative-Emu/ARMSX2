@@ -371,6 +371,13 @@ open class MainActivityRuntime : ComponentActivity() {
         // stick, so the physical stick is left driving on its own.
         val gyroActive = mutableStateOf(true)
 
+        // Bridge to the live AndroidGyroscopeInput's recenter(). The sensor instance is
+        // remembered inside TouchControlsOverlay, so the runtime (which owns hotkey
+        // dispatch) has no other handle on it. Set while a gyro session is registered and
+        // nulled on dispose, so GYRO_RECENTER can tell "no motion running" from a real
+        // recenter instead of silently doing nothing.
+        @Volatile var gyroRecenterHook: (() -> Unit)? = null
+
         // #254: whether the emulated USB keyboard is attached for the running
         // game (resolved Settings.usbKeyboard, cached at launch in
         // applyRendererPrefs). Read hot in dispatchKeyEvent to decide whether a
@@ -1417,6 +1424,25 @@ open class MainActivityRuntime : ComponentActivity() {
         private var lastInitDataRoot: String? = null
         fun currentInitDataRoot(): String? = lastInitDataRoot
 
+        /**
+         * Factory-reset every app SETTING and cold-restart.
+         *
+         * Wipes all preferences (settings, controls, hotkeys, touch layouts, per-game overrides,
+         * library cache, recents, onboarding state) plus the on-disk settings layers that would
+         * otherwise re-seed them — see [ConfigStore.purgeAllSettingsFiles], which is what stops
+         * the reset being silently undone on the next launch.
+         *
+         * Deliberately does NOT delete content: games, BIOS, saves, memory cards, save states,
+         * covers, texture packs and shaders all survive. Setup runs again afterwards because the
+         * chosen data root is a preference; pointing it at the same folder restores everything.
+         */
+        fun resetAppToDefaults(context: Context) {
+            // Files first — clearing prefs drops the data-root pref that locates them.
+            runCatching { com.armsx2.config.ConfigStore.purgeAllSettingsFiles() }
+            runCatching { prefs.edit { clear() } }
+            restartApp(context)
+        }
+
         /** Cold-restart the app so native re-runs initialize() with the newly
          *  chosen data root. Used after the user moves app data between Internal
          *  and SD in the setup wizard. */
@@ -1737,6 +1763,29 @@ open class MainActivityRuntime : ComponentActivity() {
             NativeApp.initializeOnce(applicationContext)
             nativeReady.value = true
 
+            // One-time repair of globally-armed patches. Older builds filled the global
+            // [Patches]/[Cheats] Enable lists just by opening the Patch Manager, and since
+            // patches are matched BY NAME those entries armed the same-named group in the
+            // bundled archive for every game — the "60fps/16:9 with every patch setting off,
+            // and it won't turn off" reports. The auto-sync is gone, but existing installs
+            // still carry the poisoned lists, so clear them once. Must run after
+            // initializeOnce (the base settings layer has to exist).
+            // Key is versioned: v1 cleared only the base layer, which a stale PER-GAME list then
+            // shadowed (GOW2 still reported "1 game patch active" with everything off). Bumping it
+            // re-runs the now-complete purge for anyone who already took v1.
+            // Lightgun: read the pref and re-assert the USB device type. The ini is
+            // authoritative, but this covers a first run that has no USB section yet.
+            runCatching {
+                com.armsx2.input.UsbDevices.load()
+                com.armsx2.input.Lightgun.load()
+                com.armsx2.input.UsbDevices.applyAtBoot()
+            }
+
+            if (!prefs.getBoolean("patchEnableListsPurged.v2", false)) {
+                runCatching { NativeApp.purgeGlobalPatchEnableLists() }
+                    .onSuccess { prefs.edit { putBoolean("patchEnableListsPurged.v2", true) } }
+            }
+
             // Pin Filenames/BIOS to the file the setup wizard copied —
             // deferred to here because Host::SetBaseStringSettingValue
             // null-derefs when called before initializeOnce installs the
@@ -1997,6 +2046,7 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.ui.theme.LauncherOrientationPreferences.load()
         com.armsx2.ui.theme.LibraryBackgroundColorPreferences.load()
         com.armsx2.LibraryMusic.load()
+        com.armsx2.PauseMusic.load()
         com.armsx2.MenuSfx.load(applicationContext)
         com.armsx2.ControllerSkinStore.load(applicationContext)
         startAutosaveIntervalJob()
@@ -2267,6 +2317,31 @@ open class MainActivityRuntime : ComponentActivity() {
                         }
                     } else {
                         com.armsx2.LibraryMusic.stop(this@MainActivityRuntime)
+                    }
+                }
+                // In-game pause music: the mirror image of the above — it plays only while a
+                // frontend surface covers a running game, and goes quiet the moment the game
+                // resumes. Both the pause menu AND the in-game manager screens count, because
+                // openInGameScreen() closes the menu as it opens Settings/Achievements/etc., and
+                // sitting in those is exactly the long silence this exists to fill.
+                //
+                // Driven off the same states the overlay itself is drawn from rather than from
+                // InGameOverlay.open()/close(), for the reason the comment above gives: many paths
+                // reach each state (back button, menu button, hotkey, dismissInGameScreen, a boot
+                // that force-closes the overlay) and hooking them individually always misses one.
+                val pauseMenuUp = WindowImpl.overlayVisible.value || WindowImpl.inGameScreen.value != null
+                androidx.compose.runtime.LaunchedEffect(pauseMenuUp, com.armsx2.PauseMusic.enabled.value) {
+                    if (pauseMenuUp) {
+                        // start() plays immediately now (no active-audio deference — the game's own
+                        // stream stays open-but-silent behind the overlay). A couple of light
+                        // retries only cover a transient MediaPlayer prepare hiccup.
+                        repeat(3) {
+                            com.armsx2.PauseMusic.start(this@MainActivityRuntime)
+                            if (com.armsx2.PauseMusic.isPlaying()) return@LaunchedEffect
+                            kotlinx.coroutines.delay(250)
+                        }
+                    } else {
+                        com.armsx2.PauseMusic.stop()
                     }
                 }
                 // Screen orientation follows whichever tier is live: a running game's per-game
@@ -3027,6 +3102,10 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (down && event.repeatCount == 0) toggleGyro()
                     return true
                 }
+                ControllerMappings.SysHotkey.GYRO_RECENTER -> {
+                    if (down && event.repeatCount == 0) recenterGyro()
+                    return true
+                }
                 ControllerMappings.SysHotkey.TOGGLE_KEYBOARD -> {
                     if (down && event.repeatCount == 0) toggleSoftKeyboard()
                     return true
@@ -3197,6 +3276,19 @@ open class MainActivityRuntime : ComponentActivity() {
         val on = !gyroActive.value
         gyroActive.value = on
         hotkeyToast(if (on) "Gyro ON" else "Gyro OFF")
+    }
+
+    /** Re-zero the motion neutral. Routed through [gyroRecenterHook] because the sensor
+     *  instance is owned by the touch overlay composable, not the runtime. No-op (with a
+     *  toast either way) when no gyro session is live, so the binding never feels dead. */
+    private fun recenterGyro() {
+        val hook = gyroRecenterHook
+        if (hook == null) {
+            hotkeyToast("Motion not active")
+            return
+        }
+        hook()
+        hotkeyToast("Motion recentered")
     }
 
     fun toggleFastForward() {
@@ -4264,6 +4356,7 @@ open class MainActivityRuntime : ComponentActivity() {
             // directions / combos) doesn't provide — behave as a toggle here rather than
             // latching gyro on with no release.
             ControllerMappings.SysHotkey.GYRO_HOLD -> toggleGyro()
+            ControllerMappings.SysHotkey.GYRO_RECENTER -> recenterGyro()
             ControllerMappings.SysHotkey.RES_UP -> stepResolution(1)
             ControllerMappings.SysHotkey.RES_DOWN -> stepResolution(-1)
             ControllerMappings.SysHotkey.ACHIEVEMENTS -> com.armsx2.ui.emulation.EmulationMenuInputController.open(com.armsx2.ui.emulation.EmulationMenuTab.Options)
@@ -4505,6 +4598,11 @@ open class MainActivityRuntime : ComponentActivity() {
             com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SLEEP)
         }
         com.armsx2.navigation.UiNavigator.drawerOpen.value = false
+        // Mark backgrounded BEFORE opening the overlay below. open() sets overlayVisible = true,
+        // which re-fires the pause-music LaunchedEffect — and without this flag already false, that
+        // effect would call start() and play the track on the OS home screen. setForeground(false)
+        // also pauses whatever is currently playing.
+        com.armsx2.PauseMusic.setForeground(false)
         // Leaving the app (home / recents / slide-out) while a game is running:
         // open the pause OVERLAY instead of a silent pause. A bare pause left
         // users staring at a frozen game with no obvious way back — they had to
@@ -4525,6 +4623,7 @@ open class MainActivityRuntime : ComponentActivity() {
         // like the emulator ignoring the home button. Paused, not stopped, so returning
         // to the library picks it back up.
         com.armsx2.LibraryMusic.pause()
+        // Pause-menu track was already paused by setForeground(false) at the top of onPause.
         super.onPause()
     }
 
@@ -4551,6 +4650,13 @@ open class MainActivityRuntime : ComponentActivity() {
         // still just un-pauses a merely-paused one — while its own guards keep it a no-op
         // when the setting is off, a VM is running, or that other app is still playing.
         com.armsx2.LibraryMusic.start(this)
+        // Back in the foreground: clear the background guard first, THEN restart the pause track if a
+        // menu is still up. The LaunchedEffect won't do it — the overlay states didn't change while
+        // we were away, so it never re-runs — and start() no-ops until foreground is true again.
+        com.armsx2.PauseMusic.setForeground(true)
+        if (WindowImpl.overlayVisible.value || WindowImpl.inGameScreen.value != null) {
+            com.armsx2.PauseMusic.start(this)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
