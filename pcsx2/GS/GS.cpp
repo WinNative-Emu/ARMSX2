@@ -653,22 +653,25 @@ int GSfreeze(FreezeAction mode, freezeData* data)
 	}
 }
 
-void GSQueueSnapshot(const std::string& path, u32 gsdump_frames)
+bool GSQueueSnapshot(const std::string& path, u32 gsdump_frames)
 {
-	// GV7-1d-ii known gap: the GSDump transfer hook sits on the parse path, so
-	// under the two-object split the front's transfers would be missing from
-	// the dump (GV7-2 item). Warn rather than write a corrupt dump silently.
-	if (g_gs_front)
-		Console.Warning("GS: dump recording under GSBackThreadMode=Pipelined is not yet supported; expect an incomplete dump.");
-
-	if (g_gs_renderer)
-		g_gs_renderer->QueueSnapshot(path, gsdump_frames);
+	return g_gs_renderer && g_gs_renderer->QueueSnapshot(path, gsdump_frames);
 }
 
 void GSStopGSDump()
 {
 	if (g_gs_renderer)
 		g_gs_renderer->StopGSDump();
+}
+
+bool GSIsDumpRecording()
+{
+	return g_gs_renderer && g_gs_renderer->IsDumpRecording();
+}
+
+bool GSHasFrontParser()
+{
+	return static_cast<bool>(g_gs_front);
 }
 
 bool GSBeginCapture(std::string filename)

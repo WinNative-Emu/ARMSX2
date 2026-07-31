@@ -87,7 +87,7 @@ SCAJ-20141:
     vu0ClampMode: 3
 SCAJ-20162:
   gsHWFixes:
-    autoFlush: 2
+    autoFlush: 0
     disablePartialInvalidation: 1
     halfPixelOffset: 2
     nativeScaling: 2
@@ -249,7 +249,7 @@ SCES-54041:
     texturePreloading: 1
 SCES-54552:
   gsHWFixes:
-    autoFlush: 2
+    autoFlush: 0
     disablePartialInvalidation: 1
     halfPixelOffset: 2
     nativeScaling: 2
@@ -363,7 +363,7 @@ SCPS-15095:
     vu0ClampMode: 3
 SCPS-15102:
   gsHWFixes:
-    autoFlush: 2
+    autoFlush: 0
     disablePartialInvalidation: 1
     halfPixelOffset: 2
     nativeScaling: 2
@@ -374,7 +374,7 @@ SCPS-15119:
     preloadFrameData: 1
 SCPS-17013:
   gsHWFixes:
-    autoFlush: 2
+    autoFlush: 0
     disablePartialInvalidation: 1
     halfPixelOffset: 2
     nativeScaling: 2
@@ -382,7 +382,7 @@ SCPS-17013:
     roundSprite: 1
 SCPS-19254:
   gsHWFixes:
-    autoFlush: 2
+    autoFlush: 0
     disablePartialInvalidation: 1
     halfPixelOffset: 2
     nativeScaling: 2
@@ -589,7 +589,7 @@ SCUS-97487:
   - FullVU0SyncHack
 SCUS-97490:
   gsHWFixes:
-    autoFlush: 2
+    autoFlush: 0
     disablePartialInvalidation: 1
     halfPixelOffset: 2
     nativeScaling: 2
@@ -635,7 +635,7 @@ SCUS-97518:
     recommendedBlendingLevel: 3
 SCUS-97572:
   gsHWFixes:
-    autoFlush: 2
+    autoFlush: 0
     disablePartialInvalidation: 1
     halfPixelOffset: 2
     nativeScaling: 2
@@ -1580,6 +1580,7 @@ SLUS-20765:
 SLUS-20811:
   gsHWFixes:
     halfPixelOffset: 2
+    hwDownloadMode: 2 # No Readbacks — NFS Underground perf (community request)
     recommendedBlendingLevel: 3
 SLUS-20842:
   gsHWFixes:
@@ -1624,6 +1625,7 @@ SLUS-21059:
 SLUS-21065:
   gsHWFixes:
     halfPixelOffset: 5
+    hwDownloadMode: 2 # No Readbacks — NFS Underground 2 perf (community request)
     nativeScaling: 1
 SLUS-21087:
   gsHWFixes:
