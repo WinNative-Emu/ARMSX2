@@ -62,6 +62,7 @@ extern "C" void ARMSX2_iOSCopyDeviceStats(int* outBatteryPercent, int* outTherma
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -929,6 +930,37 @@ static NSString* ARMSX2ResolveISOPath(NSString* isoName)
     return nil;
 }
 
+static BOOL ARMSX2PerGameIdentityForCurrentGame(std::string* serial, u32* crc);
+
+// There is one process-wide InputIsoFile, shared between the running VM and every
+// metadata scan, so scanning the disc a game is playing from closes it out from
+// under the game. GameList.h says as much above PopulateEntryFromPath: do not call
+// it while the system is running. Everything after that reads zero blocks and the
+// game starves while the emulator carries on at full speed, which is a miserable
+// thing to debug from a bug report.
+static bool ARMSX2PathIsRunningDisc(NSString* resolvedPath)
+{
+    if (resolvedPath.length == 0 || !VMManager::HasValidVM())
+        return false;
+
+    const std::string running = VMManager::GetDiscPath();
+    return !running.empty() && running == resolvedPath.UTF8String;
+}
+
+static void ARMSX2NoteRunningDiscScan(NSString* path)
+{
+    // Once is enough. This went unnoticed for a long time precisely because it was
+    // silent; if something finds a new way in, it should show up in an ordinary log
+    // rather than needing a special build with a backtrace in it.
+    static bool warned = false;
+    if (warned)
+        return;
+
+    warned = true;
+    Console.Warning("Not scanning '%s' while a VM is running; using the game list cache instead.",
+        path.UTF8String);
+}
+
 static BOOL ARMSX2PopulateGameListEntryForISO(NSString* isoName, GameList::Entry* entry, NSString** resolvedPath)
 {
     NSString* path = ARMSX2ResolveISOPath(isoName);
@@ -937,6 +969,25 @@ static BOOL ARMSX2PopulateGameListEntryForISO(NSString* isoName, GameList::Entry
 
     if (path.length == 0 || !entry)
         return NO;
+
+    // Any VM, not just one playing this particular file. InputIsoFile::Open closes
+    // whatever is already open before it opens anything, so scanning some unrelated
+    // image while a game is running kills that game's disc just the same.
+    if (VMManager::HasValidVM())
+    {
+        ARMSX2NoteRunningDiscScan(path);
+
+        // Cache only, and a miss fails rather than falling through to a scan. The
+        // worst case is a missing cover or title while a game is up; the
+        // alternative is killing the disc out from under it.
+        const auto lock = GameList::GetLock();
+        const GameList::Entry* cached = GameList::GetEntryForPath(path.UTF8String);
+        if (!cached)
+            return NO;
+
+        *entry = *cached;
+        return YES;
+    }
 
     return GameList::PopulateEntryFromPath(path.UTF8String, entry) ? YES : NO;
 }
@@ -2165,6 +2216,13 @@ static void ARMSX2SetPatchEnableListForIdentity(NSArray<NSString*>* values, cons
 // game-settings writer.
 static BOOL ARMSX2PerGameIdentityForISO(NSString* isoName, std::string* serial, u32* crc)
 {
+    // The VM already knows what it booted, so asking the disc is both slower and,
+    // until this check existed, destructive. Taking it here rather than relying on
+    // the cache below also means this keeps working when the game list has no
+    // entry for the running game.
+    if (ARMSX2PathIsRunningDisc(ARMSX2ResolveISOPath(isoName)))
+        return ARMSX2PerGameIdentityForCurrentGame(serial, crc);
+
     GameList::Entry entry;
     NSString* resolvedPath = nil;
     if (!ARMSX2PopulateGameListEntryForISO(isoName, &entry, &resolvedPath) || entry.crc == 0)
@@ -3916,6 +3974,30 @@ extern "C" void ARMSX2_CaptureGraphicsHackState(void)
     return si.GetBoolValue(section.UTF8String, key.UTF8String, def);
 }
 
+// The per-game panel writes every field it owns when you press Save, and each write
+// used to queue a reload of its own. One tap came out the other side as seventy-odd
+// full config reloads, each re-reading the INI, re-running GameDB and rebuilding the
+// GS config. Let the last write in a burst be the one that reloads.
+static void ARMSX2RequestPerGameSettingsReload()
+{
+    static std::atomic<uint64_t> s_generation{0};
+    const uint64_t mine = s_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(0.05 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+            // Someone wrote after us, so they own the reload.
+            if (s_generation.load(std::memory_order_relaxed) != mine)
+                return;
+
+            // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
+            Host::RunOnCPUThread([]() {
+                VMManager::ReloadGameSettings();
+                if (MTGS::IsOpen())
+                    MTGS::ApplySettings();
+            });
+        });
+}
+
 + (void)setPerGameINIInt:(nonnull NSString *)section key:(nonnull NSString *)key value:(int)value forISO:(nonnull NSString *)isoName {
     std::string serial;
     u32 crc = 0;
@@ -3997,12 +4079,7 @@ extern "C" void ARMSX2_CaptureGraphicsHackState(void)
     si.SetIntValue(section.UTF8String, key.UTF8String, value);
     Error error;
     si.Save(&error);
-    // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
-    Host::RunOnCPUThread([]() {
-        VMManager::ReloadGameSettings();
-        if (MTGS::IsOpen())
-            MTGS::ApplySettings();
-    });
+    ARMSX2RequestPerGameSettingsReload();
 }
 
 + (void)setPerGameINIBoolForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(BOOL)value {
@@ -4015,12 +4092,7 @@ extern "C" void ARMSX2_CaptureGraphicsHackState(void)
     si.SetBoolValue(section.UTF8String, key.UTF8String, value);
     Error error;
     si.Save(&error);
-    // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
-    Host::RunOnCPUThread([]() {
-        VMManager::ReloadGameSettings();
-        if (MTGS::IsOpen())
-            MTGS::ApplySettings();
-    });
+    ARMSX2RequestPerGameSettingsReload();
 }
 
 + (float)getPerGameINIFloat:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(float)def forISO:(nonnull NSString *)isoName {
@@ -4067,12 +4139,7 @@ extern "C" void ARMSX2_CaptureGraphicsHackState(void)
     si.SetFloatValue(section.UTF8String, key.UTF8String, value);
     Error error;
     si.Save(&error);
-    // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
-    Host::RunOnCPUThread([]() {
-        VMManager::ReloadGameSettings();
-        if (MTGS::IsOpen())
-            MTGS::ApplySettings();
-    });
+    ARMSX2RequestPerGameSettingsReload();
 }
 
 + (void)deletePerGameINIValueForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key {
@@ -4087,12 +4154,7 @@ extern "C" void ARMSX2_CaptureGraphicsHackState(void)
     si.RemoveEmptySections();
     Error error;
     si.Save(&error);
-    // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
-    Host::RunOnCPUThread([]() {
-        VMManager::ReloadGameSettings();
-        if (MTGS::IsOpen())
-            MTGS::ApplySettings();
-    });
+    ARMSX2RequestPerGameSettingsReload();
 }
 
 + (nonnull NSString *)perGameIdentityKeyForCurrentGame {

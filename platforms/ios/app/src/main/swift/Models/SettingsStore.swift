@@ -1506,13 +1506,25 @@ final class SettingsStore {
         _padOpacityConfig.onSet?(padOpacity)
     }}
     let _phoneRumbleStrengthConfig = Setting<Float>(
-        section: "ARMSX2iOS/UI", key: "PhoneRumbleStrength", default: 1.0,
+        section: "ARMSX2iOS/UI", key: "PhoneRumbleStrength", default: 0.25,
         suppressible: false,
         writer: ARMSX2Bridge.setINIFloat)
-    var phoneRumbleStrength: Float = 1.0 { didSet {
+    var phoneRumbleStrength: Float = 0.25 { didSet {
         guard !(_phoneRumbleStrengthConfig.suppressible && suppressINIWrites) else { return }
         _phoneRumbleStrengthConfig.writer(_phoneRumbleStrengthConfig.section, _phoneRumbleStrengthConfig.key, phoneRumbleStrength)
         _phoneRumbleStrengthConfig.onSet?(phoneRumbleStrength)
+    }}
+    let _increaseRumbleDurationAndInterpolationConfig = Setting<Bool>(
+        section: "ARMSX2iOS/UI", key: "IncreaseRumbleDurationAndInterpolation", default: true,
+        suppressible: false,
+        writer: ARMSX2Bridge.setINIBool)
+    var increaseRumbleDurationAndInterpolation: Bool = true { didSet {
+        guard !(_increaseRumbleDurationAndInterpolationConfig.suppressible && suppressINIWrites) else { return }
+        _increaseRumbleDurationAndInterpolationConfig.writer(
+            _increaseRumbleDurationAndInterpolationConfig.section,
+            _increaseRumbleDurationAndInterpolationConfig.key,
+            increaseRumbleDurationAndInterpolation)
+        _increaseRumbleDurationAndInterpolationConfig.onSet?(increaseRumbleDurationAndInterpolation)
     }}
     let _hapticFeedbackConfig = Setting<Bool>(
         section: "ARMSX2iOS/UI", key: "HapticFeedback", default: true,
@@ -2062,7 +2074,8 @@ final class SettingsStore {
         // UI
         padOpacity = ARMSX2Bridge.getINIFloat("ARMSX2iOS/UI", key: "PadOpacity", defaultValue: 0.6)
         hapticFeedback = ARMSX2Bridge.getINIBool("ARMSX2iOS/UI", key: "HapticFeedback", defaultValue: true)
-        phoneRumbleStrength = ARMSX2Bridge.getINIFloat("ARMSX2iOS/UI", key: "PhoneRumbleStrength", defaultValue: 1.0)
+        phoneRumbleStrength = ARMSX2Bridge.getINIFloat("ARMSX2iOS/UI", key: "PhoneRumbleStrength", defaultValue: 0.25)
+        increaseRumbleDurationAndInterpolation = ARMSX2Bridge.getINIBool("ARMSX2iOS/UI", key: "IncreaseRumbleDurationAndInterpolation", defaultValue: true)
         dpadDiagonalsEnabled = ARMSX2Bridge.getINIBool("ARMSX2iOS/UI", key: "DpadDiagonalsEnabled", defaultValue: true)
         faceComboZonesEnabled = ARMSX2Bridge.getINIBool("ARMSX2iOS/UI", key: "FaceComboZonesEnabled", defaultValue: true)
         virtualPadSkin = VirtualPadSkin(rawValue: Int(ARMSX2Bridge.getINIInt("ARMSX2iOS/UI", key: "VirtualPadSkin", defaultValue: 0))) ?? .armsx2Refresh
@@ -2308,7 +2321,8 @@ final class SettingsStore {
         osdShowDeviceStats = ARMSX2Bridge.getINIBool("ARMSX2iOS/UI", key: "OsdShowDeviceStats", defaultValue: osdPreset != .off)
         padOpacity = ARMSX2Bridge.getINIFloat("ARMSX2iOS/UI", key: "PadOpacity", defaultValue: 0.6)
         hapticFeedback = ARMSX2Bridge.getINIBool("ARMSX2iOS/UI", key: "HapticFeedback", defaultValue: true)
-        phoneRumbleStrength = ARMSX2Bridge.getINIFloat("ARMSX2iOS/UI", key: "PhoneRumbleStrength", defaultValue: 1.0)
+        phoneRumbleStrength = ARMSX2Bridge.getINIFloat("ARMSX2iOS/UI", key: "PhoneRumbleStrength", defaultValue: 0.25)
+        increaseRumbleDurationAndInterpolation = ARMSX2Bridge.getINIBool("ARMSX2iOS/UI", key: "IncreaseRumbleDurationAndInterpolation", defaultValue: true)
         dpadDiagonalsEnabled = ARMSX2Bridge.getINIBool("ARMSX2iOS/UI", key: "DpadDiagonalsEnabled", defaultValue: true)
         faceComboZonesEnabled = ARMSX2Bridge.getINIBool("ARMSX2iOS/UI", key: "FaceComboZonesEnabled", defaultValue: true)
         virtualPadSkin = VirtualPadSkin(rawValue: Int(ARMSX2Bridge.getINIInt("ARMSX2iOS/UI", key: "VirtualPadSkin", defaultValue: 0))) ?? .armsx2Refresh
@@ -2802,5 +2816,88 @@ final class SettingsStore {
         shadeBoostSaturation = 50
         shadeBoostGamma = 50
         // Texture pack and dump toggles are intentionally preserved.
+    }
+
+    /// Restores application configuration without deleting imported content,
+    /// user-created presets, memory cards, skins, or account credentials.
+    func resetAllDefaults() {
+        resetEmulatorDefaults()
+        resetGraphicsDefaults()
+
+        // Texture replacement settings are intentionally preserved by the
+        // graphics-only reset, but a full reset returns them to fresh-install values.
+        loadTextureReplacements = false
+        loadTextureReplacementsAsync = true
+        precacheTextureReplacements = false
+        texturePreloading = 2
+        dumpReplaceableTextures = false
+        dumpReplaceableMipmaps = false
+        dumpTexturesWithFMVActive = false
+        dumpDirectTextures = true
+        dumpPaletteTextures = true
+
+        framePacingPreset = .optimal
+        adaptiveResolutionEnabled = false
+
+        osdPreset = .off
+        lastActiveOsdPreset = .simple
+        osdPerformancePosition = Self.defaultOsdPerformancePosition
+        osdShowMessages = true
+        osdShowTextureReplacements = false
+        snapshotCustomOsd()
+
+        padOpacity = 0.6
+        phoneRumbleStrength = 0.25
+        increaseRumbleDurationAndInterpolation = true
+        hapticFeedback = true
+        dpadDiagonalsEnabled = true
+        faceComboZonesEnabled = true
+        autoHideVirtualPadWhenControllerConnected = true
+        autoFullscreen = true
+        hideMenuButton = false
+        analogStickScale = 1.0
+        invertLeftStickX = false
+        invertLeftStickY = false
+        invertRightStickX = false
+        invertRightStickY = false
+        appLanguage = .system
+        controllerMultitapMode = 0
+        autoOpenStikDebug = false
+        jitScriptProtocol = .defaultValue
+
+        dev9HddEnabled = false
+        dev9HddFile = "DEV9hdd.raw"
+        dev9EthernetEnabled = false
+        dev9EthDevice = "Auto"
+        dev9InterceptDHCP = false
+        dev9EthLogDHCP = false
+        dev9EthLogDNS = false
+        dev9DNS1Mode = "Auto"
+        dev9DNS1 = "0.0.0.0"
+        dev9DNS2Mode = "Auto"
+        dev9DNS2 = "0.0.0.0"
+
+        dynamicBackgroundsEnabled = true
+        dynamicAppearancePreferences = .standard
+        clearLiquidGlassUI = true
+        clearLiquidGlassUIQuickMenu = false
+        gameCardZoomAnimationEnabled = true
+        backgroundPrimaryAsset = nil
+        backgroundLandscapeAsset = nil
+        backgroundFitMode = .fill
+        backgroundLandscapeFitMode = .fill
+        backgroundVideoMuted = true
+        backgroundDim = 0.0
+        backgroundEnabledInBIOS = true
+        backgroundEnabledInHelp = true
+        backgroundEnabledInSettings = true
+
+        DynamicThumbstickSettings.shared.restoreDefaults()
+        let padLayout = PadLayoutStore.shared
+        padLayout.resetAll()
+        padLayout.resetControlVisibility()
+        padLayout.save()
+        ARMSX2Bridge.resetButtonMappings()
+        ARMSX2Bridge.flushINISettings()
     }
 }
