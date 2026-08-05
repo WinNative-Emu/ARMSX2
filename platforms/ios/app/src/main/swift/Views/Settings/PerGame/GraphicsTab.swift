@@ -10,11 +10,12 @@ struct GraphicsTab: View {
     let trilinearUseGlobalSentinel: Int
     let ophFlagHackEffective: Bool
 
-    // Core graphics overrides.
+    // Core graphics overrides. Each carries a use-global sentinel so an untouched setting is not
+    // written to the per-game file at all, plus the global value to label what it inherits.
     @Binding var upscaleMultiplier: Float
     @Binding var aspectRatio: String
     @Binding var textureFiltering: Int
-    @Binding var hardwareMipmapping: Bool
+    @Binding var hardwareMipmapping: Int
     @Binding var blendingAccuracy: Int
     @Binding var interlaceMode: Int
 
@@ -59,57 +60,25 @@ struct GraphicsTab: View {
     @Binding var perGameHWDownloadMode: Int
     @Binding var perGameCPUCLUT: Int
     @Binding var perGameGPUTargetCLUT: Int
-    @Binding var perGameVsyncQueue: Int
     @Binding var perGameLoadTextureReplacements: Int
     @Binding var perGameLoadTextureReplacementsAsync: Int
     @Binding var perGamePrecacheTextureReplacements: Int
-    @Binding var perGameSyncToHostRefresh: Int
 
     let savesToRunningGame: Bool
     let settings: SettingsStore
 
     // MARK: Static option tables (moved from the panel)
 
-    private struct PickerOption: Identifiable {
-        let id: Int
-        let title: String
-    }
-
     private static let useGlobalSentinel = -1
+    private static let upscaleUseGlobalSentinel: Float = -1.0
+    private static let aspectUseGlobalSentinel = ""
     private static let trilinearUseGlobalSentinelLocal = Int(Int32.min)
 
-    private static let deinterlaceOptions = [
-        PickerOption(id: 0, title: "None"),
-        PickerOption(id: 1, title: "Weave (TFF)"),
-        PickerOption(id: 2, title: "Weave (BFF)"),
-        PickerOption(id: 3, title: "Bob (TFF)"),
-        PickerOption(id: 4, title: "Bob (BFF)"),
-        PickerOption(id: 5, title: "Blend (TFF)"),
-        PickerOption(id: 6, title: "Blend (BFF)"),
-        PickerOption(id: 7, title: "Adaptive (Default)")
-    ]
-    private static let trilinearFilteringOptions = [
-        PickerOption(id: trilinearUseGlobalSentinelLocal, title: "Use Global"),
-        PickerOption(id: -1, title: "Automatic / Default"),
-        PickerOption(id: 0, title: "Off"),
-        PickerOption(id: 1, title: "PS2"),
-        PickerOption(id: 2, title: "Forced")
-    ]
-    private static let halfPixelOffsetOptions = [
-        PickerOption(id: useGlobalSentinel, title: "Use Global"),
-        PickerOption(id: 0, title: "Off"),
-        PickerOption(id: 1, title: "Normal / Vertex"),
-        PickerOption(id: 2, title: "Special / Texture"),
-        PickerOption(id: 3, title: "Special / Texture Aggressive"),
-        PickerOption(id: 4, title: "Align to Native"),
-        PickerOption(id: 5, title: "Align to Native + Texture Offset")
-    ]
-    private static let roundSpriteOptions = [
-        PickerOption(id: useGlobalSentinel, title: "Use Global"),
-        PickerOption(id: 0, title: "Off"),
-        PickerOption(id: 1, title: "Half"),
-        PickerOption(id: 2, title: "Full")
-    ]
+    // Trilinear needs Int32.min rather than -1, because -1 is a real TriFiltering value.
+    private static let trilinearFilteringOptions =
+        [(id: trilinearUseGlobalSentinelLocal, title: "Use Global")] + SettingsOptions.trilinearFiltering
+    private static let halfPixelOffsetOptions = SettingsOptions.withUseGlobal(SettingsOptions.halfPixelOffset)
+    private static let roundSpriteOptions = SettingsOptions.withUseGlobal(SettingsOptions.roundSprite)
 
     private static let aspectRatioOptions: [(id: String, title: String)] = [
         ("Auto 4:3/3:2", "Auto 4:3 / 3:2"),
@@ -142,7 +111,7 @@ struct GraphicsTab: View {
     @ViewBuilder
     private var graphicsContent: some View {
         Section(settings.localized("Graphics")) {
-            EnumPicker(UpscaleOptions.all, selection: $upscaleMultiplier) {
+            EnumPicker([(id: Self.upscaleUseGlobalSentinel, title: settings.localized("Use Global"))] + UpscaleOptions.all, selection: $upscaleMultiplier) {
                 Text(settings.localized("Internal Resolution"))
             }
             .disabled(!enabled)
@@ -162,33 +131,34 @@ struct GraphicsTab: View {
                 .disabled(!enabled)
             }
 
-            EnumPicker(Self.aspectRatioOptions, selection: $aspectRatio) {
+            EnumPicker([(id: Self.aspectUseGlobalSentinel, title: settings.localized("Use Global"))] + Self.aspectRatioOptions, selection: $aspectRatio) {
                 Text(settings.localized("Aspect Ratio"))
             }
             .disabled(!enabled)
 
-            EnumPicker(Self.textureFilteringOptionsEnum, selection: $textureFiltering) {
+            EnumPicker([(id: Self.useGlobalSentinel, title: settings.localized("Use Global"))] + Self.textureFilteringOptionsEnum, selection: $textureFiltering) {
                 Text(settings.localized("Texture Filtering"))
             }
             .disabled(!enabled)
 
-            Toggle(settings.localized("Hardware Mipmapping"), isOn: $hardwareMipmapping)
-                .disabled(!enabled)
+            Picker(settings.localized("Hardware Mipmapping"), selection: $hardwareMipmapping) {
+                Text(settings.localized("Use Global")).tag(Self.useGlobalSentinel)
+                Text(settings.localized("Off")).tag(0)
+                Text(settings.localized("On")).tag(1)
+            }
+            .disabled(!enabled)
             Text(settings.localized("Turn this off only for games with mipmap-related texture stripes, shimmer, or bad LOD. " + (savesToRunningGame ? "Applies when you save." : "Applies on next boot.")))
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            EnumPicker(Self.blendingAccuracyOptions, selection: $blendingAccuracy) {
+            EnumPicker([(id: Self.useGlobalSentinel, title: settings.localized("Use Global"))] + Self.blendingAccuracyOptions, selection: $blendingAccuracy) {
                 Text(settings.localized("Blending Accuracy"))
             }
             .disabled(!enabled)
 
-            Picker(settings.localized("Deinterlace"), selection: $interlaceMode) {
-                ForEach(Self.deinterlaceOptions) { option in
-                    Text(settings.localized(option.title)).tag(option.id)
-                }
-            }
-            .disabled(!enabled)
+            sharedPicker("Deinterlace", selection: $interlaceMode,
+                         SettingsOptions.withUseGlobal(SettingsOptions.deinterlace))
+                .disabled(!enabled)
 
             Picker(settings.localized("FXAA"), selection: $perGameFXAA) {
                 Text(settings.localized("Use Global")).tag(-1)
@@ -197,20 +167,6 @@ struct GraphicsTab: View {
             }
             .disabled(!enabled)
 
-            Picker(settings.localized("Shade Boost"), selection: $perGameShadeBoost) {
-                Text(settings.localized("Use Global")).tag(-1)
-                Text(settings.localized("Off")).tag(0)
-                Text(settings.localized("On")).tag(1)
-            }
-            .disabled(!enabled)
-            shadeBoostSlider(settings.localized("Shade Boost Brightness"), value: $perGameShadeBoostBrightness)
-                .disabled(!enabled)
-            shadeBoostSlider(settings.localized("Shade Boost Contrast"), value: $perGameShadeBoostContrast)
-                .disabled(!enabled)
-            shadeBoostSlider(settings.localized("Shade Boost Saturation"), value: $perGameShadeBoostSaturation)
-                .disabled(!enabled)
-            shadeBoostSlider(settings.localized("Shade Boost Gamma"), value: $perGameShadeBoostGamma)
-                .disabled(!enabled)
             Picker(settings.localized("Dithering"), selection: $perGameDithering) {
                 Text(settings.localized("Use Global")).tag(-1)
                 Text(settings.localized("Off")).tag(0)
@@ -219,16 +175,9 @@ struct GraphicsTab: View {
             }
             .disabled(!enabled)
 
-            Picker(settings.localized("TV/CRT Shader"), selection: $perGameTVShader) {
-                Text(settings.localized("Use Global")).tag(-1)
-                Text(settings.localized("Off")).tag(0)
-                Text(settings.localized("Scanline")).tag(1)
-                Text(settings.localized("Diagonal")).tag(2)
-                Text(settings.localized("Tri")).tag(3)
-                Text(settings.localized("Wave")).tag(4)
-                Text(settings.localized("Lottes")).tag(5)
-            }
-            .disabled(!enabled)
+            sharedPicker("TV/CRT Shader", selection: $perGameTVShader,
+                         SettingsOptions.withUseGlobal(SettingsOptions.tvShader))
+                .disabled(!enabled)
             Text(settings.localized("Scanline and CRT effects are subtle on high-resolution displays and are more visible at a lower Internal Resolution."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -240,25 +189,14 @@ struct GraphicsTab: View {
             }
             .disabled(!enabled)
 
-            Picker(settings.localized("Max Anisotropy"), selection: $perGameMaxAnisotropy) {
-                Text(settings.localized("Use Global")).tag(-1)
-                Text(settings.localized("Off")).tag(0)
-                Text("2x").tag(2)
-                Text("4x").tag(4)
-                Text("8x").tag(8)
-                Text("16x").tag(16)
-            }
-            .disabled(!enabled)
+            sharedPicker("Max Anisotropy", selection: $perGameMaxAnisotropy,
+                         SettingsOptions.withUseGlobal(SettingsOptions.maxAnisotropy))
+                .disabled(!enabled)
 
-            Picker(settings.localized("CAS Sharpness"), selection: $perGameCASSharpness) {
-                Text(settings.localized("Use Global")).tag(-1)
-                Text("0").tag(0)
-                Text("25").tag(25)
-                Text("50").tag(50)
-                Text("75").tag(75)
-                Text("100").tag(100)
-            }
-            .disabled(!enabled)
+            NumberOverrideRow(.casSharpness, value: $perGameCASSharpness,
+                              global: settings.casSharpness,
+                              settings: settings)
+                .disabled(!enabled)
 
             Picker(settings.localized("Screen Offsets"), selection: $perGamePCRTCOffsets) {
                 Text(settings.localized("Use Global")).tag(-1)
@@ -303,6 +241,34 @@ struct GraphicsTab: View {
             .disabled(!enabled)
         }
 
+        // Its own section, the way the global screen has it. The header is what lets the four rows
+        // be called Brightness and Contrast rather than repeating Shade Boost four times.
+        Section(settings.localized("Shade Boost")) {
+            Picker(settings.localized("Shade Boost"), selection: $perGameShadeBoost) {
+                Text(settings.localized("Use Global")).tag(-1)
+                Text(settings.localized("Off")).tag(0)
+                Text(settings.localized("On")).tag(1)
+            }
+            .disabled(!enabled)
+
+            NumberOverrideRow(.shadeBoostBrightness, value: $perGameShadeBoostBrightness,
+                              global: settings.shadeBoostBrightness,
+                              settings: settings)
+                .disabled(!enabled)
+            NumberOverrideRow(.shadeBoostContrast, value: $perGameShadeBoostContrast,
+                              global: settings.shadeBoostContrast,
+                              settings: settings)
+                .disabled(!enabled)
+            NumberOverrideRow(.shadeBoostSaturation, value: $perGameShadeBoostSaturation,
+                              global: settings.shadeBoostSaturation,
+                              settings: settings)
+                .disabled(!enabled)
+            NumberOverrideRow(.shadeBoostGamma, value: $perGameShadeBoostGamma,
+                              global: settings.shadeBoostGamma,
+                              settings: settings)
+                .disabled(!enabled)
+        }
+
         Section(settings.localized("Advanced Upscaling Hacks")) {
             Text(settings.localized("Manual advanced hacks only apply when Use Per-Game Overrides is on and GameDB Graphics Fixes is off. " + (savesToRunningGame ? "They apply when you save." : "They apply on next boot.")))
                 .font(.caption)
@@ -314,12 +280,9 @@ struct GraphicsTab: View {
                     .foregroundStyle(.orange)
             }
 
-            Picker(settings.localized("Trilinear Filtering"), selection: $trilinearFiltering) {
-                ForEach(Self.trilinearFilteringOptions) { option in
-                    Text(settings.localized(option.title)).tag(option.id)
-                }
-            }
-            .disabled(!enabled)
+            sharedPicker("Trilinear Filtering", selection: $trilinearFiltering,
+                         Self.trilinearFilteringOptions)
+                .disabled(!enabled)
 
             if trilinearFiltering != trilinearUseGlobalSentinel && trilinearFiltering != -1 {
                 Text(settings.localized("Non-automatic trilinear filtering may break textures in some games."))
@@ -327,19 +290,13 @@ struct GraphicsTab: View {
                     .foregroundStyle(.orange)
             }
 
-            Picker(settings.localized("Half-pixel Offset"), selection: $halfPixelOffset) {
-                ForEach(Self.halfPixelOffsetOptions) { option in
-                    Text(settings.localized(option.title)).tag(option.id)
-                }
-            }
-            .disabled(!manualAdvancedHacksEnabled)
+            sharedPicker("Half-pixel Offset", selection: $halfPixelOffset,
+                         Self.halfPixelOffsetOptions)
+                .disabled(!manualAdvancedHacksEnabled)
 
-            Picker(settings.localized("Round Sprite"), selection: $roundSprite) {
-                ForEach(Self.roundSpriteOptions) { option in
-                    Text(settings.localized(option.title)).tag(option.id)
-                }
-            }
-            .disabled(!manualAdvancedHacksEnabled)
+            sharedPicker("Round Sprite", selection: $roundSprite,
+                         Self.roundSpriteOptions)
+                .disabled(!manualAdvancedHacksEnabled)
 
             Toggle(settings.localized("Override Align Sprite"), isOn: $alignSpriteOverride)
                 .disabled(!manualAdvancedHacksEnabled)
@@ -365,25 +322,29 @@ struct GraphicsTab: View {
             Toggle(settings.localized("Override Texture Offset X"), isOn: $textureOffsetXOverride)
                 .disabled(!manualAdvancedHacksEnabled)
             if textureOffsetXOverride {
-                ClampedIntField(title: settings.localized("Texture Offset X"), value: $textureOffsetX, range: SettingsStore.textureOffsetRange, isEnabled: manualAdvancedHacksEnabled)
+                NumberRow(.textureOffsetX, value: $textureOffsetX, settings: settings)
+                    .disabled(!manualAdvancedHacksEnabled)
             }
 
             Toggle(settings.localized("Override Texture Offset Y"), isOn: $textureOffsetYOverride)
                 .disabled(!manualAdvancedHacksEnabled)
             if textureOffsetYOverride {
-                ClampedIntField(title: settings.localized("Texture Offset Y"), value: $textureOffsetY, range: SettingsStore.textureOffsetRange, isEnabled: manualAdvancedHacksEnabled)
+                NumberRow(.textureOffsetY, value: $textureOffsetY, settings: settings)
+                    .disabled(!manualAdvancedHacksEnabled)
             }
 
             Toggle(settings.localized("Override Skipdraw Start"), isOn: $skipDrawStartOverride)
                 .disabled(!manualAdvancedHacksEnabled)
             if skipDrawStartOverride {
-                ClampedIntField(title: settings.localized("Skipdraw Start"), value: skipDrawStartBinding, range: SettingsStore.skipDrawRange, isEnabled: manualAdvancedHacksEnabled)
+                NumberRow(.skipDrawStart, value: skipDrawStartBinding, settings: settings)
+                    .disabled(!manualAdvancedHacksEnabled)
             }
 
             Toggle(settings.localized("Override Skipdraw End"), isOn: $skipDrawEndOverride)
                 .disabled(!manualAdvancedHacksEnabled)
             if skipDrawEndOverride {
-                ClampedIntField(title: settings.localized("Skipdraw End"), value: skipDrawEndBinding, range: SettingsStore.skipDrawRange, isEnabled: manualAdvancedHacksEnabled)
+                NumberRow(.skipDrawEnd, value: skipDrawEndBinding, settings: settings)
+                    .disabled(!manualAdvancedHacksEnabled)
             }
             if skipDrawStartOverride || skipDrawEndOverride {
                 Text(settings.localized("For Skipdraw 1, use Start 1 and End 1. " + (savesToRunningGame ? "Changes apply when you save." : "Changes apply on next boot.")))
@@ -393,43 +354,15 @@ struct GraphicsTab: View {
         }
 
         Section(settings.localized("Hardware Fixes & Display")) {
-            Picker(settings.localized("Hardware Download Mode"), selection: $perGameHWDownloadMode) {
-                Text(settings.localized("Use Global")).tag(-1)
-                Text(settings.localized("Enabled")).tag(0)
-                Text(settings.localized("Force Full")).tag(1)
-                Text(settings.localized("No Readbacks")).tag(2)
-                Text(settings.localized("Unsynchronized")).tag(3)
-                Text(settings.localized("Disabled")).tag(4)
-            }
-            .disabled(!enabled)
-            Picker(settings.localized("CPU CLUT Render"), selection: $perGameCPUCLUT) {
-                Text(settings.localized("Use Global")).tag(-1)
-                Text(settings.localized("Disabled")).tag(0)
-                Text(settings.localized("Normal")).tag(1)
-                Text(settings.localized("Aggressive")).tag(2)
-            }
-            .disabled(!enabled)
-            Picker(settings.localized("GPU Target CLUT"), selection: $perGameGPUTargetCLUT) {
-                Text(settings.localized("Use Global")).tag(-1)
-                Text(settings.localized("Off")).tag(0)
-                Text(settings.localized("Enabled (Exact)")).tag(1)
-                Text(settings.localized("Enabled (Inside Target)")).tag(2)
-            }
-            .disabled(!enabled)
-            Picker(settings.localized("VSync Queue Size"), selection: $perGameVsyncQueue) {
-                Text(settings.localized("Use Global")).tag(-1)
-                ForEach([2, 3, 4, 5, 6, 8, 10, 12, 16], id: \.self) { Text("\($0)").tag($0) }
-            }
-            .disabled(!enabled)
-            Picker(settings.localized("Sync to Host Refresh"), selection: $perGameSyncToHostRefresh) {
-                Text(settings.localized("Use Global")).tag(-1)
-                Text(settings.localized("Off")).tag(0)
-                Text(settings.localized("On")).tag(1)
-            }
-            .disabled(!enabled)
-            Text(settings.localized("Sync to Host Refresh needs a restart to take effect."))
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            sharedPicker("Hardware Download Mode", selection: $perGameHWDownloadMode,
+                         SettingsOptions.withUseGlobal(SettingsOptions.hardwareDownloadMode))
+                .disabled(!enabled)
+            sharedPicker("CPU CLUT Render", selection: $perGameCPUCLUT,
+                         SettingsOptions.withUseGlobal(SettingsOptions.cpuClutRender))
+                .disabled(!enabled)
+            sharedPicker("GPU Target CLUT", selection: $perGameGPUTargetCLUT,
+                         SettingsOptions.withUseGlobal(SettingsOptions.gpuTargetClut))
+                .disabled(!enabled)
         }
 
         Section(settings.localized("Texture Replacement")) {
@@ -454,6 +387,17 @@ struct GraphicsTab: View {
             Text(settings.localized("Texture replacement needs a restart to take effect."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Picker over a shared option table, localized the way the global screen's own
+    /// helper does. The caller adds `.disabled(...)`, since the gate differs per row.
+    private func sharedPicker(_ title: String, selection: Binding<Int>,
+                              _ options: [(id: Int, title: String)]) -> some View {
+        Picker(settings.localized(title), selection: selection) {
+            ForEach(options, id: \.id) { option in
+                Text(settings.localized(option.title)).tag(option.id)
+            }
         }
     }
 
@@ -516,41 +460,5 @@ struct GraphicsTab: View {
             return clampedEnd
         }
         return SettingsStore.normalizedSkipDrawEnd(start: start, end: clampedEnd)
-    }
-
-    /// A 1...100 Shade Boost parameter row. -1 means "Use Global": the slider is hidden
-    /// and a button restores the per-game override at the inherited global default so the
-    /// user can dial in any value (the previous picker only offered 25/50/75/100).
-    @ViewBuilder
-    private func shadeBoostSlider(_ title: String, value: Binding<Int>) -> some View {
-        if value.wrappedValue == -1 {
-            HStack {
-                Text(title)
-                Spacer()
-                Text(settings.localized("Use Global"))
-                    .foregroundStyle(.secondary)
-                Button(settings.localized("Override")) {
-                    value.wrappedValue = 50
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-        } else {
-            HStack {
-                Text(title)
-                Slider(value: Binding(
-                    get: { Double(value.wrappedValue) },
-                    set: { value.wrappedValue = Int($0.rounded()) }
-                ), in: 1...100)
-                Text("\(value.wrappedValue)%")
-                    .font(.caption.monospacedDigit())
-                    .frame(width: 44, alignment: .trailing)
-                Button(settings.localized("Global")) {
-                    value.wrappedValue = -1
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-        }
     }
 }

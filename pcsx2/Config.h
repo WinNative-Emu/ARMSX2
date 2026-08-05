@@ -456,8 +456,12 @@ constexpr bool IsHardwareDownloadReadbackEnabled(GSHardwareDownloadMode mode)
 	       mode == GSHardwareDownloadMode::Asynchronous;
 }
 
-/// True when the EE thread reads GS local memory itself, without synchronizing the GS thread.
-/// These modes cannot run with a separate GS front-parser object (no drain point exists).
+/// True when the EE thread services the readback itself instead of waiting on the GS thread.
+/// Both modes therefore need the GS thread synchronized around anything that reopens the
+/// renderer underneath them. NOTE: this says nothing about *what* gets read — Unsynchronized
+/// takes live local memory, Asynchronous takes the mutex-guarded CPU shadow — so it is not the
+/// right question to ask about the pipelined front-object split, which cares only about live
+/// reads. GS.cpp tests that directly.
 constexpr bool IsHardwareDownloadEEThreadRead(GSHardwareDownloadMode mode)
 {
 	return mode == GSHardwareDownloadMode::Unsynchronized ||
@@ -551,8 +555,10 @@ enum class GSUserHackOverride : u8
 	AutoFlush,
 	TextureInsideRt,
 	// Appended rather than slotted in next to X, so a mask already written to an INI keeps
-	// meaning what it meant.
+	// meaning what it meant. Everything below follows the same rule: append only.
 	TextureOffsetY,
+	PreloadFrameData,
+	DisablePartialInvalidation,
 	MaxCount
 };
 

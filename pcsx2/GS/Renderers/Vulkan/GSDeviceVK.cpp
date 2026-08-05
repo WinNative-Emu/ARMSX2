@@ -3411,22 +3411,66 @@ bool GSDeviceVK::CheckFeatures()
 	// input attachment and the feedback-loop-layout texelFetch sampler. Reading a separate copy of
 	// the target is the only reliable form.
 	//
-	// ⚠️ Narrowed to replacement textures deliberately. Device A/B on Turnip/Adreno 650:
-	//   - TotA + HD pack, in-tile: text layer gone at 4x AND at 1x (so it is not tile-size related)
-	//   - TotA + HD pack, RT copy: correct
-	//   - NFS Underground, no pack, 608 barrier draws/frame through the same in-tile self-read:
-	//     renders correctly
-	// So the self-read is fine for ordinary blending and only fails when the draw also samples a
-	// replacement. Applying the copy unconditionally cost +38%/+40% frame time at 3x/4x on the
-	// NFSU dump (copies 5 -> 348 per frame, render passes 62 -> 391) for no correctness gain,
-	// which is far too much to charge every Adreno user for a bug none of them can hit without a
-	// texture pack. Pack users pay it and get correct output; everyone else keeps the fast path.
+	// This was originally narrowed to replacement textures, on the evidence that Tales of the
+	// Abyss + an HD pack lost its whole 2D text layer in-tile (at 1x as well as 4x, so not
+	// tile-size related) while NFS Underground pushed 608 barrier draws per frame through the same
+	// in-tile self-read with no pack and rendered correctly. That read the pattern backwards: the
+	// self-read is not reliable for ordinary blending either, it just fails subtly enough there to
+	// look fine. OutRun 2006 has no pack and renders its sea as high-contrast two-tone speckle -
+	// 4.0% of the frame differs from the software renderer by more than 16 levels in-tile, and
+	// 0.13% through the RT copy (Turnip/Adreno 650, water dump, 2026-08-02). Both in-pass shapes
+	// are byte-identical wrong, which is what says driver rather than draw.
 	//
-	// If a title is ever reported losing draws WITHOUT a pack, widen this to unconditional — the
-	// underlying driver defect is not replacement-specific, only our evidence is.
+	// So it applies to every draw on an affected driver now. The cost is real and scales with
+	// upscale - measured on device, RT copy vs in-tile, median frame time over two runs each:
+	//
+	//              1x      3x      4x
+	//   FlatOut 2  +7.5%  +10.5%  +24.6%   (copies/frame 23 -> 477, render passes 100 -> 538)
+	//   OutRun    +20.5%   +9.9%   +0.5%
+	//   GoW II     -3.2%   +2.9%
+	//   RG lamps   -1.5%   +9.3%
+	//
+	// The old note recorded +38%/+40% at 3x/4x on NFSU. Nothing here reproduces that on the titles
+	// available now; FlatOut 2 makes a bigger structural change (more copies, more render passes)
+	// for a third of the cost at 3x. Treat the old figure as an upper bound on a build we can no
+	// longer run, not as a contradiction.
+	//
+	// WHICH draws does it get wrong? All of them, on every affected title, and worse than it
+	// looks. Scored per frame against the software renderer, in-tile (Turnip/Adreno 650,
+	// 2026-08-02):
+	//
+	//   FlatOut 2   31.3% of the frame wrong by >16 levels   <- worst measured, once read as clean
+	//   Katamari     7.5%
+	//   OutRun       4.6%   (a separate scoring run from the 4.0% above, different frames)
+	//   NFSU         0.00% by >16 levels, but ~40% of pixels off by 1-16
+	//
+	// NFSU is the whole lesson: corrupt everywhere and invisible, which is exactly what made
+	// "only titles with a texture pack" look like a real gate. There is no title-level
+	// discriminator to find. Nor a useful draw-level one - most corrupted draws never sample the
+	// target, they read it for the destination-alpha test and the write mask, so "self-read"
+	// understates what the workaround protects.
+	//
+	// Two distinct mechanisms, and only one of them is about ordering between draws:
+	//
+	//   1. An in-pass read does not observe writes made by EARLIER DRAWS in the same render
+	//      pass. Ending the pass before such a draw - read still in-pass, no copy - makes
+	//      OutRun, FlatOut, Katamari and NFSU pixel-identical to the copy path.
+	//   2. God of War II is not fixed by a pass boundary, and the oracle says the copy is the
+	//      correct one. Its first failing draw is a 10740-primitive overlapping triangle strip
+	//      whose own primitives read what their predecessors wrote - a hazard inside a single
+	//      draw, which no pass boundary can separate.
+	//
+	// The driver also ignores the in-pass barrier outright: forcing the explicit
+	// vkCmdPipelineBarrier self-dependency path, with the barrier landing on exactly the affected
+	// draws, produces byte-identical wrong output to the coherent ROAA read.
+	//
+	// So the pass boundary is a partial fix rather than a cheaper one - it leaves mechanism 2
+	// broken, and it would re-admit full-barrier draws this driver cannot order. It did measure
+	// ~7% faster than the copy on FlatOut at 1x, and no different on OutRun. Correctness for
+	// everyone beats speed for everyone, and OverrideTextureBarriers = 1 is the documented way
+	// out for anyone who would rather have the frames.
 	const bool rt_self_read_is_broken =
-		GetMobileDriverProfile().UsesWorkaround(DriverWorkaround::UseRenderTargetCopyForFeedback) &&
-		GSConfig.LoadTextureReplacements;
+		GetMobileDriverProfile().UsesWorkaround(DriverWorkaround::UseRenderTargetCopyForFeedback);
 
 	// framebuffer_fetch: the tiler-native ordered Cd read (ROAA / subpassLoad in tile
 	// memory). It lets DetermineBarriers() (GSRendererHW.cpp) drop every per-primitive
@@ -3553,8 +3597,8 @@ bool GSDeviceVK::CheckFeatures()
 	// revision that fixes the read; an explicit 0 already lands here anyway.
 	if (rt_self_read_is_broken && GSConfig.OverrideTextureBarriers < 0)
 	{
-		Console.WriteLn("VK: texture replacements active on a driver with an unreliable in-pass "
-						"render-target self-read — forcing the RT-copy blend path.");
+		Console.WriteLn("VK: driver has an unreliable in-pass render-target self-read — forcing the "
+						"RT-copy blend path.");
 		m_features.texture_barrier = false;
 	}
 	// Mali r44p1: the attachment-feedback-loop-layout disable in CreateDevice only swapped the
@@ -3940,15 +3984,27 @@ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& 
 			BeginRenderPassForStretchRect(
 				dTexVK, dst_rect, GSVector4i(destX, destY, destX + r.width(), destY + r.height()));
 
-			// so use an attachment clear
+			// so use an attachment clear. VkClearValue is a union, so only the aspect we are
+			// actually clearing may be written -- filling both destroys the colour's red and
+			// green with the depth and the stencil.
 			VkClearAttachment ca;
 			ca.aspectMask = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-			GSVector4::store<false>(ca.clearValue.color.float32, sTexVK->GetClearForFormat());
-			ca.clearValue.depthStencil.depth = sTexVK->GetClearDepth();
-			ca.clearValue.depthStencil.stencil = 0;
 			ca.colorAttachment = 0;
+			if (depth)
+			{
+				ca.clearValue.depthStencil.depth = sTexVK->GetClearDepth();
+				ca.clearValue.depthStencil.stencil = 0;
+			}
+			else
+			{
+				GSVector4::store<false>(ca.clearValue.color.float32, sTexVK->GetClearForFormat());
+			}
 
-			const VkClearRect cr = {{{0, 0}, {static_cast<u32>(r.width()), static_cast<u32>(r.height())}}, 0u, 1u};
+			// The clear rect is in framebuffer coordinates and the framebuffer is the whole
+			// destination, so it has to carry the copy's destination offset.
+			const VkClearRect cr = {{{static_cast<s32>(destX), static_cast<s32>(destY)},
+										{static_cast<u32>(r.width()), static_cast<u32>(r.height())}},
+				0u, 1u};
 			vkCmdClearAttachments(GetCurrentCommandBuffer(), 1, &ca, 1, &cr);
 
 			return;

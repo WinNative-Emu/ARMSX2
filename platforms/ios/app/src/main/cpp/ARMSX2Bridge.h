@@ -145,7 +145,7 @@ typedef void (^ARMSX2RetroAchievementsCompletion)(BOOL success, NSString * _Nonn
              upscaleMultiplier:(float)upscaleMultiplier
                    aspectRatio:(nonnull NSString *)aspectRatio
               textureFiltering:(int)textureFiltering
-            hardwareMipmapping:(BOOL)hardwareMipmapping
+            hardwareMipmapping:(int)hardwareMipmapping
               blendingAccuracy:(int)blendingAccuracy
                interlaceMode:(int)interlaceMode
         trilinearFiltering:(int)trilinearFiltering
@@ -182,7 +182,7 @@ typedef void (^ARMSX2RetroAchievementsCompletion)(BOOL success, NSString * _Nonn
                                upscaleMultiplier:(float)upscaleMultiplier
                                      aspectRatio:(nonnull NSString *)aspectRatio
                                 textureFiltering:(int)textureFiltering
-                              hardwareMipmapping:(BOOL)hardwareMipmapping
+                              hardwareMipmapping:(int)hardwareMipmapping
                                 blendingAccuracy:(int)blendingAccuracy
                                    interlaceMode:(int)interlaceMode
                               trilinearFiltering:(int)trilinearFiltering
@@ -300,6 +300,7 @@ typedef void (^ARMSX2RetroAchievementsCompletion)(BOOL success, NSString * _Nonn
 // Runtime speed control
 + (int)limiterMode;
 + (void)setLimiterMode:(int)mode;
++ (void)setPresentFPSCap:(float)fps NS_SWIFT_NAME(setPresentFPSCap(_:));
 
 // Compatibility Lab
 + (BOOL)getJITBisectFlag:(nonnull NSString *)key defaultValue:(BOOL)def;

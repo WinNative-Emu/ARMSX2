@@ -94,7 +94,7 @@ constexpr int GSState::GetSaveStateSize(int version)
 	return size;
 }
 
-GSState::GSState(GSBackQueue::Channel* shared_chan)
+GSState::GSState(GSBackQueue::Channel* shared_chan, bool is_front_parser)
 	: m_vt(this)
 {
 	// m_nativeres seems to be a hack. Unfortunately it impacts draw call number which make debug painful in the replayer.
@@ -151,8 +151,13 @@ GSState::GSState(GSBackQueue::Channel* shared_chan)
 
 	// Hardware renderers only: the SW renderer never issues GPU downloads, so there is
 	// nothing to shadow and MTGS::InitAndReadFIFO keeps taking the synchronizing path.
-	if (GSConfig.HWDownloadMode == GSHardwareDownloadMode::Asynchronous && GSConfig.UseHardwareRenderer())
+	// The front parser object is skipped as well — it borrows the back's shadow through
+	// m_mem_target, so allocating one here would cost a GS-memory-sized copy nobody reads.
+	if (GSConfig.HWDownloadMode == GSHardwareDownloadMode::Asynchronous && GSConfig.UseHardwareRenderer() &&
+		!is_front_parser)
+	{
 		EnsureAsyncReadbackMemory();
+	}
 
 	m_v.RGBAQ.Q = 1.0f;
 
@@ -212,7 +217,7 @@ GSState::~GSState()
 }
 
 GSFrontState::GSFrontState(GSState* back)
-	: GSState(back->GetBackChannel())
+	: GSState(back->GetBackChannel(), true)
 	, m_back(back)
 {
 	m_mem_target = back;
@@ -664,6 +669,9 @@ void GSState::StartBackThread()
 {
 	m_back_thread_exit.store(false, std::memory_order_release);
 	m_chan->consumer_running = true;
+	// Claim the empty-wait for this thread (the MTGS thread — every drain site,
+	// and the lockstep tail of PushRecord, run on it). See Channel::drain_thread.
+	m_chan->drain_thread = std::this_thread::get_id();
 	m_back_thread = std::thread(&GSState::BackThreadLoop, this);
 	// The drain policy is the PRODUCER's (the front object under the split
 	// runs pipelined while this back object's own flag stays lockstep), so
@@ -690,8 +698,17 @@ void GSState::DrainBackQueue()
 {
 	// Keyed on the channel, not this object's producer flag, so drains work
 	// from either side of the two-object split.
-	if (m_chan->consumer_running)
-		m_chan->sema.WaitForEmpty();
+	if (!m_chan->consumer_running)
+		return;
+
+	// Only the thread that started the consumer may wait for empty; a second
+	// waiter hangs for good. Checked here rather than relying on WaitForEmpty's
+	// own assert, which only trips when the two waits happen to overlap — this
+	// one trips on the first off-thread drain, whatever the timing.
+	pxAssertMsg(std::this_thread::get_id() == m_chan->drain_thread,
+		"GS back queue drained off the MTGS thread (single empty-waiter channel)");
+
+	m_chan->sema.WaitForEmpty();
 }
 
 void GSState::BackThreadLoop()
@@ -1197,16 +1214,22 @@ void GSState::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
 {
 	m_mipmap = GSConfig.Mipmap;
 
-	if (GSConfig.HWDownloadMode == GSHardwareDownloadMode::Asynchronous && GSConfig.UseHardwareRenderer())
+	// Only the object owning local memory owns the shadow. UpdateSettings runs on both halves
+	// of the pipelined split (GS.cpp), and the front's accessors all resolve to the back, so
+	// letting it through here would re-seed a copy nobody reads on every settings change.
+	if (m_mem_target == this)
 	{
-		if (old_config.HWDownloadMode != GSHardwareDownloadMode::Asynchronous || !m_async_readback_mem)
-			EnsureAsyncReadbackMemory();
-	}
-	else if (old_config.HWDownloadMode == GSHardwareDownloadMode::Asynchronous)
-	{
-		// The allocation is deliberately kept (the EE thread may be mid-read), but stop
-		// publishing into it so a later re-enable always re-seeds from live memory.
-		m_async_readback_ready.store(false, std::memory_order_release);
+		if (GSConfig.HWDownloadMode == GSHardwareDownloadMode::Asynchronous && GSConfig.UseHardwareRenderer())
+		{
+			if (old_config.HWDownloadMode != GSHardwareDownloadMode::Asynchronous || !m_async_readback_mem)
+				EnsureAsyncReadbackMemory();
+		}
+		else if (old_config.HWDownloadMode == GSHardwareDownloadMode::Asynchronous)
+		{
+			// The allocation is deliberately kept (the EE thread may be mid-read), but stop
+			// publishing into it so a later re-enable always re-seeds from live memory.
+			m_async_readback_ready.store(false, std::memory_order_release);
+		}
 	}
 
 	if (
@@ -4098,7 +4121,22 @@ void GSState::ReadFIFO(u8* mem, int size)
 
 void GSState::ReadLocalMemoryUnsync(u8* mem, int qwc, GIFRegBITBLTBUF BITBLTBUF, GIFRegTRXPOS TRXPOS, GIFRegTRXREG TRXREG)
 {
-	DrainBackQueue();
+	// Deliberately does NOT drain the back queue. This runs on the EE thread, and
+	// the queue's empty-wait admits exactly one waiter — the MTGS thread, which is
+	// already using it (the lockstep tail of PushRecord, and InitReadFIFO servicing
+	// the very AsyncReadFIFO packet this function queues). Two waiters and one of
+	// them never wakes: a hard hang in Release, where the assert inside
+	// WaitForEmpty is compiled out.
+	//
+	// Nothing is lost by leaving it out. The Asynchronous path below reads the
+	// shadow copy under m_async_readback_mutex, which is the real synchronization
+	// point and is published by the GS thread; a drain adds nothing and would stall
+	// the EE thread on the GS thread, which is exactly what the mode exists to
+	// avoid. The Unsynchronized path races the renderer's local-memory writes by
+	// definition — a drain narrows that window without closing it, since MTGS can
+	// queue another record the instant it returns. GS.cpp caps the staleness the
+	// real way, by refusing the pipelined front-object split whenever HW downloads
+	// are read from the EE thread.
 
 	const int w = TRXREG.RRW;
 	const int h = TRXREG.RRH;

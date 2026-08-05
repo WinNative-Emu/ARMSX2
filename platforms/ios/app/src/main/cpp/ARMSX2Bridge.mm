@@ -46,6 +46,7 @@ extern "C" void ARMSX2_iOSCopyDeviceStats(int* outBatteryPercent, int* outTherma
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Sio.h"
 #include "Counters.h"
+#include "GS/GS.h"
 #include "GS/GSState.h"
 #include "SPU2/spu2.h"
 #include "GameList.h"
@@ -80,6 +81,7 @@ extern "C" void ARMSX2_iOSCopyDeviceStats(int* outBatteryPercent, int* outTherma
 extern INISettingsInterface* g_p44_settings_interface;
 extern "C" void ARMSX2_PrepareGameRenderViewForCurrentRenderer(const char* reason);
 extern "C" void ARMSX2_PostRuntimeMenuStateChanged(void);
+extern "C" void ARMSX2_ApplyEffectivePresentFPSCap(void);
 extern "C" void ARMSX2_iOSTestGamepadRumble(void);
 extern "C" bool ARMSX2_IsIdleVMPrewarmResolved(void);
 
@@ -180,6 +182,9 @@ static NSString* const ARMSX2CompatibilityProfileIntegerALU = @"integeralu";
 static NSString* const ARMSX2CompatibilityProfileBranches = @"branches";
 static NSString* const ARMSX2CompatibilityProfileCustom = @"custom";
 static constexpr int ARMSX2UseGlobalIntSentinel = -1;
+// "Use global" markers. Out of band for their ranges: upscale is positive, the int keys start
+// at 0, AspectRatio uses an empty string.
+static constexpr float ARMSX2UseGlobalFloatSentinel = -1.0f;
 static constexpr int ARMSX2TriFilterUseGlobalSentinel = std::numeric_limits<int>::min();
 static constexpr int ARMSX2DefaultAudioVolumePercent = 100;
 
@@ -1655,7 +1660,8 @@ static NSMutableDictionary<NSString*, id>* ARMSX2BuildGlobalGameSettingsResult()
     const int globalTextureFiltering = g_p44_settings_interface ? g_p44_settings_interface->GetIntValue("EmuCore/GS", "filter", 2) : 2;
     const bool globalHardwareMipmapping = g_p44_settings_interface ? g_p44_settings_interface->GetBoolValue("EmuCore/GS", "hw_mipmap", true) : true;
     const int globalBlendingAccuracy = g_p44_settings_interface ? g_p44_settings_interface->GetIntValue("EmuCore/GS", "accurate_blending_unit", 1) : 1;
-    const int globalInterlaceMode = g_p44_settings_interface ? g_p44_settings_interface->GetIntValue("EmuCore/GS", "deinterlace_mode", 7) : 7;
+    // 0 is GSInterlaceMode::Automatic. Not 7, whatever the old picker labelled it.
+    const int globalInterlaceMode = g_p44_settings_interface ? g_p44_settings_interface->GetIntValue("EmuCore/GS", "deinterlace_mode", 0) : 0;
     const int globalTrilinearFiltering = g_p44_settings_interface ? g_p44_settings_interface->GetIntValue("EmuCore/GS", "TriFilter", -1) : -1;
     const int globalHalfPixelOffset = g_p44_settings_interface ? g_p44_settings_interface->GetIntValue("EmuCore/GS", "UserHacks_HalfPixelOffset", 0) : 0;
     const int globalRoundSprite = g_p44_settings_interface ? g_p44_settings_interface->GetIntValue("EmuCore/GS", "UserHacks_round_sprite_offset", 0) : 0;
@@ -1689,12 +1695,19 @@ static NSMutableDictionary<NSString*, id>* ARMSX2BuildGlobalGameSettingsResult()
         @"path": @"",
         @"serial": @"",
         @"crc": @"",
+        // has*Override so an untouched setting writes nothing.
         @"upscaleMultiplier": @(globalUpscale),
+        @"hasUpscaleMultiplierOverride": @NO,
         @"aspectRatio": ARMSX2NSStringFromStdString(globalAspect),
+        @"hasAspectRatioOverride": @NO,
         @"textureFiltering": @(globalTextureFiltering),
+        @"hasTextureFilteringOverride": @NO,
         @"hardwareMipmapping": @(globalHardwareMipmapping),
+        @"hasHardwareMipmappingOverride": @NO,
         @"blendingAccuracy": @(globalBlendingAccuracy),
+        @"hasBlendingAccuracyOverride": @NO,
         @"interlaceMode": @(globalInterlaceMode),
+        @"hasInterlaceModeOverride": @NO,
         @"trilinearFiltering": @(globalTrilinearFiltering),
         @"hasTrilinearFilteringOverride": @NO,
         @"halfPixelOffset": @(globalHalfPixelOffset),
@@ -1796,21 +1809,27 @@ static void ARMSX2ApplyPerGameSettingsOverrides(NSMutableDictionary<NSString*, i
         si.ContainsValue("ARMSX2iOS/UI", "InvertRightStickY");
 
     result[@"enabled"] = @(hasKnownOverride);
-    const bool hasStandardVolumeOverride = si.ContainsValue("SPU2/Output", "StandardVolume");
-    const bool hasFastForwardVolumeOverride = si.ContainsValue("SPU2/Output", "FastForwardVolume");
-    const bool hasVolumeOverride = hasStandardVolumeOverride || hasFastForwardVolumeOverride;
+    // StandardVolume only. Falling back to FastForwardVolume made the main slider show an
+    // override nobody set.
+    const bool hasVolumeOverride = si.ContainsValue("SPU2/Output", "StandardVolume");
     const int inheritedVolumePercent = [result[@"volumePercent"] intValue];
-    const int volumePercent = hasStandardVolumeOverride ?
+    const int volumePercent = hasVolumeOverride ?
         si.GetIntValue("SPU2/Output", "StandardVolume", inheritedVolumePercent) :
-        (hasFastForwardVolumeOverride ? si.GetIntValue("SPU2/Output", "FastForwardVolume", inheritedVolumePercent) : inheritedVolumePercent);
+        inheritedVolumePercent;
     result[@"hasVolumeOverride"] = @(hasVolumeOverride);
     result[@"volumePercent"] = @(ARMSX2ClampInt(volumePercent, 0, ARMSX2DefaultAudioVolumePercent));
     NSString* currentAspect = [result[@"aspectRatio"] isKindOfClass:NSString.class] ? result[@"aspectRatio"] : @"Auto 4:3/3:2";
+    result[@"hasUpscaleMultiplierOverride"] = @(si.ContainsValue("EmuCore/GS", "upscale_multiplier"));
     result[@"upscaleMultiplier"] = @(si.GetFloatValue("EmuCore/GS", "upscale_multiplier", [result[@"upscaleMultiplier"] floatValue]));
+    result[@"hasAspectRatioOverride"] = @(si.ContainsValue("EmuCore/GS", "AspectRatio"));
     result[@"aspectRatio"] = ARMSX2NSStringFromStdString(si.GetStringValue("EmuCore/GS", "AspectRatio", currentAspect.UTF8String));
+    result[@"hasTextureFilteringOverride"] = @(si.ContainsValue("EmuCore/GS", "filter"));
     result[@"textureFiltering"] = @(si.GetIntValue("EmuCore/GS", "filter", [result[@"textureFiltering"] intValue]));
+    result[@"hasHardwareMipmappingOverride"] = @(si.ContainsValue("EmuCore/GS", "hw_mipmap"));
     result[@"hardwareMipmapping"] = @(si.GetBoolValue("EmuCore/GS", "hw_mipmap", [result[@"hardwareMipmapping"] boolValue]));
+    result[@"hasBlendingAccuracyOverride"] = @(si.ContainsValue("EmuCore/GS", "accurate_blending_unit"));
     result[@"blendingAccuracy"] = @(si.GetIntValue("EmuCore/GS", "accurate_blending_unit", [result[@"blendingAccuracy"] intValue]));
+    result[@"hasInterlaceModeOverride"] = @(si.ContainsValue("EmuCore/GS", "deinterlace_mode"));
     result[@"interlaceMode"] = @(si.GetIntValue("EmuCore/GS", "deinterlace_mode", [result[@"interlaceMode"] intValue]));
     result[@"hasTrilinearFilteringOverride"] = @(si.ContainsValue("EmuCore/GS", "TriFilter"));
     result[@"trilinearFiltering"] = @(ARMSX2ClampInt(si.GetIntValue("EmuCore/GS", "TriFilter", [result[@"trilinearFiltering"] intValue]), -1, 2));
@@ -1933,13 +1952,46 @@ static void ARMSX2ApplyPerGameSettingsOverrides(NSMutableDictionary<NSString*, i
     }
 }
 
+// Older builds stamped deinterlace_mode 7 into every per-game file with overrides on. Nobody
+// picked that deliberately, Blend BFF was offered as 6, so drop it and let Automatic apply again.
+// Exact 7 only.
+void ARMSX2MigratePerGameDeinterlaceBlend(SettingsInterface* si)
+{
+    if (!si || si->GetBoolValue("ARMSX2iOS/Migrations", "PerGameDeinterlaceBlendV1", false))
+        return;
+
+    FileSystem::FindResultsArray files;
+    FileSystem::FindFiles(EmuFolders::GameSettings.c_str(), "*.ini",
+        FILESYSTEM_FIND_FILES | FILESYSTEM_FIND_HIDDEN_FILES, &files);
+
+    u32 repaired = 0;
+    for (const FILESYSTEM_FIND_DATA& fd : files) {
+        INISettingsInterface game_si(fd.FileName);
+        if (!game_si.Load())
+            continue;
+        if (!game_si.ContainsValue("EmuCore/GS", "deinterlace_mode") ||
+            game_si.GetIntValue("EmuCore/GS", "deinterlace_mode", 0) != 7)
+            continue;
+
+        game_si.DeleteValue("EmuCore/GS", "deinterlace_mode");
+        game_si.RemoveEmptySections();
+        if (game_si.Save())
+            repaired++;
+    }
+
+    si->SetBoolValue("ARMSX2iOS/Migrations", "PerGameDeinterlaceBlendV1", true);
+    si->Save();
+    std::fprintf(stderr, "@@IOS_DEINTERLACE_MIGRATION@@ scanned=%zu repaired=%u\n", files.size(), repaired);
+    std::fflush(stderr);
+}
+
 static void ARMSX2WriteGameSettingsForIdentity(const std::string& serial,
                                                 u32 crc,
                                                 BOOL enabled,
                                                 float upscaleMultiplier,
                                                 NSString* aspectRatio,
                                                 int textureFiltering,
-                                                BOOL hardwareMipmapping,
+                                                int hardwareMipmapping,
                                                 int blendingAccuracy,
                                                 int interlaceMode,
                                                 int trilinearFiltering,
@@ -1984,12 +2036,32 @@ static void ARMSX2WriteGameSettingsForIdentity(const std::string& serial,
 
     if (enabled) {
         si.SetBoolValue("ARMSX2iOS/PerGame", "Enabled", true);
-        si.SetFloatValue("EmuCore/GS", "upscale_multiplier", upscaleMultiplier);
-        si.SetStringValue("EmuCore/GS", "AspectRatio", aspectRatio.UTF8String ?: "Auto 4:3/3:2");
-        si.SetIntValue("EmuCore/GS", "filter", textureFiltering);
-        si.SetBoolValue("EmuCore/GS", "hw_mipmap", hardwareMipmapping);
-        si.SetIntValue("EmuCore/GS", "accurate_blending_unit", blendingAccuracy);
-        si.SetIntValue("EmuCore/GS", "deinterlace_mode", interlaceMode);
+        // Only write what was actually overridden. Copying the global in froze it against later
+        // edits, and for deinterlace_mode invented a value the global INI never held.
+        if (upscaleMultiplier <= ARMSX2UseGlobalFloatSentinel)
+            si.DeleteValue("EmuCore/GS", "upscale_multiplier");
+        else
+            si.SetFloatValue("EmuCore/GS", "upscale_multiplier", upscaleMultiplier);
+        if (aspectRatio.length == 0)
+            si.DeleteValue("EmuCore/GS", "AspectRatio");
+        else
+            si.SetStringValue("EmuCore/GS", "AspectRatio", aspectRatio.UTF8String);
+        if (textureFiltering == ARMSX2UseGlobalIntSentinel)
+            si.DeleteValue("EmuCore/GS", "filter");
+        else
+            si.SetIntValue("EmuCore/GS", "filter", textureFiltering);
+        if (hardwareMipmapping == ARMSX2UseGlobalIntSentinel)
+            si.DeleteValue("EmuCore/GS", "hw_mipmap");
+        else
+            si.SetBoolValue("EmuCore/GS", "hw_mipmap", hardwareMipmapping != 0);
+        if (blendingAccuracy == ARMSX2UseGlobalIntSentinel)
+            si.DeleteValue("EmuCore/GS", "accurate_blending_unit");
+        else
+            si.SetIntValue("EmuCore/GS", "accurate_blending_unit", blendingAccuracy);
+        if (interlaceMode == ARMSX2UseGlobalIntSentinel)
+            si.DeleteValue("EmuCore/GS", "deinterlace_mode");
+        else
+            si.SetIntValue("EmuCore/GS", "deinterlace_mode", interlaceMode);
         if (trilinearFiltering == ARMSX2TriFilterUseGlobalSentinel)
             si.DeleteValue("EmuCore/GS", "TriFilter");
         else
@@ -2073,21 +2145,42 @@ static void ARMSX2WriteGameSettingsForIdentity(const std::string& serial,
         else
             si.DeleteValue("EmuCore/GS", "UserHacks_SkipDraw_End");
 
-        if (volumeOverride) {
-            const int clampedVolumePercent = ARMSX2ClampInt(volumePercent, 0, ARMSX2DefaultAudioVolumePercent);
-            si.SetIntValue("SPU2/Output", "StandardVolume", clampedVolumePercent);
-            si.SetIntValue("SPU2/Output", "FastForwardVolume", clampedVolumePercent);
-        } else {
+        // StandardVolume only. The audio tab owns FastForwardVolume and writes it later in the
+        // same save, so touching it here just meant last writer won.
+        if (volumeOverride)
+            si.SetIntValue("SPU2/Output", "StandardVolume", ARMSX2ClampInt(volumePercent, 0, ARMSX2DefaultAudioVolumePercent));
+        else
             si.DeleteValue("SPU2/Output", "StandardVolume");
-            si.DeleteValue("SPU2/Output", "FastForwardVolume");
-        }
 
-        si.SetBoolValue("EmuCore", "EnableCheats", enableCheats);
-        si.SetBoolValue("EmuCore", "EnablePatches", enablePatches);
-        si.SetBoolValue("EmuCore", "EnableGameFixes", enableGameFixes);
-        si.SetBoolValue("EmuCore/GS", "UserHacks", !enableGameDBHardwareFixes);
-        si.SetIntValue("EmuCore/CPU", "CoreType", eeCoreType);
-        si.SetBoolValue("EmuCore/CPU", "UseArm64Dynarec", eeCoreType == 2);
+        // No use-global marker on these, so compare against the global and write nothing when
+        // they agree, same as vuThread below.
+        const auto writeIfDifferent = [&si](const char* section, const char* key, bool value, bool global_value) {
+            if (value == global_value)
+                si.DeleteValue(section, key);
+            else
+                si.SetBoolValue(section, key, value);
+        };
+        const bool globalEnableCheats = g_p44_settings_interface ?
+            g_p44_settings_interface->GetBoolValue("EmuCore", "EnableCheats", false) : false;
+        const bool globalEnablePatches = g_p44_settings_interface ?
+            g_p44_settings_interface->GetBoolValue("EmuCore", "EnablePatches", true) : true;
+        const bool globalEnableGameFixes = g_p44_settings_interface ?
+            g_p44_settings_interface->GetBoolValue("EmuCore", "EnableGameFixes", true) : true;
+        const bool globalUserHacks = g_p44_settings_interface ?
+            g_p44_settings_interface->GetBoolValue("EmuCore/GS", "UserHacks", false) : false;
+        const int globalEECoreType = g_p44_settings_interface ?
+            g_p44_settings_interface->GetIntValue("EmuCore/CPU", "CoreType", 2) : 2;
+        writeIfDifferent("EmuCore", "EnableCheats", enableCheats, globalEnableCheats);
+        writeIfDifferent("EmuCore", "EnablePatches", enablePatches, globalEnablePatches);
+        writeIfDifferent("EmuCore", "EnableGameFixes", enableGameFixes, globalEnableGameFixes);
+        writeIfDifferent("EmuCore/GS", "UserHacks", !enableGameDBHardwareFixes, globalUserHacks);
+        if (eeCoreType == globalEECoreType) {
+            si.DeleteValue("EmuCore/CPU", "CoreType");
+            si.DeleteValue("EmuCore/CPU", "UseArm64Dynarec");
+        } else {
+            si.SetIntValue("EmuCore/CPU", "CoreType", eeCoreType);
+            si.SetBoolValue("EmuCore/CPU", "UseArm64Dynarec", eeCoreType == 2);
+        }
         const bool globalMTVU = g_p44_settings_interface ?
             g_p44_settings_interface->GetBoolValue("EmuCore/Speedhacks", "vuThread", true) : true;
         if (mtvu == globalMTVU) {
@@ -2147,6 +2240,12 @@ static void ARMSX2WriteGameSettingsForIdentity(const std::string& serial,
         si.DeleteValue("EmuCore", "EnableFastBoot");
         si.DeleteValue("SPU2/Output", "StandardVolume");
         si.DeleteValue("SPU2/Output", "FastForwardVolume");
+        // hasKnownOverride counts these and the pad tab writes them without consulting the master
+        // toggle, so not clearing them let a flipped stick latch overrides on.
+        si.DeleteValue("ARMSX2iOS/UI", "InvertLeftStickX");
+        si.DeleteValue("ARMSX2iOS/UI", "InvertLeftStickY");
+        si.DeleteValue("ARMSX2iOS/UI", "InvertRightStickX");
+        si.DeleteValue("ARMSX2iOS/UI", "InvertRightStickY");
         si.RemoveEmptySections();
     }
 
@@ -3159,7 +3258,7 @@ extern "C" void ARMSX2_CaptureGraphicsHackState(void)
              upscaleMultiplier:(float)upscaleMultiplier
                    aspectRatio:(nonnull NSString *)aspectRatio
               textureFiltering:(int)textureFiltering
-            hardwareMipmapping:(BOOL)hardwareMipmapping
+            hardwareMipmapping:(int)hardwareMipmapping
               blendingAccuracy:(int)blendingAccuracy
                interlaceMode:(int)interlaceMode
         trilinearFiltering:(int)trilinearFiltering
@@ -3215,7 +3314,7 @@ extern "C" void ARMSX2_CaptureGraphicsHackState(void)
                                upscaleMultiplier:(float)upscaleMultiplier
                                      aspectRatio:(nonnull NSString *)aspectRatio
                                 textureFiltering:(int)textureFiltering
-                              hardwareMipmapping:(BOOL)hardwareMipmapping
+                              hardwareMipmapping:(int)hardwareMipmapping
                                 blendingAccuracy:(int)blendingAccuracy
                                    interlaceMode:(int)interlaceMode
                               trilinearFiltering:(int)trilinearFiltering
@@ -3992,6 +4091,7 @@ static void ARMSX2RequestPerGameSettingsReload()
             // EmuConfig and the MTGS ring are the CPU thread's; this runs on the UI thread.
             Host::RunOnCPUThread([]() {
                 VMManager::ReloadGameSettings();
+                ARMSX2_ApplyEffectivePresentFPSCap();
                 if (MTGS::IsOpen())
                     MTGS::ApplySettings();
             });
@@ -4218,6 +4318,11 @@ static void ARMSX2RequestPerGameSettingsReload()
         const LimiterModeType previousMode = VMManager::GetLimiterMode();
         VMManager::SetLimiterMode(limiterMode);
         const LimiterModeType appliedMode = VMManager::GetLimiterMode();
+        // Update cap suspension after the VM mode changes on the same CPU-thread
+        // task. This avoids a settings reload racing Turbo and restoring a cap
+        // using the previous limiter mode.
+        GSSetPresentCapSuspended(
+            appliedMode == LimiterModeType::Turbo && GSGetMaxPresentInterval() != 0);
         std::fprintf(stderr,
             "@@LIMITER_MODE@@ before=%d after=%d target=%.3f nominal=%.3f turbo=%.3f slomo=%.3f\n",
             static_cast<int>(previousMode), static_cast<int>(appliedMode), VMManager::GetTargetSpeed(),
@@ -4225,6 +4330,106 @@ static void ARMSX2RequestPerGameSettingsReload()
             EmuConfig.EmulationSpeed.SlomoScalar);
         std::fflush(stderr);
     }, false);
+}
+
+static void ARMSX2SetPresentFPSCapValue(double fps)
+{
+    const double requestedFPS = std::isfinite(fps) ? std::clamp(static_cast<double>(fps), 0.0, 1000.0) : 0.0;
+    const u32 requestedMilliFPS = requestedFPS > 0.0 ?
+        static_cast<u32>(std::llround(requestedFPS * 1000.0)) : 0u;
+
+    // 60 FPS and higher use the native/default path rather than a custom
+    // presentation cap. Publishing a zero interval preserves master's original
+    // VM pacing, rendering, and submission behavior. Fractional rates below 60,
+    // such as 59.970, remain explicit caps.
+    const bool customCapActive = requestedMilliFPS != 0 && requestedMilliFPS < 60000;
+    const u32 displayFPS = customCapActive ? static_cast<u32>(std::lround(requestedFPS)) : 0u;
+    const u32 milliFPS = customCapActive ? requestedMilliFPS : 0u;
+    const u64 interval = customCapActive
+        ? static_cast<u64>(std::llround(static_cast<double>(GetTickFrequency()) / requestedFPS))
+        : 0u;
+
+    GSSetMaxPresentFps(displayFPS, interval, milliFPS);
+    GSSetPresentCapRenderSkip(customCapActive);
+    GSSetPresentCapSuspended(customCapActive && VMManager::HasValidVM() &&
+        VMManager::GetLimiterMode() == LimiterModeType::Turbo);
+}
+
+// Older iOS per-game profiles encoded their presentation target in
+// Framerate/NominalScalar. Convert the active profile once so loading it no
+// longer slows CPU/audio timing, while retaining the selected display cadence.
+// This runs on the CPU thread before the effective cap is read.
+static bool ARMSX2MigrateLegacyPerGamePresentFPSCap()
+{
+    if (!VMManager::HasValidVM())
+        return false;
+
+    bool migrated = false;
+    {
+        auto lock = Host::GetSettingsLock();
+        SettingsInterface* const game_layer = Host::Internal::GetGameSettingsLayer();
+        if (!game_layer ||
+            !game_layer->ContainsValue("Framerate", "NominalScalar") ||
+            game_layer->ContainsValue("ARMSX2iOS/FramePacing", "TargetFPS"))
+        {
+            return false;
+        }
+
+        const float scalar = game_layer->GetFloatValue("Framerate", "NominalScalar", 1.0f);
+        if (!std::isfinite(scalar) || scalar >= 5.0f || std::abs(scalar - 1.0f) < 0.002f)
+            return false;
+
+        SettingsInterface* const layered = Host::GetSettingsInterface();
+        const float base_fps = layered ?
+            layered->GetFloatValue("EmuCore/GS", "FramerateNTSC", 59.94f) : 59.94f;
+        const float target_fps = std::clamp(scalar * std::max(base_fps, 1.0f), 15.0f, 120.0f);
+
+        game_layer->SetFloatValue("ARMSX2iOS/FramePacing", "TargetFPS", target_fps);
+        game_layer->SetFloatValue("Framerate", "NominalScalar", 1.0f);
+        Error error;
+        if (!game_layer->Save(&error))
+        {
+            Console.Error("Failed to migrate per-game presentation FPS cap: %s", error.GetDescription().c_str());
+            return false;
+        }
+        migrated = true;
+    }
+
+    if (migrated)
+        VMManager::ReloadGameSettings();
+    return migrated;
+}
+
+extern "C" void ARMSX2_ApplyEffectivePresentFPSCap(void)
+{
+    ARMSX2MigrateLegacyPerGamePresentFPSCap();
+
+    float nominalScalar = 1.0f;
+    float targetFPS = 60.0f;
+    {
+        auto lock = Host::GetSettingsLock();
+        SettingsInterface* const si = Host::GetSettingsInterface();
+        if (si)
+        {
+            nominalScalar = si->GetFloatValue("Framerate", "NominalScalar", 1.0f);
+            targetFPS = si->GetFloatValue("ARMSX2iOS/FramePacing", "TargetFPS", 60.0f);
+        }
+    }
+
+    const bool limiterEnabled = !std::isfinite(nominalScalar) || nominalScalar < 5.0f;
+    ARMSX2SetPresentFPSCapValue(limiterEnabled ? (std::isfinite(targetFPS) ? targetFPS : 60.0f) : 0.0f);
+    if (!VMManager::HasValidVM())
+        GSSetPresentCapSuspended(false);
+}
+
++ (void)setPresentFPSCap:(float)fps
+{
+    // With a running VM the layered settings interface is authoritative: a
+    // per-game TargetFPS must continue to win when the global value changes.
+    if (VMManager::HasValidVM())
+        Host::RunOnCPUThread([]() { ARMSX2_ApplyEffectivePresentFPSCap(); }, false);
+    else
+        ARMSX2SetPresentFPSCapValue(fps);
 }
 
 #pragma mark - Compatibility Lab

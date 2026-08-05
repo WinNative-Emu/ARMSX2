@@ -234,12 +234,13 @@ void C_LT() {
 void CFC1() {
 	if (!_Rt_) return;
 
-	if (_Fs_ == 31)
-		cpuRegs.GPR.r[_Rt_].SD[0] = (s32)fpuRegs.fprc[31];	// force sign extension to 64 bit
-	else if (_Fs_ == 0)
-		cpuRegs.GPR.r[_Rt_].SD[0] = 0x2E00;
+	// Only bit 4 of the register field is decoded: 0-15 alias FCR0, 16-31
+	// alias FCR31. Both recompilers implement this (iFPU.cpp recCFC1,
+	// iFPU-arm64.cpp recCFC1); the SD[0] stores force sign extension to 64 bit.
+	if (_Fs_ >= 16)
+		cpuRegs.GPR.r[_Rt_].SD[0] = (s32)((fpuRegs.fprc[31] & 0x0083c078) | 0x01000001); // drop always-zero bits, set always-one bits
 	else
-		cpuRegs.GPR.r[_Rt_].SD[0] = 0;
+		cpuRegs.GPR.r[_Rt_].SD[0] = (s32)fpuRegs.fprc[0];
 }
 
 void CTC1() {
@@ -342,7 +343,15 @@ void RSQRT_S() {
 
 	if ( ( _FtValUl_ & 0x7F800000 ) == 0 ) { // Ft is zero (Denormals are Zero)
 		_ContVal_ |= FPUflagD | FPUflagSD;
-		_FdValUl_ = ( _FtValUl_ & 0x80000000 ) | posFmax;
+		// The sign of FS ALONE. Unlike DIV.S there is no xor here: rsqrt
+		// divides by sqrt(|Ft|), so the divisor has no sign left to contribute
+		// by the time the division happens. Console rows witness it --
+		// rsqrt(+0, -0) is positive and rsqrt(-0, -0) is negative, and an xor
+		// rule (or Ft's sign, which this used) flips both. x86 recRSQRThelper1
+		// has always taken Fs's sign. The magnitude stays at posFmax, the
+		// shared saturation compromise -- silicon says 0x7FFFFFFF there, which
+		// is the top-binade question, not the sign question.
+		_FdValUl_ = ( _FsValUl_ & 0x80000000 ) | posFmax;
 		return;
 	}
 	else if ( _FtValUl_ & 0x80000000 ) { // Ft is negative
@@ -359,13 +368,55 @@ void RSQRT_S() {
 void SQRT_S() {
 	clearFPUFlags(FPUflagI | FPUflagD);
 
-	if ( ( _FtValUl_ & 0x7F800000 ) == 0 ) // If Ft = +/-0
-		_FdValUl_ = _FtValUl_ & 0x80000000;// result is 0
-	else if ( _FtValUl_ & 0x80000000 ) { // If Ft is Negative
+	// Invalid-operation keys off the SIGN BIT ALONE. -0 and the negative
+	// denormals raise it too, even though they are flushed to -0 and produce a
+	// perfectly ordinary +0: the exponent field plays no part. This used to sit
+	// inside the negative-normal arm below, so those two operand classes came
+	// back with FCR31 untouched. x86's recSQRT_S_xmm has always tested the sign
+	// bit alone (iFPU.cpp, MOVMSKPS & 1), as has the FULL-mode DOUBLE path in
+	// iFPUd-arm64.cpp. Scored against a first-party capture over the sign x
+	// exponent matrix -- see EeRecFpu.SqrtSInvalidFlagFollowsTheSignBitAlone.
+	if ( _FtValUl_ & 0x80000000 )
 		_ContVal_ |= FPUflagI | FPUflagSI;
-		_FdValf_ = sqrt( fabs( fpuDouble( _FtValUl_ ) ) );
-	} else
-		_FdValf_ = sqrt( fpuDouble( _FtValUl_ ) ); // If Ft is Positive
+
+	if ( ( _FtValUl_ & 0x7F800000 ) == 0 ) // If Ft = +/-0 (denormals included)
+	{
+		_FdValUl_ = 0;                     // +0: the EE drops the sign here, and
+		                                   // both recompilers already do (they
+		                                   // take |Ft| before the sqrt). See
+		                                   // EeRecFpu.SqrtSOfNegativeZeroIsPositiveZero.
+	}
+	else if ( ( _FtValUl_ & 0x7F800000 ) == 0x7F800000 )
+	{
+		// Exponent 255 is an ORDINARY binade on the EE -- no Inf, no NaN, and
+		// the representable max is 0x7FFFFFFF, not FLT_MAX. So fpuDouble()'s
+		// clamp is not a rounding of this operand, it is a different operand,
+		// and the answer lands two binades low: sqrt(2^128) came back as
+		// 0x5F7FFFFF where the console gives 0x5F800000, and sqrt(+EEMAX) as
+		// 0x5F7FFFFF against 0x5FB504F3.
+		//
+		// Square-root |Ft|/4 and double it. sqrt halves exponents, so the
+		// scaled operand (exponent field 253) and the doubled result are both
+		// ordinary representable singles -- no wider format is needed. 4 is an
+		// even power of two, so its own square root is exact and the identity
+		// contributes no rounding: the sqrt below is the only rounding step,
+		// exactly as on the untouched path. Same power-of-two prescale that
+		// ToDouble() uses to carry these operands into FULL mode
+		// (iFPUd-arm64.cpp), with the factor picked to suit sqrt so it can stay
+		// in single precision. The arm64 fast path emits the same two steps --
+		// see recSQRT_S_xmm in iFPU-arm64.cpp.
+		//
+		// RSQRT_S deliberately does NOT get this. Its two clamped operands
+		// currently cancel on rsqrt(2^128, 2^128); unclamping only the sqrt
+		// breaks that row. It is all-or-nothing and is a separate change.
+		FPRreg quarter;
+		quarter.UL = ( _FtValUl_ & 0x7FFFFFFF ) - 0x01000000; // |Ft| / 4
+		_FdValf_ = 2.0 * sqrt( (double)quarter.f );
+	}
+	else
+	{
+		_FdValf_ = sqrt( fabs( fpuDouble( _FtValUl_ ) ) ); // sqrt of |Ft|
+	}
 }
 
 void SUB_S() {
