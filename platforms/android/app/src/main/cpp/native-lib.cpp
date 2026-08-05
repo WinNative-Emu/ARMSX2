@@ -342,7 +342,13 @@ Java_kr_co_iefriends_pcsx2_NativeApp_initialize(JNIEnv *env, jclass clazz,
         si.SetBoolValue("InputSources", "XInput", false);
 
         si.SetStringValue("SPU2/Output", "Backend", "Oboe");
-        si.SetBoolValue("EmuCore", "EnableFastBoot", false);
+        // ★ MUST match Settings.kt's `enableFastBoot = true`. This first-run seed used to write
+        // FALSE while the Kotlin default (what the UI shows) was TRUE, so on a fresh install the
+        // Skip BIOS switch read ON while boot_params.fast_boot resolved to false — the full BIOS
+        // ran and dropped the user in the memory-card/config screen instead of the game, with no
+        // setting that looked wrong. Only reached when the settings file is empty (first launch),
+        // so it can never override a choice the user has actually made.
+        si.SetBoolValue("EmuCore", "EnableFastBoot", true);
 
         // Enable RetroAchievements by default. Pcsx2Config defaults this to
         // false (privacy-conscious for desktop), but on Android the in-game
@@ -1232,6 +1238,15 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setPortraitRenderTopInset(JNIEnv*, jclass, 
     // Isshin. Only the top-align path uses it, and that path always has spare room below, so the
     // image shifts down rather than being cropped.
     GSSetPortraitRenderTopInset(static_cast<int>(pixels));
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setLandscapeRenderTop(JNIEnv*, jclass, jboolean top) {
+    // Top-align the render in a LANDSCAPE window instead of vertical-centering. Foldables and
+    // clamshell controllers open the screen downward, so a centred image sits too low. Same GS
+    // static shape as the portrait flag: read live per-present, safe with or without a VM.
+    GSSetLandscapeRenderTopAlign(top == JNI_TRUE);
 }
 
 extern "C"
@@ -2611,10 +2626,22 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
         return false;
     }
 
-    // fast_boot : (false:bios->game, true:game)
     VMBootParameters boot_params;
     boot_params.filename = _szPath;
-    boot_params.fast_boot = Host::GetBaseBoolSettingValue("EmuCore", "EnableFastBoot", false);
+    // fast_boot is deliberately left UNSET so VMManager::Initialize falls back to
+    // EmuConfig.EnableFastBoot, which it reads late and on purpose ("Read fast boot setting
+    // late so it can be overridden per-game").
+    //
+    // This used to force it from Host::GetBaseBoolSettingValue("EmuCore", "EnableFastBoot",
+    // false), which was wrong twice over:
+    //   * the fallback was FALSE while every other layer defaults it TRUE (Settings.kt's
+    //     enableFastBoot, and VMManager::SetDefaultSettings). Any time the key was not yet in
+    //     settings.ini -- notably right after an update, before the Kotlin settings have been
+    //     pushed down -- the app showed "Skip BIOS: on" and full-booted anyway. Toggling the
+    //     switch off and on wrote the key and "fixed" it, which is exactly what users reported.
+    //   * it read only the BASE layer, so a per-game Skip BIOS override was ignored outright.
+    // Letting the resolved config decide fixes both, and there is no Android-specific reason
+    // to override the boot mode per launch.
     Console.WriteLnFmt("@@ANDROID_RUNVM_PATH@@ empty={} path={}",
         _szPath.empty() ? 1 : 0, _szPath);
     Console.Error("Loading %s", _szPath.c_str());
@@ -2652,6 +2679,24 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
     if (boot_result == VMBootResult::StartupSuccess)
     {
         Console.Error("VM INIT");
+        // Boot-shape diagnostic for the "Skip BIOS OFF lands in the BIOS browser instead of
+        // the game" report. The boot path itself is stock upstream, so the answer has to be
+        // one of these four values, and one emulog line settles which:
+        //   fastboot : did the setting actually reach boot_params (0 = full BIOS boot)
+        //   src      : CDVD source type — 0/NoDisc here means nothing was mounted to boot
+        //   disctype : what the BIOS's sceCdGetDiskType sees; a PS2 disc auto-boots, and a
+        //              DETCT / illegal type is precisely what drops OSDSYS to the browser
+        //   nvm      : does <bios>.nvm exist yet — an absent/unconfigured NVM is why the
+        //              BIOS runs first-boot setup and then parks in the browser
+        {
+            const std::string nvm_path = Path::ReplaceExtension(BiosPath, "nvm");
+            Console.WriteLnFmt("@@ANDROID_BOOTSHAPE@@ fastboot={} src={} disctype=0x{:02X} nvm={} bios={}",
+                +EmuConfig.EnableFastBoot,
+                static_cast<int>(CDVDsys_GetSourceType()),
+                cdvd.DiscType,
+                FileSystem::FileExists(nvm_path.c_str()) ? 1 : 0,
+                Path::GetFileName(BiosPath));
+        }
         // Apply the persisted frame-limit preference now that the VM is up.
         // The overlay's Frame Limiter toggle stores into the base layer via
         // setSetting("EmuCore/GS","FrameLimitEnable") + speedhackLimitermode
@@ -2752,7 +2797,16 @@ Java_kr_co_iefriends_pcsx2_NativeApp_pause(JNIEnv *env, jclass clazz) {
     }
     else if (state == VMState::Paused)
     {
-        Console.WriteLn("@@ANDROID_PAUSE@@ already_paused");
+        // Already paused, but still flush the BIOS NVRAM. Backgrounding while the pause
+        // menu is up took this branch and skipped the flush entirely — and that is the
+        // common way to leave a game that booted into the BIOS browser, which is exactly
+        // the session whose config we most need to keep. Without it the BIOS re-ran its
+        // first-boot setup on the next launch no matter how many times you configured it.
+        Host::RunOnCPUThread([]() {
+            if (VMManager::HasValidVM())
+                cdvdSaveNVRAM();
+        });
+        Console.WriteLn("@@ANDROID_PAUSE@@ already_paused nvm_flush_queued");
     }
 }
 

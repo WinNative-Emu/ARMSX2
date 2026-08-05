@@ -5,6 +5,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -103,6 +104,12 @@ fun SaveStatePickerScreen(mode: SaveMode, onBack: () -> Unit) {
     // a refresh bump so the slot tiles re-probe and show the imported save immediately.
     var notice by remember { mutableStateOf<String?>(null) }
     var refreshKey by remember { mutableStateOf(0) }
+    // Slot pending deletion, confirmed before anything is removed.
+    var deleteSlot by remember { mutableStateOf<Int?>(null) }
+    // Delete MODE. Long-press works, but it is invisible and a controller cannot long-press —
+    // both reported. With this armed, choosing a slot deletes it instead of loading/saving, so
+    // the D-pad + A reaches deletion through the same path everything else uses.
+    var deleteMode by remember { mutableStateOf(false) }
     val importContext = androidx.compose.ui.platform.LocalContext.current
     val importLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
@@ -123,8 +130,25 @@ fun SaveStatePickerScreen(mode: SaveMode, onBack: () -> Unit) {
             ArmsTopBar(
                 title = if (mode == SaveMode.Save) str("savestate.title.save")
                 else str("savestate.title.loadManage"),
-                leading = { RoundAction("←", str("action.back"), onBack) },
-                actions = { RoundAction("⤓", str("savestate.import"), onClick = { importLauncher.launch(arrayOf("*/*")) }) },
+                leading = { RoundAction("←", str("action.back"), onBack, controllerId = "save.back") },
+                actions = {
+                    RoundAction("⤓", str("savestate.import"), onClick = { importLauncher.launch(arrayOf("*/*")) }, controllerId = "save.import")
+                    RoundAction(
+                        "🗑",
+                        str("savestate.delete.mode"),
+                        onClick = { deleteMode = !deleteMode; notice = null; failure = null },
+                        selected = deleteMode,
+                        controllerId = "save.deleteMode",
+                    )
+                },
+            )
+            // Say what the screen can do. Long-press-to-delete was undiscoverable on its own —
+            // there was nothing on screen to suggest it existed.
+            Text(
+                if (deleteMode) str("savestate.delete.modeHint") else str("savestate.hint"),
+                color = if (deleteMode) Color(0xFFFFB4A2) else Color(0xFF9AA0A6),
+                fontSize = 12.sp,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
             )
             failure?.let { key ->
                 Text(
@@ -177,7 +201,19 @@ fun SaveStatePickerScreen(mode: SaveMode, onBack: () -> Unit) {
                     }
                 }
                     items((0 until SLOTS).toList(), key = { "slot_$it" }) { slot ->
-                        SlotTile(slot, mode, refreshKey) { selected ->
+                        SlotTile(
+                            slot,
+                            mode,
+                            refreshKey,
+                            deleteMode = deleteMode,
+                            onDelete = { deleteSlot = it },
+                        ) { selected ->
+                            // Armed for deletion: choosing a slot deletes it, so the pad reaches
+                            // deletion through the same confirm press it uses everywhere else.
+                            if (deleteMode) {
+                                deleteSlot = selected
+                                return@SlotTile
+                            }
                             scope.launch(Dispatchers.IO) {
                                 // The result used to be discarded and onBack() called either way, so
                                 // a refused save closed the picker looking exactly like a successful
@@ -217,6 +253,39 @@ fun SaveStatePickerScreen(mode: SaveMode, onBack: () -> Unit) {
                 }
             }
         }
+    }
+
+    // Delete confirmation for a long-pressed slot. ConfirmOverlay (not a Dialog) so the pad can
+    // reach it; the file is removed directly because there is no delete JNI — the slot path from
+    // getGamePathSlot is the same file the manager deletes.
+    deleteSlot?.let { slot ->
+        com.armsx2.ui.common.ConfirmOverlay(
+            title = str("savestate.delete.title"),
+            message = str("savestate.delete.body").format(slot + 1),
+            confirmLabel = str("action.delete"),
+            destructive = true,
+            idPrefix = "savestate.delete",
+            onDismiss = { deleteSlot = null },
+            onConfirm = {
+                deleteSlot = null
+                scope.launch(Dispatchers.IO) {
+                    val ok = runCatching {
+                        val path = NativeApp.getGamePathSlot(slot)
+                        !path.isNullOrBlank() && java.io.File(path).delete()
+                    }.getOrDefault(false)
+                    withContext(Dispatchers.Main) {
+                        if (ok) {
+                            failure = null
+                            notice = "${com.armsx2.i18n.I18n.get("action.delete")} · ${slot + 1}"
+                            refreshKey++
+                        } else {
+                            notice = null
+                            failure = "savestate.delete.failed"
+                        }
+                    }
+                }
+            },
+        )
     }
 }
 
@@ -328,7 +397,14 @@ private fun AutosaveTile(onPick: () -> Unit) {
 }
 
 @Composable
-private fun SlotTile(slot: Int, mode: SaveMode, refreshKey: Int = 0, onPick: (Int) -> Unit) {
+private fun SlotTile(
+    slot: Int,
+    mode: SaveMode,
+    refreshKey: Int = 0,
+    deleteMode: Boolean = false,
+    onDelete: ((Int) -> Unit)? = null,
+    onPick: (Int) -> Unit,
+) {
     val gamePath by produceState<String?>(initialValue = null, slot, refreshKey) {
         value = withContext(Dispatchers.IO) { runCatching { NativeApp.getGamePathSlot(slot) }.getOrNull() }
     }
@@ -341,14 +417,19 @@ private fun SlotTile(slot: Int, mode: SaveMode, refreshKey: Int = 0, onPick: (In
         }
     }
     val empty = gamePath.isNullOrEmpty()
-    // Load: empty slots disabled. Save: any slot is a valid target.
-    val enabled = mode == SaveMode.Save || !empty
+    // Load: empty slots disabled. Save: any slot is a valid target. Delete mode overrides both —
+    // only an OCCUPIED slot can be deleted, whichever screen you came in on.
+    val enabled = if (deleteMode) !empty else (mode == SaveMode.Save || !empty)
     TileFrame(
         controllerId = if (enabled) "save.slot.$slot" else null,
-        borderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.6f),
+        borderColor = if (deleteMode && !empty) Color(0xFFFFB4A2)
+        else MaterialTheme.colorScheme.outline.copy(alpha = 0.6f),
         backgroundColor = MaterialTheme.colorScheme.surfaceVariant,
         enabled = enabled,
         onClick = { onPick(slot) },
+        // Long-press an OCCUPIED slot to delete it — the reported gap ("tap and hold does
+        // nothing", and deleting otherwise meant digging through a file manager).
+        onLongClick = if (!empty && onDelete != null) ({ onDelete(slot) }) else null,
     ) {
         image?.let {
             Image(it.asImageBitmap(), "Slot ${slot + 1}",
@@ -373,6 +454,7 @@ private fun TileFrame(
     backgroundColor: Color,
     enabled: Boolean = true,
     onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
     content: @Composable BoxScope.() -> Unit,
 ) {
     Box(
@@ -383,7 +465,11 @@ private fun TileFrame(
             .clip(RoundedCornerShape(12.dp))
             .background(backgroundColor)
             .border(1.dp, borderColor, RoundedCornerShape(12.dp))
-            .clickable(enabled = enabled, onClick = onClick),
+            .combinedClickable(
+                enabled = enabled || onLongClick != null,
+                onClick = { if (enabled) onClick() },
+                onLongClick = onLongClick,
+            ),
         content = content,
     )
 }

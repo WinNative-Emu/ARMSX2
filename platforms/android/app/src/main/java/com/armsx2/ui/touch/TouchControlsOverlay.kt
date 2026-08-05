@@ -196,8 +196,8 @@ fun TouchControlsOverlay() {
         if (edit && !running) {
             Box(Modifier.fillMaxSize().background(Color(0xF2101015)))
         }
-        LaunchedEffect(widthPx, heightPx) {
-            OverlayDims.last = OverlayDims.Dims(widthPx, heightPx)
+        LaunchedEffect(widthPx, heightPx, density.density) {
+            OverlayDims.last = OverlayDims.Dims(widthPx, heightPx, density.density)
         }
         val layout = TouchControls.activeLayout.value
         // Buttons the single UnifiedTouchLayer currently holds down (face + shoulder +
@@ -360,6 +360,12 @@ fun TouchControlsOverlay() {
             // hidden away; skip it here or it would render twice. Edit mode still gets it from
             // the loop, so it stays draggable/resizable like every other widget.
             if (cfg.id == TouchButtonId.PAUSE && !edit) continue
+            // The extra analog button's visibility is owned by the Pad-settings toggle, not by the
+            // layout's own enabled flag — one switch, in the place users already look for it. The
+            // layout entry only carries where it sits and how big it is. Gating here (rather than
+            // on cfg.enabled) is deliberate: when the toggle is ON it must appear in EDIT mode too,
+            // which is the whole point of the change — it is now dragged like every other widget.
+            if (cfg.id == TouchButtonId.ANALOG_EXTRA && !TouchControls.analogExtraEnabled.value) continue
             val size = cfg.sizeDp.dp
             // Grid snap (editor only): render the centre anchor on the nearest cross so it visibly
             // clicks into place while dragging. The underlying cfg.xFrac keeps the raw free-drag
@@ -388,6 +394,7 @@ fun TouchControlsOverlay() {
                     TouchButtonId.Kind.FASTFORWARD -> FastForwardWidget(cfg, edit)
                     TouchButtonId.Kind.MACRO -> MacroWidget(cfg, edit)
                     TouchButtonId.Kind.STATEACTION -> StateActionWidget(cfg, edit)
+                    TouchButtonId.Kind.ANALOGEXTRA -> AnalogExtraWidget(cfg, edit)
 	                    else -> ButtonWidget(
 	                        cfg = cfg,
 	                        edit = edit,
@@ -561,7 +568,8 @@ private fun drawableFor(id: TouchButtonId, pressed: Boolean): Int = when (id) {
     TouchButtonId.DPAD, TouchButtonId.L_STICK, TouchButtonId.R_STICK,
     TouchButtonId.PAUSE, TouchButtonId.PRESSURE, TouchButtonId.FAST_FORWARD,
     TouchButtonId.MACRO1, TouchButtonId.MACRO2, TouchButtonId.MACRO3, TouchButtonId.MACRO4,
-    TouchButtonId.SAVE_STATE, TouchButtonId.LOAD_STATE, TouchButtonId.SCREENSHOT -> R.drawable.pad_cross
+    TouchButtonId.SAVE_STATE, TouchButtonId.LOAD_STATE, TouchButtonId.SCREENSHOT,
+    TouchButtonId.ANALOG_EXTRA -> R.drawable.pad_cross
 }
 
 /** Pressure-sensitivity modifier button. Emits no PS2 keycode; while held it
@@ -582,6 +590,8 @@ private fun PressureButtonWidget(cfg: TouchButtonCfg, edit: Boolean) {
                         val change = ev.changes.firstOrNull() ?: continue
                         if (!change.pressed) continue
                         TouchControls.pressureModifierHeld.value = true
+                        // Soften buttons already held (MGS2: hold Square, then ease off).
+                        TouchControls.reapplyPressureToHeldButtons()
                         TouchControls.noteTouchInteraction()
                         while (true) {
                             val next = awaitPointerEvent()
@@ -589,6 +599,7 @@ private fun PressureButtonWidget(cfg: TouchButtonCfg, edit: Boolean) {
                             if (nc == null || !nc.pressed) break
                         }
                         TouchControls.pressureModifierHeld.value = false
+                        TouchControls.reapplyPressureToHeldButtons()
                     }
                 }
             }
@@ -1261,6 +1272,8 @@ private fun StickWidget(cfg: TouchButtonCfg, edit: Boolean) {
     val origin = remember(cfg.id) { mutableStateOf<Offset?>(null) }
     val baseShift = remember(cfg.id) { mutableStateOf(Offset.Zero) }
     val lastEmit = remember(cfg.id) { mutableStateOf(StickEmit()) }
+    // Extra stick button (left stick): currently held? Drives both the emit and its visual.
+    val extraHeld = remember(cfg.id) { mutableStateOf(false) }
     val opacity = TouchControls.opacity.floatValue
     val density = LocalDensity.current
 
@@ -1302,6 +1315,13 @@ private fun StickWidget(cfg: TouchButtonCfg, edit: Boolean) {
                             if (lastEmit.value.any()) {
                                 releaseStick(codes, lastEmit.value)
                                 lastEmit.value = StickEmit()
+                            }
+                            // Lifting off always drops this gesture's hold on the extra button.
+                            if (extraHeld.value) {
+                                extraHeld.value = false
+                                if (TouchControls.noteAnalogExtraHold(false)) {
+                                    sendDigital(TouchControls.analogExtraKeycode.intValue, false)
+                                }
                             }
                         }
                         continue
@@ -1352,6 +1372,35 @@ private fun StickWidget(cfg: TouchButtonCfg, edit: Boolean) {
                         applyStickDiff(codes, lastEmit.value, emit)
                         lastEmit.value = emit
                     }
+                    // Extra stick button (left stick only): a circular zone directly ABOVE the
+                    // stick. Hit-tested HERE, inside the stick's own gesture, which is the whole
+                    // point — the pointer is locked to this handler, so a finger that glides up
+                    // out of the stick still reports here and can latch the button. Deflection
+                    // keeps being emitted above, so "run forward + sprint" is one thumb motion.
+                    if (leftStick) {
+                        // ★ The zone is the extra button widget's OWN circle, wherever the user
+                        // dragged it — one position, one source of truth, so what you see is what
+                        // you can glide onto. tracked.position is in the STICK's local space and
+                        // the button is a sibling widget, so lift it to overlay coordinates first.
+                        val circle = extraButtonCircle()
+                        val dims = OverlayDims.last
+                        val inZone = circle != null && dims != null && run {
+                            val (c, r) = circle
+                            // This widget's own top-left in overlay space: the layout anchors on
+                            // the widget CENTRE (see the placement loop), hence the half-size.
+                            val absX = dims.widthPx * cfg.xFrac - size.width / 2f + tracked.position.x
+                            val absY = dims.heightPx * cfg.yFrac - size.height / 2f + tracked.position.y
+                            val zdx = absX - c.x
+                            val zdy = absY - c.y
+                            (zdx * zdx + zdy * zdy) <= r * r
+                        }
+                        if (inZone != extraHeld.value) {
+                            extraHeld.value = inZone
+                            if (TouchControls.noteAnalogExtraHold(inZone)) {
+                                sendDigital(TouchControls.analogExtraKeycode.intValue, inZone)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1401,8 +1450,94 @@ private fun StickWidget(cfg: TouchButtonCfg, edit: Boolean) {
                 )
                 .size(thumbSizeDp.dp),
         )
+        // The extra analog button is no longer drawn here — it is its own widget (AnalogExtraWidget)
+        // placed by the layout, so it can be dragged in the editor. This gesture handler still
+        // hit-tests it above, which is the part that has to live here: a finger locked onto the
+        // stick keeps reporting to THIS handler after it glides off the stick, so no other
+        // handler ever sees it.
         if (edit) EditAdornment(cfg.id)
     }
+}
+
+/* -------------------------------------------------------------------- */
+/*  Extra analog button (sprint / jump)                                  */
+/* -------------------------------------------------------------------- */
+
+/** The extra button that rides with the left stick. An ORDINARY widget: it is placed by the
+ *  layout, so it drags and resizes in the touch editor exactly like the D-pad or a face button.
+ *
+ *  It used to be a satellite of the stick, positioned only by distance/angle sliders buried in Pad
+ *  settings and invisible to the editor — the editor is where everyone goes to move a control, so
+ *  in practice it could not be moved at all.
+ *
+ *  Two gestures can hold it: a direct press (here) and a thumb that glides up off the stick (in
+ *  StickWidget, which hit-tests THIS widget's circle). Both go through
+ *  TouchControls.noteAnalogExtraHold so a lift by one never releases the other's hold. */
+@Composable
+private fun AnalogExtraWidget(cfg: TouchButtonCfg, edit: Boolean) {
+    val held = TouchControls.analogExtraHeld.value
+    val opacity = TouchControls.opacity.floatValue
+    val label = TouchControls.macroTargetFor(TouchControls.analogExtraKeycode.intValue)?.label ?: "?"
+    val mod = Modifier
+        .fillMaxSize()
+        .let { m ->
+            if (edit) m.editGestures(cfg)
+            else m.pointerInput(cfg.id) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val ev = awaitPointerEvent()
+                        val change = ev.changes.firstOrNull { it.pressed } ?: continue
+                        if (TouchControls.noteAnalogExtraHold(true)) {
+                            sendDigital(TouchControls.analogExtraKeycode.intValue, true)
+                        }
+                        TouchControls.noteTouchInteraction()
+                        while (true) {
+                            val next = awaitPointerEvent()
+                            val nc = next.changes.firstOrNull { it.id == change.id }
+                            if (nc == null || !nc.pressed) break
+                        }
+                        if (TouchControls.noteAnalogExtraHold(false)) {
+                            sendDigital(TouchControls.analogExtraKeycode.intValue, false)
+                        }
+                    }
+                }
+            }
+        }
+    Box(modifier = mod, contentAlignment = Alignment.Center) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .clip(CircleShape)
+                .background(Color.Black.copy(alpha = (if (held) 0.55f else 0.30f) * opacity))
+                .border(
+                    1.dp,
+                    Color.White.copy(alpha = (if (held) 0.85f else 0.35f) * opacity),
+                    CircleShape,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                label,
+                color = Color.White.copy(alpha = legibleAlpha(opacity, 0.35f)),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+        if (edit) EditAdornment(cfg.id)
+    }
+}
+
+/** The extra button's circle in SCREEN pixels, or null when it is off / the overlay has not been
+ *  measured yet. The stick's glide hit test needs it in absolute coordinates because the finger it
+ *  is tracking is reported in the STICK's local space — the two widgets are siblings, so the only
+ *  common frame is the overlay. Anchor is the widget centre (see the placement loop). */
+private fun extraButtonCircle(): Pair<Offset, Float>? {
+    if (!TouchControls.analogExtraEnabled.value) return null
+    val dims = OverlayDims.last ?: return null
+    val cfg = TouchControls.activeLayout.value.buttons
+        .firstOrNull { it.id == TouchButtonId.ANALOG_EXTRA } ?: return null
+    return Offset(dims.widthPx * cfg.xFrac, dims.heightPx * cfg.yFrac) to
+        (cfg.sizeDp / 2f * dims.density)
 }
 
 private data class StickCodes(val xPos: Int, val xNeg: Int, val yPos: Int, val yNeg: Int)
@@ -1546,6 +1681,10 @@ private fun sendDigital(keycode: Int, pressed: Boolean) {
     // while the modifier is held; 0 (full press) otherwise. native-lib.cpp's
     // setPadButton turns the range into a 0..1 pressure value.
     val range = if (pressed) TouchControls.pressureRangeFor(keycode) else 0
+    // Track the held state so the modifier can be applied LIVE to a button already down
+    // (MGS2: hold Square to aim, then ease off to cancel the shot). Port 0 — the on-screen
+    // pad always drives P1.
+    TouchControls.notePressureKeyState(0, keycode, pressed)
     NativeApp.setPadButton(keycode, range, pressed)
     // Touch haptics (#247): a short vibration tick when a button goes DOWN. Press-only
     // (release stays silent); gated by the Touch Haptics setting (default on).
@@ -1695,7 +1834,9 @@ private fun snapLayoutToGrid() {
 
 private object OverlayDims {
     @Volatile var last: Dims? = null
-    data class Dims(val widthPx: Float, val heightPx: Float)
+    // density is carried alongside so non-composable code (the stick's glide hit test) can turn a
+    // widget's sizeDp into pixels without reaching for a Context it does not have.
+    data class Dims(val widthPx: Float, val heightPx: Float, val density: Float = 1f)
 }
 
 /** Editor snap-to-grid: the overlay width is divided into this many columns; rows use the same

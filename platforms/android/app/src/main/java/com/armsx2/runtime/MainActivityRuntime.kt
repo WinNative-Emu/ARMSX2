@@ -372,6 +372,10 @@ open class MainActivityRuntime : ComponentActivity() {
         // Reset to false whenever a game starts.
         @Volatile var fastForwardToggleActive = false
 
+        /** Read-only view of the fast-forward latch, for UI that only needs to DISPLAY it (the
+         *  second-display panel shows a ▶▶ marker while carrying the OSD). */
+        fun isFastForwardActive(): Boolean = fastForwardToggleActive
+
         // Latched state for the "Slow Down (toggle)" hotkey (LimiterModeType::Slomo).
         // Mutually exclusive with the fast-forward latch; blocked in RA hardcore.
         @Volatile var slowDownToggleActive = false
@@ -523,6 +527,10 @@ open class MainActivityRuntime : ComponentActivity() {
             // Never leave the device pinned once the game is gone (#425).
             com.armsx2.ui.ScreenPinning.stop()
             stopAutoProgressiveScanHold()
+            // Drop pressure-modifier bookkeeping: a button still held when the game exits would
+            // otherwise stay in the set and be re-emitted into the NEXT session.
+            com.armsx2.ui.touch.TouchControls.clearHeldPressureKeys()
+            com.armsx2.BatteryWatcher.resetForNewSession()
             instance?.runOnUiThread { instance?.applyEmulationOrientation() }
         }
 
@@ -1931,10 +1939,13 @@ open class MainActivityRuntime : ComponentActivity() {
             // merge layer so a stick MOTION event can't release it mid-hold.
             if (p_keycode in 110..123 && port in analogKeyHeld.indices)
                 analogKeyHeld[port][p_keycode] = pad_force / 32767f
+            // Track for the LIVE pressure modifier (see TouchControls.notePressureKeyState).
+            com.armsx2.ui.touch.TouchControls.notePressureKeyState(port, p_keycode, true)
             NativeApp.setPadButtonForPort(port, p_keycode, pad_force, true)
         } else if (p_action == KeyEventType.KeyUp || p_action == KeyEventType.Unknown) {
             if (p_keycode in 110..123 && port in analogKeyHeld.indices)
                 analogKeyHeld[port].remove(p_keycode)
+            com.armsx2.ui.touch.TouchControls.notePressureKeyState(port, p_keycode, false)
             NativeApp.setPadButtonForPort(port, p_keycode, 0, false)
         }
     }
@@ -2065,6 +2076,18 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.PauseMusic.load()
         com.armsx2.MenuSfx.load(applicationContext)
         com.armsx2.ControllerSkinStore.load(applicationContext)
+        // Low-battery / high-temperature banners. Registers for the sticky battery broadcast, so
+        // there is no polling; the toggle lives in App settings.
+        com.armsx2.OverlayRepo.load()
+        com.armsx2.CoverRegionIndex.load()
+        // Only parses the 2.6MB GameDB when a non-default cover region is actually in use.
+        if (com.armsx2.CoverRegionIndex.region.intValue != 0)
+            com.armsx2.CoverRegionIndex.ensureBuilt(applicationContext)
+        // Second-display utility panel (Ayn Thor / Retroid dual screen). No-op with one display.
+        com.armsx2.SecondScreen.load()
+        com.armsx2.SecondScreen.attach(applicationContext)
+        com.armsx2.BatteryWatcher.load()
+        com.armsx2.BatteryWatcher.start(applicationContext)
         startAutosaveIntervalJob()
         // Restore the saved rumble master toggle into the native gate (NativeApp.onPadRumble).
         NativeApp.sRumbleEnabled = ControllerMappings.rumbleEnabled()
@@ -2779,6 +2802,9 @@ open class MainActivityRuntime : ComponentActivity() {
                     KeyEvent.ACTION_DOWN -> com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = true
                     KeyEvent.ACTION_UP -> com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = false
                 }
+                // Apply the change to buttons ALREADY held, so easing on/off works mid-hold
+                // instead of only for presses started after the modifier (the MGS2 case).
+                com.armsx2.ui.touch.TouchControls.reapplyPressureToHeldButtons()
                 return true
             }
         }
@@ -3347,12 +3373,32 @@ open class MainActivityRuntime : ComponentActivity() {
 
     /** Quick save / load to the active slot — shared by the SAVE_STATE/LOAD_STATE
      *  hotkeys and the on-screen Save/Load State touch buttons. Runs off the UI thread. */
+    /**
+     * RetroAchievements hardcore forbids save states — enforced HERE so every entry point is
+     * covered at once.
+     *
+     * The slot picker checked it, but these direct quick-save/load helpers did not, so anything
+     * bypassing the picker (the second-display panel, the on-screen state buttons, the hotkeys)
+     * could still load a state in hardcore — precisely the cheat the mode exists to prevent.
+     */
+    private fun blockedByHardcore(): Boolean {
+        val hardcore = runCatching { NativeApp.isHardcoreMode() }.getOrDefault(false)
+        if (hardcore) {
+            runOnUiThread {
+                com.armsx2.ui.WelcomeBanner.show(com.armsx2.i18n.I18n.get("savestate.error.hardcore"))
+            }
+        }
+        return hardcore
+    }
+
     fun saveState() {
+        if (blockedByHardcore()) return
         val slot = currentSaveSlot.value
         kotlin.concurrent.thread { runCatching { NativeApp.saveStateToSlot(slot) } }
     }
 
     fun loadState(onLoaded: (() -> Unit)? = null) {
+        if (blockedByHardcore()) return
         val slot = currentSaveSlot.value
         kotlin.concurrent.thread {
             runCatching { NativeApp.loadStateFromSlot(slot) }
@@ -4683,6 +4729,10 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun onPause() {
+        // Take the second-display panel down with the app. A Presentation is not torn down by the
+        // activity stopping, so it otherwise stayed on the external screen while the user was off
+        // doing something else (reported).
+        runCatching { com.armsx2.SecondScreen.setForeground(applicationContext, false) }
         // DS-lid-style chime when the SCREEN is going off (device sleeping) — gated on isInteractive
         // so a plain background (home / recents, screen still on) stays silent. Fires before we pause
         // audio below so the blip is heard as the device sleeps.
@@ -4722,6 +4772,7 @@ open class MainActivityRuntime : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        runCatching { com.armsx2.SecondScreen.setForeground(applicationContext, true) }
         // Woke from a real sleep (paired with the onPause sleep chime): play the wake chime + a brief
         // top-left "Welcome Back!". A plain background return never set wasAsleep, so this only fires
         // after an actual screen-off sleep.
@@ -4769,6 +4820,9 @@ open class MainActivityRuntime : ComponentActivity() {
             super.onDestroy()
             return
         }
+        // Real finish only — a configuration recreate must NOT tear the second-display panel
+        // down (it would flicker away and rebuild on every rotation/density change).
+        runCatching { com.armsx2.SecondScreen.release(applicationContext) }
         NativeApp.shutdown()
         super.onDestroy()
 
