@@ -12,6 +12,7 @@ struct GraphicsTab: View {
 
     // Core graphics overrides. Each carries a use-global sentinel so an untouched setting is not
     // written to the per-game file at all, plus the global value to label what it inherits.
+    @Binding var perGameRenderer: Int
     @Binding var upscaleMultiplier: Float
     @Binding var aspectRatio: String
     @Binding var textureFiltering: Int
@@ -23,12 +24,9 @@ struct GraphicsTab: View {
     @Binding var trilinearFiltering: Int
     @Binding var halfPixelOffset: Int
     @Binding var roundSprite: Int
-    @Binding var alignSpriteOverride: Bool
-    @Binding var alignSprite: Bool
-    @Binding var mergeSpriteOverride: Bool
-    @Binding var mergeSprite: Bool
-    @Binding var wildArmsOffsetOverride: Bool
-    @Binding var wildArmsOffset: Bool
+    @Binding var alignSprite: Int
+    @Binding var mergeSprite: Int
+    @Binding var wildArmsOffset: Int
     @Binding var textureOffsetXOverride: Bool
     @Binding var textureOffsetX: Int
     @Binding var textureOffsetYOverride: Bool
@@ -111,6 +109,14 @@ struct GraphicsTab: View {
     @ViewBuilder
     private var graphicsContent: some View {
         Section(settings.localized("Graphics")) {
+            sharedPicker("Renderer", selection: $perGameRenderer,
+                         SettingsOptions.withUseGlobal(SettingsOptions.renderer))
+                .disabled(!enabled)
+
+            Text(settings.localized("Software Renderer is much slower but can fix games that break on Metal. It applies the next time this game boots."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
             EnumPicker([(id: Self.upscaleUseGlobalSentinel, title: settings.localized("Use Global"))] + UpscaleOptions.all, selection: $upscaleMultiplier) {
                 Text(settings.localized("Internal Resolution"))
             }
@@ -241,8 +247,7 @@ struct GraphicsTab: View {
             .disabled(!enabled)
         }
 
-        // Its own section, the way the global screen has it. The header is what lets the four rows
-        // be called Brightness and Contrast rather than repeating Shade Boost four times.
+        // Its own section, as on the global screen, so the four rows can be named plainly.
         Section(settings.localized("Shade Boost")) {
             Picker(settings.localized("Shade Boost"), selection: $perGameShadeBoost) {
                 Text(settings.localized("Use Global")).tag(-1)
@@ -270,12 +275,12 @@ struct GraphicsTab: View {
         }
 
         Section(settings.localized("Advanced Upscaling Hacks")) {
-            Text(settings.localized("Manual advanced hacks only apply when Use Per-Game Overrides is on and GameDB Graphics Fixes is off. " + (savesToRunningGame ? "They apply when you save." : "They apply on next boot.")))
+            Text(settings.localized("A hack you set here outranks the game database for this game, and everything on Use Global stays automatic. " + (savesToRunningGame ? "Changes apply when you save." : "Changes apply on next boot.")))
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             if enabled && enableGameDBHardwareFixes {
-                Text(settings.localized("GameDB Graphics Fixes is on, so manual advanced hacks are saved but ignored until it is turned off for this game."))
+                Text(settings.localized("Skipdraw is the exception: it only applies while GameDB Graphics Fixes is off for this game."))
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -292,45 +297,45 @@ struct GraphicsTab: View {
 
             sharedPicker("Half-pixel Offset", selection: $halfPixelOffset,
                          Self.halfPixelOffsetOptions)
-                .disabled(!manualAdvancedHacksEnabled)
+                .disabled(!enabled)
 
             sharedPicker("Round Sprite", selection: $roundSprite,
                          Self.roundSpriteOptions)
-                .disabled(!manualAdvancedHacksEnabled)
+                .disabled(!enabled)
 
-            Toggle(settings.localized("Override Align Sprite"), isOn: $alignSpriteOverride)
-                .disabled(!manualAdvancedHacksEnabled)
-            if alignSpriteOverride {
-                Toggle(settings.localized("Align Sprite"), isOn: $alignSprite)
-                    .disabled(!manualAdvancedHacksEnabled)
+            Picker(settings.localized("Align Sprite"), selection: $alignSprite) {
+                Text(settings.localized("Use Global")).tag(Self.useGlobalSentinel)
+                Text(settings.localized("Off")).tag(0)
+                Text(settings.localized("On")).tag(1)
             }
+            .disabled(!enabled)
 
-            Toggle(settings.localized("Override Merge Sprite"), isOn: $mergeSpriteOverride)
-                .disabled(!manualAdvancedHacksEnabled)
-            if mergeSpriteOverride {
-                Toggle(settings.localized("Merge Sprite"), isOn: $mergeSprite)
-                    .disabled(!manualAdvancedHacksEnabled)
+            Picker(settings.localized("Merge Sprite"), selection: $mergeSprite) {
+                Text(settings.localized("Use Global")).tag(Self.useGlobalSentinel)
+                Text(settings.localized("Off")).tag(0)
+                Text(settings.localized("On")).tag(1)
             }
+            .disabled(!enabled)
 
-            Toggle(settings.localized("Override Wild Arms Offset"), isOn: $wildArmsOffsetOverride)
-                .disabled(!manualAdvancedHacksEnabled)
-            if wildArmsOffsetOverride {
-                Toggle(settings.localized("Wild Arms Offset"), isOn: $wildArmsOffset)
-                    .disabled(!manualAdvancedHacksEnabled)
+            Picker(settings.localized("Wild Arms Offset"), selection: $wildArmsOffset) {
+                Text(settings.localized("Use Global")).tag(Self.useGlobalSentinel)
+                Text(settings.localized("Off")).tag(0)
+                Text(settings.localized("On")).tag(1)
             }
+            .disabled(!enabled)
 
             Toggle(settings.localized("Override Texture Offset X"), isOn: $textureOffsetXOverride)
-                .disabled(!manualAdvancedHacksEnabled)
+                .disabled(!enabled)
             if textureOffsetXOverride {
                 NumberRow(.textureOffsetX, value: $textureOffsetX, settings: settings)
-                    .disabled(!manualAdvancedHacksEnabled)
+                    .disabled(!enabled)
             }
 
             Toggle(settings.localized("Override Texture Offset Y"), isOn: $textureOffsetYOverride)
-                .disabled(!manualAdvancedHacksEnabled)
+                .disabled(!enabled)
             if textureOffsetYOverride {
                 NumberRow(.textureOffsetY, value: $textureOffsetY, settings: settings)
-                    .disabled(!manualAdvancedHacksEnabled)
+                    .disabled(!enabled)
             }
 
             Toggle(settings.localized("Override Skipdraw Start"), isOn: $skipDrawStartOverride)

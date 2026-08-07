@@ -46,6 +46,8 @@ struct GraphicsSettingsView: View {
             }
             if status.pinned {
                 Button(settings.localized("Use the game database value")) {
+                    // Reset first; the value write may pin again, so the unpin must come last.
+                    settings.resetGraphicsHackValue(key)
                     settings.setGraphicsHackPinned(key, false)
                 }
                 .font(.caption)
@@ -215,8 +217,7 @@ struct GraphicsSettingsView: View {
 
             Section(settings.localized("Display")) {
                 Picker(settings.localized("Deinterlace"), selection: $settings.interlaceMode) {
-                    // Tags are GSInterlaceMode values. This list used to be shifted by one, so
-                    // every label from Weave down named the mode below it.
+                    // Tags are GSInterlaceMode values; a shift by one renames every mode.
                     Text(settings.localized("Automatic (Default)")).tag(0)
                     Text(settings.localized("Off (No Deinterlacing)")).tag(1)
                     Text(settings.localized("Weave (TFF)")).tag(2)
@@ -369,18 +370,21 @@ struct GraphicsSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                intPicker("Texture Inside RT", selection: $settings.textureInsideRt, shared: SettingsOptions.textureInsideRT)
+                intPicker("Texture Inside RT", selection: claiming("UserHacks_TextureInsideRt", $settings.textureInsideRt), shared: SettingsOptions.textureInsideRT)
+                hackNote("UserHacks_TextureInsideRt", shown: settings.textureInsideRt)
                 intPicker("Limit 24-Bit Depth", selection: $settings.limit24BitDepth, options: [
                     ("Off", 0), ("Prioritise Upper Bits", 1), ("Prioritise Lower Bits", 2)
                 ])
-                intPicker("Native Scaling", selection: $settings.nativeScaling, options: [
+                intPicker("Native Scaling", selection: claiming("UserHacks_native_scaling", $settings.nativeScaling), options: [
                     ("Off", 0), ("Normal", 1), ("Aggressive", 2), ("Normal (Maintain Upscale)", 3), ("Aggressive (Maintain Upscale)", 4)
                 ])
+                hackNote("UserHacks_native_scaling", shown: settings.nativeScaling)
                 intPicker("CPU CLUT Render", selection: $settings.cpuClutRender, shared: SettingsOptions.cpuClutRender)
                 intPicker("GPU Target CLUT", selection: $settings.gpuTargetClut, shared: SettingsOptions.gpuTargetClut)
-                intPicker("Bilinear Upscale", selection: $settings.bilinearUpscaleHack, options: [
+                intPicker("Bilinear Upscale", selection: claiming("UserHacks_BilinearHack", $settings.bilinearUpscaleHack), options: [
                     ("Automatic", 0), ("Force Bilinear", 1), ("Force Nearest", 2)
                 ])
+                hackNote("UserHacks_BilinearHack", shown: settings.bilinearUpscaleHack)
                 NumberRow(.cpuSpriteRenderBw, value: $settings.cpuSpriteRenderBw,
                           settings: settings)
                 intPicker("CPU Sprite Render Level", selection: $settings.cpuSpriteRenderLevel,
@@ -394,6 +398,7 @@ struct GraphicsSettingsView: View {
                         get: { settings.gsBoolHackEnabled(option.key) },
                         set: { settings.setGSBoolHack(option.key, $0) }
                     ))
+                    hackNote(option.key, shown: settings.gsBoolHackEnabled(option.key) ? 1 : 0)
                 }
             } header: {
                 Text(settings.localized("Hardware Fixes"))

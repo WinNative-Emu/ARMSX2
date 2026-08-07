@@ -727,6 +727,12 @@ void VMManager::LoadCoreSettings(SettingsInterface& si)
 {
 	SettingsLoadWrapper slw(si);
 	EmuConfig.LoadSave(slw);
+
+	// A game file's UserHackOverrides replaces the base mask outright, and the
+	// player's global claims still stand here.
+	if (SettingsInterface* base = Host::Internal::GetBaseSettingsLayer(); base && base != &si)
+		EmuConfig.GS.UserHackOverrides |= static_cast<u32>(base->GetIntValue("EmuCore/GS", "UserHackOverrides", 0));
+
 	Patch::ApplyPatchSettingOverrides();
 
 	// Achievements hardcore mode disallows setting some configuration options.
@@ -3348,6 +3354,13 @@ void VMManager::CheckForMiscConfigChanges(const Pcsx2Config& old_config)
 
 void VMManager::CheckForConfigChanges(const Pcsx2Config& old_config)
 {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+	// GSreopen would recreate the Metal device under the running game, so a
+	// renderer change brought in by a reload waits for the next boot.
+	if (MTGS::IsOpen())
+		EmuConfig.GS.Renderer = old_config.GS.Renderer;
+#endif
+
 	if (HasValidVM())
 	{
 		CheckForCPUConfigChanges(old_config);
