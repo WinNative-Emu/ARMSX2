@@ -703,6 +703,10 @@ void GSDevice11::SetFeatures(IDXGIAdapter1* adapter)
 {
 	// Check these first as others depend on them.
 	m_features.multidraw_fb_copy = GSConfig.OverrideTextureBarriers != 0;
+	// D3D11 has no render passes, so the RT copy that serves a feedback read costs a copy and
+	// nothing else. This is the one backend where the renderer may add a feedback read to a draw
+	// that did not ask for one. See the flag's declaration.
+	m_features.cheap_rt_feedback_read = m_features.multidraw_fb_copy;
 	m_features.vs_expand = (!GSConfig.DisableVertexShaderExpand && m_feature_level >= D3D_FEATURE_LEVEL_11_0);
 
 	// Check all three formats, since the feature means any can be used.
@@ -2075,6 +2079,7 @@ void GSDevice11::SetupPS(const PSSelector& sel, const GSHWDrawConfig::PSConstant
 		sm.AddMacro("PS_TEX_IS_FB", sel.tex_is_fb);
 		sm.AddMacro("PS_NO_COLOR", sel.no_color);
 		sm.AddMacro("PS_NO_COLOR1", sel.no_color1);
+		sm.AddMacro("PS_BLEND_FACTOR_IN_ALPHA", sel.blend_factor_in_alpha);
 		sm.AddMacro("PS_ZTST", sel.ztst);
 		sm.AddMacro("PS_AA1", static_cast<u32>(sel.aa1));
 		sm.AddMacro("PS_ABE", sel.abe);
