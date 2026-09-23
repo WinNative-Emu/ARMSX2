@@ -528,6 +528,7 @@ set(pcsx2GSSources
 	GS/MultiISA.cpp
 	GS/Renderers/Common/GSDevice.cpp
 	GS/Renderers/Common/GSDirtyRect.cpp
+	GS/Renderers/Common/GSFieldShiftDetector.cpp
 	GS/Renderers/Common/GSFunctionMap.cpp
 	# The GPU driver-bug database is keyed on the DRIVER, not the platform: Turnip, PanVK and the
 	# Qualcomm blob all ship outside Android too (ARM Linux handhelds — Rocknix, Batocera). Building
@@ -583,22 +584,30 @@ set(pcsx2GSHeaders
 	GS/GSXXH.h
 	GS/MultiISA.h
 	GS/Renderers/Common/GSBlendConstantPolicy.h
+	GS/Renderers/Common/GSBackThreadPolicy.h
+	GS/Renderers/Common/GSCopyRoadBlendingPolicy.h
+	GS/Renderers/Common/GSDynamicFeedbackLoopPolicy.h
 	GS/Renderers/Common/GSDevice.h
 	GS/Renderers/Common/GSDirtyRect.h
 	GS/Renderers/Common/GSFastList.h
 	GS/Renderers/Common/GSFastStencilShadow.h
 	GS/Renderers/Common/GSFeedbackLoopCarryPolicy.h
+	GS/Renderers/Common/GSFieldShiftDetector.h
+	GS/Renderers/Common/GSFieldShiftPolicy.h
 	GS/Renderers/Common/GSFramebufferFetchPolicy.h
+	GS/Renderers/Common/GSMeasurementOverrides.h
 	GS/Renderers/Common/GSFunctionMap.h
 	GS/Renderers/Common/GSGPUProfile.h
 	GS/Renderers/Common/GSGPUProfilePrivate.h
 	GS/Renderers/Common/GSInterlaceModePolicy.h
+	GS/Renderers/Common/GSNativeTexelGridPolicy.h
 	GS/Renderers/Common/GSPassScheduler.h
 	GS/Renderers/Common/GSPresentationPolicy.h
 	GS/Renderers/Common/GSRenderer.h
 	GS/Renderers/Common/GSSwPrimRender.h
 	GS/Renderers/Common/GSShaderEnums.h
 	GS/Renderers/Common/GSSelfReadCopyPolicy.h
+	GS/Renderers/Common/GSSelfReadRoadPolicy.h
 	GS/Renderers/Common/GSSnapshotPolicy.h
 	GS/Renderers/Common/GSStreamRingFlushRange.h
 	GS/Renderers/Common/GSStreamRingMemoryPolicy.h
@@ -606,6 +615,7 @@ set(pcsx2GSHeaders
 	GS/Renderers/Common/GSVertex.h
 	GS/Renderers/Common/GSVertexTrace.h
 	GS/Renderers/Null/GSDeviceNone.h
+	GS/Renderers/Null/GSNullDeviceProfile.h
 	GS/Renderers/Null/GSRendererNull.h
 	GS/Renderers/HW/GSAlphaKnownBits.h
 	GS/Renderers/HW/GSDepthCoverage.h
@@ -613,6 +623,7 @@ set(pcsx2GSHeaders
 	GS/Renderers/HW/GSDrawLog.h
 	GS/Renderers/HW/GSHwHack.h
 	GS/Renderers/HW/GSLineWalk.h
+	GS/Renderers/HW/GSPointPlace.h
 	GS/Renderers/HW/GSRendererHW.h
 	GS/Renderers/HW/GSSpriteEdgeSnap.h
 	GS/Renderers/HW/GSTextureCache.h
@@ -1770,15 +1781,17 @@ if (APPLE)
 			${COREMEDIA_LIBRARY}
 		)
 	endif()
-	# Weak-link MetalFX so older OS versions still load. Skip on the iOS simulator:
-	# MetalFX.framework isn't in the iphonesimulator SDK (see PCSX2_HAS_METALFX in
-	# GSDeviceMTL.h), so linking it there fails with "framework not found".
+	# Weak-link MetalFX so older OS versions still load. Skip it where the SDK
+	# does not carry the framework at all - the iOS simulator and tvOS (see
+	# PCSX2_HAS_METALFX in GSDeviceMTL.h) - because linking it there fails with
+	# "framework not found".
 	#
 	# ARMSX2_REAL_DEVICE is the iOS app's own switch and nothing sets it for the
 	# libretro core, which is only ever built against a device SDK - and without
 	# the framework the link is short MTLFXSpatialScalerDescriptor, because the
 	# header is there and PCSX2_HAS_METALFX is 1.
-	if(ARMSX2_REAL_DEVICE OR ENABLE_LIBRETRO OR NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+	if(NOT CMAKE_SYSTEM_NAME STREQUAL "tvOS"
+	   AND (ARMSX2_REAL_DEVICE OR ENABLE_LIBRETRO OR NOT CMAKE_SYSTEM_NAME STREQUAL "iOS"))
 		target_link_options(PCSX2_FLAGS INTERFACE "SHELL:-weak_framework MetalFX")
 	endif()
 endif()

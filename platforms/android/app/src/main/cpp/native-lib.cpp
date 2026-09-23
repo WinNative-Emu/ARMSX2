@@ -878,8 +878,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setCustomVulkanDriver(
     const std::string name  = GetJavaString(env, driverName);
     const std::string redir = GetJavaString(env, redirectDir);
     const std::string hook  = GetJavaString(env, hookLibDir);
+    // required=false: the app keeps its existing behaviour of falling through to the
+    // system loader when the pack will not open, so a bad pack cannot leave the user
+    // with an emulator that refuses to boot.
     Vulkan::SetCustomDriverPath(
-        dir.c_str(), name.c_str(), redir.c_str(), hook.c_str());
+        dir.c_str(), name.c_str(), redir.c_str(), hook.c_str(), /*required=*/false);
 }
 
 extern "C"
@@ -1745,7 +1748,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_applyGSSettingsLive(JNIEnv *env, jclass cla
         const auto saved_blit_swap       = EmuConfig.GS.UseBlitSwapChain;
         const auto saved_no_shader_cache = EmuConfig.GS.DisableShaderCache;
         const auto saved_no_fb_fetch     = EmuConfig.GS.DisableFramebufferFetch;
-        const auto saved_adreno_fbfetch  = EmuConfig.GS.EnableAdrenoFramebufferFetch;
         const auto saved_mali_fbfetch    = EmuConfig.GS.ForceMaliFramebufferFetch;
         const auto saved_no_vs_expand    = EmuConfig.GS.DisableVertexShaderExpand;
         const auto saved_tex_barriers    = EmuConfig.GS.OverrideTextureBarriers;
@@ -1779,7 +1781,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_applyGSSettingsLive(JNIEnv *env, jclass cla
         EmuConfig.GS.UseBlitSwapChain           = saved_blit_swap;
         EmuConfig.GS.DisableShaderCache         = saved_no_shader_cache;
         EmuConfig.GS.DisableFramebufferFetch    = saved_no_fb_fetch;
-        EmuConfig.GS.EnableAdrenoFramebufferFetch = saved_adreno_fbfetch;
         EmuConfig.GS.ForceMaliFramebufferFetch  = saved_mali_fbfetch;
         EmuConfig.GS.DisableVertexShaderExpand  = saved_no_vs_expand;
         EmuConfig.GS.OverrideTextureBarriers    = saved_tex_barriers;
@@ -4168,9 +4169,8 @@ int Host::LocaleSensitiveCompare(std::string_view lhs, std::string_view rhs)
 // `mutate` is the caller's EmuConfig.GS write, and it runs HERE rather than in the JNI function
 // because it must happen on the CPU thread like everything else in this callback. The OSD flags
 // are `bool : 1` bit-fields (Config.h GSOptions BITFIELD32) sharing storage with the GS
-// device-restart flags — DisableFramebufferFetch, EnableAdrenoFramebufferFetch,
-// ForceMaliFramebufferFetch, UseBlitSwapChain, DisableShaderCache. A bit-field assignment is a
-// read-modify-write of that whole storage unit, so a UI-thread OSD toggle racing the CPU thread
+// device-restart flags — DisableFramebufferFetch, ForceMaliFramebufferFetch, UseBlitSwapChain,
+// DisableShaderCache. A bit-field assignment is a read-modify-write of that whole storage unit, so a UI-thread OSD toggle racing the CPU thread
 // can write back a stale copy of its neighbours. Lose applyGSSettingsLive's restore of one of
 // those and RestartOptionsAreEqual() goes false, which takes GSUpdateConfig down the full device
 // teardown path — the one GS operation that crashes mid-game here. An OSD toggle is emphatically
