@@ -6,7 +6,7 @@
 #include "GS/Renderers/Common/GSDynamicFeedbackLoopPolicy.h"
 #include "GS/Renderers/Common/GSSelfReadRoadPolicy.h"
 
-/// Switches that move the Vulkan self-read road for an A/B, and nothing else. Only
+/// Switches that move the Vulkan self-read road, or size the vertex ring, for an A/B. Only
 /// pcsx2-gsrunner sets them, from its command line, before the VM starts; the Vulkan backend
 /// reads them once, while it resolves its features and before any pipeline, image or render pass
 /// exists. None is read per draw.
@@ -29,12 +29,33 @@ struct GSMeasurementOverrides
 	/// extension is requested at all.
 	bool loop_create_flag = false;
 
+	/// -no-stencil-buffer: create depth as plain D32F and report no stencil buffer, as a device
+	/// under DriverWorkaround::DisableStencilBuffer does (Turnip before Mesa 26.2). Puts the old
+	/// driver's destination-alpha choices on a device that has D32S8.
+	bool disable_stencil_buffer = false;
+
+	/// -vertex-ring-kib N: the Vulkan vertex ring's starting size, in KiB (0 = the shipped size),
+	/// clamped to 64 KiB .. the growth cap.
+	/// It still grows to its cap on demand, so a small start drives the growth path on every title.
+	u32 vertex_ring_start_kib = 0;
+
+	/// -vertex-ring-no-grow: the vertex ring keeps its starting size and waits for the GPU when
+	/// full, as it did before it could grow.
+	bool vertex_ring_no_growth = false;
+
+	/// -readback-kick-passes N: in a readback frame, the Vulkan mid-frame kick waits for at least
+	/// N unsubmitted render passes (0 = the shipped spacing). Read once, when the device is created.
+	u32 readback_kick_passes = 0;
+
 	GSLoopDeclarationSpelling LoopSpelling() const
 	{
 		return loop_create_flag ? GSLoopDeclarationSpelling::PipelineCreateFlag : kDefaultLoopDeclarationSpelling;
 	}
 
-	bool Any() const { return self_read_arm != GSSelfReadArm::Off || declare_depth_loop || loop_create_flag; }
+	bool Any() const
+	{
+		return self_read_arm != GSSelfReadArm::Off || declare_depth_loop || loop_create_flag || disable_stencil_buffer;
+	}
 };
 
 inline GSMeasurementOverrides g_gs_measurement_overrides;

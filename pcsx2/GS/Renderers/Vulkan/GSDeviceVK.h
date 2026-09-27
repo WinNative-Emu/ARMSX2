@@ -16,10 +16,13 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -74,6 +77,7 @@ public:
 	__fi u32 GetGraphicsQueueFamilyIndex() const { return m_graphics_queue_family_index; }
 	__fi u32 GetPresentQueueFamilyIndex() const { return m_present_queue_family_index; }
 	__fi const VkPhysicalDeviceProperties& GetDeviceProperties() const { return m_device_properties; }
+	__fi const VkPhysicalDeviceDriverPropertiesKHR& GetDeviceDriverProperties() const { return m_device_driver_properties; }
 	__fi const OptionalExtensions& GetOptionalExtensions() const { return m_optional_extensions; }
 
 	/// Which memory the six stream rings are allocated from, decided once in CheckFeatures from the
@@ -213,6 +217,10 @@ public:
 	// commands can be retreived by calling GetCurrentFenceCounter().
 	u64 GetCompletedFenceCounter() const { return m_completed_fence_counter; }
 
+	// Polls the submitted command buffers' fences without blocking and retires every one that has
+	// signalled, advancing GetCompletedFenceCounter().
+	void ScanForCommandBufferCompletion();
+
 	// Gets the fence that will be signaled when the currently executing command buffer is
 	// queued and executed. Do not wait for this fence before the buffer is executed.
 	u64 GetCurrentFenceCounter() const { return m_frame_resources[m_current_frame].fence_counter; }
@@ -229,6 +237,10 @@ public:
 	void WaitForFenceCounter(u64 fence_counter);
 
 	void WaitForGPUIdle();
+
+	// A stream ring replaced its buffer (VKStreamBuffer::Grow). Rebinds whatever refers to it by
+	// handle, from the command buffer being recorded on.
+	void OnStreamRingReplaced(const VKStreamBuffer& ring);
 
 private:
 	// Helper method to create a Vulkan instance.
@@ -297,7 +309,6 @@ private:
 
 	void CommandBufferCompleted(u32 index);
 	void ActivateCommandBuffer(u32 index);
-	void ScanForCommandBufferCompletion();
 	void WaitForCommandBufferCompletion(u32 index);
 
 	/// VK_EXT_device_fault post-mortem: on VK_ERROR_DEVICE_LOST, logs the driver's
@@ -595,11 +606,63 @@ private:
 		return m_convert[ShaderConvertSelector(shader).Index()];
 	}
 
+	/// Guards m_tfx_vertex_shaders and m_tfx_fragment_shaders, which precompile workers fill too.
+	std::mutex m_tfx_shader_mutex;
 	std::unordered_map<u32, VkShaderModule> m_tfx_vertex_shaders;
 	std::unordered_map<GSHWDrawConfig::PSSelector, VkShaderModule, GSHWDrawConfig::PSSelectorHash>
 		m_tfx_fragment_shaders;
+	/// GS thread only. A precompiled pipeline moves in here when it is first drawn with.
 	std::unordered_map<PipelineSelector, VkPipeline, PipelineSelectorHash> m_tfx_pipelines;
 	u32 m_tfx_pipeline_compile_counter = 0;
+
+	// Pipeline precompile. Each game's TFX pipeline keys are appended to a file in the cache
+	// directory as they are first created; when that game starts again, worker threads build the
+	// recorded pipelines in first-use order, ahead of the draws that need them. The pipelines are
+	// the ones the GS thread would have built -- same key, same CreateTFXPipeline -- so this moves
+	// work off the GS thread without changing what is drawn.
+	struct TFXPrecompileJob
+	{
+		enum class State : u8
+		{
+			Queued, ///< Not started. The GS thread may take it and build it itself.
+			Running, ///< A worker is building it. The GS thread waits for it.
+			Done,
+		};
+		State state = State::Queued;
+		VkPipeline pipeline = VK_NULL_HANDLE;
+	};
+	std::mutex m_precompile_mutex; ///< Guards the queue, the jobs and m_precompile_stop.
+	std::condition_variable m_precompile_done_cv;
+	std::deque<PipelineSelector> m_precompile_queue;
+	std::unordered_map<PipelineSelector, TFXPrecompileJob, PipelineSelectorHash> m_precompile_jobs;
+	std::vector<std::thread> m_precompile_workers;
+	bool m_precompile_stop = false;
+	u64 m_precompile_start = 0; ///< Common::Timer value when the workers started; read by the workers.
+	bool m_precompile_active = false; ///< GS thread only: whether m_precompile_jobs can be non-empty.
+	/// GS thread only: the keys the game's key file holds (record index and last session drawn), the
+	/// open file, and this session's number in it.
+	struct RecordedTFXKey
+	{
+		u32 index;
+		u32 last_session;
+	};
+	std::unordered_map<PipelineSelector, RecordedTFXKey, PipelineSelectorHash> m_recorded_tfx_keys;
+	std::FILE* m_tfx_key_file = nullptr;
+	u32 m_tfx_key_session = 0;
+
+	void SetGameIdentity(const std::string& serial, u32 crc) override;
+	void PrepareShaderCacheClear() override;
+	/// Joins the workers and destroys every pipeline built but not drawn with. GS thread only.
+	void StopPipelinePrecompile();
+	void PrecompileWorker();
+	/// The result of a precompile job for p, waiting if a worker is building it (the only wait). nullopt
+	/// if there is no job, the job had not started, or the worker's build failed: the job is dropped
+	/// and the caller builds p itself.
+	std::optional<VkPipeline> TakePrecompiledTFXPipeline(const PipelineSelector& p);
+	void RecordTFXPipelineKey(const PipelineSelector& p);
+	/// What CreateTFXPipeline reads besides the key. A key file written under a different value is
+	/// discarded, so a key is never built on a device configuration it was not recorded on.
+	std::string GetTFXPipelineKeyFingerprint() const;
 
 	VkRenderPass m_utility_color_render_pass_load = VK_NULL_HANDLE;
 	VkRenderPass m_utility_color_render_pass_clear = VK_NULL_HANDLE;
@@ -798,7 +861,6 @@ public:
 	void Draw(const GSHWDrawConfig& config, int offset, int count);
 
 	std::unique_ptr<GSDownloadTexture> CreateDownloadTexture(u32 width, u32 height, GSTexture::Format format) override;
-	void DoHintReadbackSource(GSTexture* tex) override;
 
 	void DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r, u32 destX, u32 destY) override;
 
@@ -951,6 +1013,7 @@ private:
 
 	void InitializeState();
 	bool CreatePersistentDescriptorSets();
+	VkDescriptorSet CreateTFXUBODescriptorSet();
 
 	void SetInitialState(VkCommandBuffer cmdbuf);
 	void ApplyBaseState(u32 flags, VkCommandBuffer cmdbuf);
@@ -987,14 +1050,9 @@ private:
 	// ~0u = no readback seen yet, window shut.
 	u32 m_render_passes_since_submit = 0;
 	u32 m_readback_frame = ~0u;
-
-	// Textures recently used as synchronous-readback sources (see DoHintReadbackSource).
-	// A draw INTO one of these is almost certainly the producer of the next readback,
-	// so DoRenderHW kicks the command buffer first: the queued backlog drains while the
-	// producing pass records, leaving the readback to wait on one small pass + copy
-	// instead of the whole backlog. Compared by pointer only, never dereferenced —
-	// a recycled allocation at worst causes one extra readback-window submit.
-	std::array<GSTexture*, 2> m_recent_readback_sources = {};
+	// The kick's spacing, in unsubmitted render passes (see DoRenderHW). Only gsrunner's
+	// -readback-kick-passes moves it.
+	u32 m_readback_kick_passes = 8;
 
 	GSVector4i m_scissor = GSVector4i::zero();
 	VkViewport m_viewport = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};

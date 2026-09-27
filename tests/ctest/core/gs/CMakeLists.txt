@@ -16,12 +16,14 @@ add_pcsx2_test(gs_vertex_tests
 	gs_field_shift_policy_tests.cpp
 	gs_framebuffer_fetch_policy_tests.cpp
 	gs_draw_road_tests.cpp
+	gs_date_road_tests.cpp
 	gs_copy_road_blending_tests.cpp
 	gs_native_texel_grid_tests.cpp
 	gs_self_read_road_tests.cpp
 	gs_dynamic_feedback_loop_tests.cpp
 	gs_stream_ring_memory_tests.cpp
 	gs_stream_ring_flush_tests.cpp
+	gs_stream_ring_growth_tests.cpp
 	gs_gpu_driver_profile_tests.cpp
 	gs_vulkan_device_rules_tests.cpp
 	gs_gpu_profile_tests.cpp
@@ -32,6 +34,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_aa1_edge_tests.cpp
 	gs_sw_colour_walk_tables_tests.cpp
 	gs_line_walk_tests.cpp
+	gs_line_runs_tests.cpp
 	gs_point_place_tests.cpp
 	gs_sw_setup_reciprocal_tests.cpp
 	gs_readback_transfer_size_tests.cpp
@@ -76,6 +79,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_field_shift_detector_tests.cpp
 	gs_channel_shuffle_cover_tests.cpp
 	gs_sw_palette_block_copy_tests.cpp
+	gs_cache_file_tests.cpp
 )
 
 target_include_directories(gs_vertex_tests PRIVATE
@@ -108,3 +112,20 @@ target_link_libraries(gs_sw_palette_block_copy_jit_tests PUBLIC
 	PCSX2
 	common
 )
+
+# The GS cache store under a host file system (the libretro core's VFS). Its own binary: a host file
+# system is installed once per process, and would change every other test's files.
+if(UNIX)
+	add_pcsx2_test(gs_cache_file_vfs_tests
+		${CMAKE_CURRENT_SOURCE_DIR}/../StubHost.cpp
+		gs_cache_file_vfs_tests.cpp
+	)
+	target_include_directories(gs_cache_file_vfs_tests PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/../../../../pcsx2
+	)
+	target_link_libraries(gs_cache_file_vfs_tests PUBLIC
+		PCSX2_FLAGS
+		PCSX2
+		common
+	)
+endif()

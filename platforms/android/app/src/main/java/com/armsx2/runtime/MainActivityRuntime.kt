@@ -57,6 +57,7 @@ import com.armsx2.MemoryCardBackup
 import com.armsx2.PlayTime
 import com.armsx2.i18n.str
 import com.armsx2.input.ControllerMappings
+import com.armsx2.input.HotkeyHoldState
 import com.armsx2.input.SoftKeyboard
 import com.armsx2.runtime.MainActivityRuntime.Companion.internalBiosDir
 import com.armsx2.runtime.MainActivityRuntime.Companion.romsDirs
@@ -1316,6 +1317,7 @@ open class MainActivityRuntime : ComponentActivity() {
             // at normal speed. Same for the gyro hotkey latch — a game left with gyro
             // toggled off must not silently start the next one with gyro dead.
             fastForwardToggleActive = false
+            instance?.fastForwardHold?.clear()
             slowDownToggleActive = false
             gyroActive.value = true
             val nativeActive = runCatching { NativeApp.hasActiveVM() }.getOrDefault(false)
@@ -2053,21 +2055,29 @@ open class MainActivityRuntime : ComponentActivity() {
         copyAssetAll(applicationContext, "bios")
         copyAssetAll(applicationContext, "resources")
 
-        // On an app UPDATE (versionCode changed), drop the regenerable GPU caches. Installing a
-        // new build over an old one keeps the compiled GS shader/pipeline cache under
-        // <dataRoot>/cache, and a cache baked by a different core build can render corrupt — the
-        // "scrambled PS2 logo" and post-update graphical glitches users currently fix by
-        // reinstalling clean (#376/#385). The cache is pure derived data (rebuilt on demand),
-        // never user content, so wiping it is always safe. Skipped on first install (no prior
-        // version recorded) — there is nothing stale to clear.
+        // On any new install of the app, drop the regenerable GPU caches. The native caches carry
+        // their own build and driver stamps and discard themselves on a mismatch; this is the second
+        // line, for anything an older build wrote before those stamps existed. The marker lives in
+        // the data root beside the caches, not in this package's preferences: a data root shared by
+        // two installs (stable and nightly) is wiped whenever the other one last used it, and a
+        // data root that moved is wiped where it now is. lastUpdateTime changes on every install,
+        // so a rebuilt APK with an unchanged versionCode counts too. The marker is written only
+        // after the wipe succeeded, so a failed wipe is retried on the next launch.
         runCatching {
-            val prevVc = prefs.getInt("lastRunVersionCode", 0)
-            val curVc = BuildConfig.VERSION_CODE
-            if (prevVc != 0 && prevVc != curVc) {
-                File(assetCopyRoot(applicationContext), "cache").deleteRecursively()
-                android.util.Log.i("ARMSX2", "Update $prevVc -> $curVc: cleared GS shader/pipeline cache")
+            val info = packageManager.getPackageInfo(packageName, 0)
+            val install = "$packageName ${BuildConfig.VERSION_CODE} ${BuildConfig.VERSION_NAME} ${info.lastUpdateTime}"
+            val cacheDir = File(assetCopyRoot(applicationContext), "cache")
+            val marker = File(cacheDir, ".install")
+            val recorded = runCatching { marker.readText() }.getOrNull()
+            if (recorded != install) {
+                val wiped = !cacheDir.exists() || cacheDir.deleteRecursively()
+                if (wiped && cacheDir.mkdirs()) {
+                    marker.writeText(install)
+                    android.util.Log.i("ARMSX2", "New install ($install): cleared GS shader/pipeline cache")
+                } else {
+                    android.util.Log.w("ARMSX2", "New install ($install): could not clear ${cacheDir.path}")
+                }
             }
-            if (prevVc != curVc) prefs.edit { putInt("lastRunVersionCode", curVc) }
         }
 
         // Point the ANGLE EGL env vars at the bundled libs (or clear them) before the
@@ -3039,6 +3049,20 @@ open class MainActivityRuntime : ComponentActivity() {
     // (e.g. Select + R1) — kept current at the top of dispatchKeyEvent so a
     // combo's modifier can be checked the instant its main key is pressed.
     private val heldKeys = HashSet<Int>()
+    private val fastForwardHold = HotkeyHoldState()
+
+    private fun startFastForwardHold(mainKey: Int) {
+        val modifier = ControllerMappings.hotkeyModCode(ControllerMappings.SysHotkey.FAST_FORWARD)
+            .takeUnless { it == KeyEvent.KEYCODE_UNKNOWN }
+        fastForwardHold.start(mainKey, modifier)
+        fastForwardToggleActive = false
+        runCatching { NativeApp.speedhackLimitermode(ffLimiterMode()) }
+    }
+
+    private fun releaseFastForwardHold(key: Int) {
+        if (fastForwardHold.release(key))
+            runCatching { NativeApp.speedhackLimitermode(baseLimiterMode()) }
+    }
 
     // Hold-BACK-to-exit (Dolphin-style) timer. Instance-scoped because
     // dispatchKeyEvent is an Activity method; the posted runnable is cancelled on
@@ -3082,7 +3106,14 @@ open class MainActivityRuntime : ComponentActivity() {
         if (kc != KeyEvent.KEYCODE_UNKNOWN) {
             when (event.action) {
                 KeyEvent.ACTION_DOWN -> heldKeys.add(kc)
-                KeyEvent.ACTION_UP -> heldKeys.remove(kc)
+                KeyEvent.ACTION_UP -> {
+                    heldKeys.remove(kc)
+                    // A combo hold ends when EITHER physical key is released, even if
+                    // this key is the modifier and matchHotkey would not match it.
+                    // Axis-owned triggers release only at their axis threshold; their
+                    // duplicate key-up must not end the hold ahead of that edge.
+                    if (triggerHotkeyOwner[kc] != true) releaseFastForwardHold(kc)
+                }
             }
         }
         // Track the active gamepad so PS2 rumble routes to its vibrator.
@@ -3625,13 +3656,8 @@ open class MainActivityRuntime : ComponentActivity() {
                     // Hold to fast-forward (Turbo), release to return to the user's
                     // current limiter mode (Nominal if frame-limit is on, else Unlimited)
                     // — not blindly Nominal, which would re-enable a disabled limiter.
-                    if (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP) {
-                        if (event.repeatCount == 0) {
-                            // Holding FF supersedes any latched FF-toggle.
-                            if (down) fastForwardToggleActive = false
-                            runCatching { NativeApp.speedhackLimitermode(if (down) ffLimiterMode() else baseLimiterMode()) }
-                        }
-                    }
+                    // Release was handled above using the binding active at press time.
+                    if (down && event.repeatCount == 0) startFastForwardHold(kc)
                     return true
                 }
                 ControllerMappings.SysHotkey.FAST_FORWARD_TOGGLE -> {
@@ -5270,6 +5296,7 @@ open class MainActivityRuntime : ComponentActivity() {
                 }
             } else {
                 heldKeys.remove(code)
+                releaseFastForwardHold(code)
                 held.remove(code)
             }
         }
@@ -5529,7 +5556,10 @@ open class MainActivityRuntime : ComponentActivity() {
         // event that happens to read the axis low.
         if (pressed) heldKeys.add(code)
         if (pressed != held.contains(code)) {
-            if (pressed) held.add(code) else { held.remove(code); heldKeys.remove(code) }
+            if (pressed) held.add(code) else {
+                held.remove(code)
+                heldKeys.remove(code)
+            }
             // Only the path that saw this press first fires its hotkey or macro, on both edges;
             // on a pad that reports the trigger both ways the key path has the other. See
             // triggerHotkeyOwner.
@@ -5538,6 +5568,7 @@ open class MainActivityRuntime : ComponentActivity() {
             } else {
                 (triggerHotkeyOwner[code] == true).also { if (it) triggerHotkeyOwner.remove(code) }
             }
+            if (ours && !pressed) releaseFastForwardHold(code)
             // Triggers now reach the Hotkeys tab's capture like any other button, so they have
             // to be able to fire one here. Hold-type hotkeys act on both edges (a trigger has a
             // real release, unlike a stick edge); the rest fire on the press. Matching on
@@ -5545,10 +5576,7 @@ open class MainActivityRuntime : ComponentActivity() {
             if (ours) ControllerMappings.matchHotkey(code, if (pressed) heldKeys else heldKeys + code)?.let { hk ->
                 when (hk) {
                     ControllerMappings.SysHotkey.FAST_FORWARD -> {
-                        if (pressed) fastForwardToggleActive = false
-                        runCatching {
-                            NativeApp.speedhackLimitermode(if (pressed) ffLimiterMode() else baseLimiterMode())
-                        }
+                        if (pressed) startFastForwardHold(code)
                     }
                     ControllerMappings.SysHotkey.PRESSURE_MOD ->
                         com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = pressed

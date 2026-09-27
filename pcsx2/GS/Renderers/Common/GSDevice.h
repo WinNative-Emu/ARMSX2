@@ -1800,7 +1800,6 @@ protected:
 	virtual void DoFilteredDownsampleTexture(GSTexture* sTex, GSTexture* dTex, u32 downsample_factor, const GSVector2i& clamp_min, const GSVector4& dRect) = 0;
 	virtual void DoRenderHW(GSHWDrawConfig& config) = 0;
 	virtual void DoBeginDSAsRT(GSTexture* ds, const GSVector4i& drawarea);
-	virtual void DoHintReadbackSource(GSTexture* tex);
 	virtual PresentResult DoBeginPresent(bool frame_skip) = 0;
 
 public:
@@ -1981,6 +1980,16 @@ public:
 	/// Enables/disables GPU frame timing.
 	virtual bool SetGPUTimingEnabled(bool enabled) = 0;
 
+	/// Names the running game, so a device can build the pipelines it recorded for that game ahead
+	/// of their first use. Called on the GS thread when a renderer opens and on every game change;
+	/// an empty serial (the software renderer, or no game) means build nothing.
+	virtual void SetGameIdentity(const std::string& serial, u32 crc) {}
+
+	/// Called on the GS thread just before the on-disk shader caches are cleared: close whatever
+	/// cache file the device holds outside GSCacheFile's stores, and drop in-memory state it would
+	/// otherwise write back.
+	virtual void PrepareShaderCacheClear() {}
+
 	/// Returns the amount of GPU time utilized since the last time this method was called.
 	virtual float GetAndResetAccumulatedGPUTime() = 0;
 
@@ -2051,15 +2060,9 @@ public:
 
 	virtual std::unique_ptr<GSDownloadTexture> CreateDownloadTexture(u32 width, u32 height, GSTexture::Format format) = 0;
 
-	/// Hints that a synchronous CPU readback of `tex` is being performed. Games that read
-	/// back every frame (e.g. small occlusion-test targets) will typically draw into the
-	/// same texture again shortly before the next readback; backends can use this to
-	/// schedule command submission so that readback has minimal GPU backlog to wait on.
-	void HintReadbackSource(GSTexture* tex)
-	{
-		FlushDeferredDraws();
-		DoHintReadbackSource(tex);
-	}
+	/// A synchronous CPU readback follows: record every queued draw first, so the copy
+	/// sees what they wrote.
+	void FlushBeforeReadback() { FlushDeferredDraws(); }
 
 	void CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r, u32 destX, u32 destY)
 	{
