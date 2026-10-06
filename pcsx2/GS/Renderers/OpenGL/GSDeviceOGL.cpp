@@ -2685,6 +2685,7 @@ std::string GSDeviceOGL::GetPSSource(const PSSelector& sel)
 		+ fmt::format("#define PS_COLCLIP_HW {}\n", sel.colclip_hw)
 		+ fmt::format("#define PS_RTA_CORRECTION {}\n", sel.rta_correction)
 		+ fmt::format("#define PS_RTA_SRC_CORRECTION {}\n", sel.rta_source_correction)
+		+ fmt::format("#define PS_REPLACEMENT_ALPHA_SNAP {}\n", sel.replacement_alpha_snap)
 		+ fmt::format("#define PS_DITHER {}\n", sel.dither)
 		+ fmt::format("#define PS_DITHER_ADJUST {}\n", sel.dither_adjust)
 		+ fmt::format("#define PS_ZCLAMP {}\n", sel.zclamp)
@@ -4376,9 +4377,7 @@ void GSDeviceOGL::DoRenderHW(GSHWDrawConfig& config)
 		{
 			OMSetBlendState();
 		}
-		psel.ps.no_color1 = config.blend_multi_pass.no_color1;
-		psel.ps.blend_hw = config.blend_multi_pass.blend_hw;
-		psel.ps.dither = config.blend_multi_pass.dither;
+		config.blend_multi_pass.ApplyTo(psel.ps);
 		SetupPipeline(psel);
 		Draw(config);
 	}
