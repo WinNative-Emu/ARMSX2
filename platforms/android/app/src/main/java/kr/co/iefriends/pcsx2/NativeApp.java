@@ -945,6 +945,10 @@ public class NativeApp {
 	 *  instead of OpenGL. The decision needs the driver-bug database (keyed on a parsed driver
 	 *  revision), which lives natively, so the app supplies the strings rather than the verdict. */
 	public static native void setAutoRendererGpuStrings(String vendor, String renderer, String version);
+	/** Whether the driver list offers malisx2 for this device's GPU (CustomDriver.offersMaliSX2).
+	 *  Pushed once at startup. The core pairs it with the driver the open Vulkan device is on and
+	 *  posts the "get malisx2" OSD notice at game start when that driver is not malisx2. */
+	public static native void setMaliSX2Offered(boolean offered);
 	/** Affinity Control Mode: 0 off (scheduler decides), 1-6 EE/VU/GS priority orders,
 	 *  7 Performance Cores. Read when the VM boots — set it before runVMThread. */
 	public static native void setAffinityMode(int mode);
@@ -1058,12 +1062,17 @@ public class NativeApp {
 	// in the savestate folder (see VMManager::SAVESTATE_SLOT_AUTOSAVE) so the
 	// numbered slots 0-9 stay user-controlled. saveAutosaveState is called
 	// from the in-game "Save State And Exit" menu; hasAutosaveState gates
-	// the load picker's autosave tile.
-	public static native boolean saveAutosaveState();
+	// the load picker's autosave tile. That file is the newest autosave: saving moves the ones
+	// before it a place older, keeping `keep` (1-5) in all; the *At(n) calls reach the n-th newest
+	// (1 = the newest, 2 the one before it...) for the picker's tiles, null / false when there is none.
+	public static native boolean saveAutosaveState(int keep);
 	public static native boolean loadAutosaveState();
 	public static native boolean hasAutosaveState();
 	public static native byte[] getAutosaveImage();
 	public static native String getAutosaveGamePath();
+	public static native String getAutosavePathAt(int n);
+	public static native byte[] getAutosaveImageAt(int n);
+	public static native boolean loadAutosaveStateAt(int n);
 	// Frames the GS has presented since it opened (host-side, not saved in the state). The
 	// auto-load-on-boot path waits until this is advancing before restoring, so the load happens
 	// once the renderer is actually presenting — otherwise the restored frame never reaches the

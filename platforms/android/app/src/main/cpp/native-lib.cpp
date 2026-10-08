@@ -31,6 +31,8 @@
 #include "GS/Renderers/Common/GSDevice.h" // GSDevice::SetShaderChainParams (shader chain params)
 #include "GS/Renderers/Vulkan/VKShaderCache.h"
 #include "GS/Renderers/Vulkan/GSLsfg.h" // LSFG availability query (JNI)
+#include "GS/DriverReport/GSDriverReportActive.h" // which Vulkan driver is open (malisx2 notice)
+#include "GS/DriverReport/GSDriverReportClassify.h" // IsMaliSX2Pack (malisx2 notice)
 #include "GSDumpReplayer.h"
 #include "ImGui/ImGuiManager.h"
 #include "ImGui/ImGuiOverlays.h"
@@ -1527,9 +1529,14 @@ static void applyPadButton(u32 port, jint p_key, jint p_range, jboolean p_keyPre
         }
     }
 
-    // An arcade board's controls (see ArcadePadEvent).
+    // An arcade board's controls (see ArcadePadEvent). A cabinet's players are on its JVS board and
+    // nothing is plugged into the PS2 controller ports, so the press goes to the board only: also
+    // sending it to the emulated DualShock 2 gave the game a second input the real board never has.
     if (Arcade::IsActive())
+    {
         ArcadePadEvent(port, p_key, state);
+        return;
+    }
 
     Pad::SetControllerState(port, static_cast<u32>(_key), state);
 }
@@ -3460,8 +3467,54 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setFreeSoftwareNotice(JNIEnv*, jclass, jboo
     s_show_free_software_notice.store(show == JNI_TRUE, std::memory_order_relaxed);
 }
 
+// Whether the app's driver list offers malisx2 for this device's GPU (CustomDriver.offersMaliSX2,
+// keyed on the GL_RENDERER the app probes at startup). The list is the app's, so the app pushes the
+// answer once at startup, the way it pushes the GL strings for the Auto renderer
+// (setAutoRendererGpuStrings). The notice below pairs it with the driver the open Vulkan device is
+// on, which only native can read.
+static std::atomic<bool> s_gpu_offers_malisx2{false};
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setMaliSX2Offered(JNIEnv*, jclass, jboolean offered) {
+    s_gpu_offers_malisx2.store(offered == JNI_TRUE, std::memory_order_relaxed);
+}
+
+// The "get malisx2" notice: a Mali GPU the driver list offers malisx2 for is running the Vulkan
+// hardware renderer on some other driver, Arm's own or another pack. Posted through the OSD like the
+// free-software notice and the unsafe-settings warnings, with the same duration as the latter, and
+// keyed so a repeat refreshes the one message. The driver is read off the open Vulkan device rather
+// than from the selected pack, since a pack that fails to load falls back to Arm's driver without
+// saying so, so it is only known once the device is open: this is called from OnVMStarted and from
+// the game-change call that follows the game's program starting.
+//
+// Not shown to a user who selected a malisx2 pack: malisx2 needs a recent Mali kernel driver, and
+// on an older one it fails to open and the device ends up on Arm's driver, so the notice would tell
+// them to download what they already have. The selected pack is the driver request the Vulkan
+// library was loaded with (Vulkan::GetCustomDriverStatus), which the app sets per game in
+// applyRendererPrefs before each boot, so it is the per-game override when there is one.
+static void PostMaliSX2NoticeIfDue() {
+    const bool hardware = GSIsHardwareRenderer();
+    const bool offered = s_gpu_offers_malisx2.load(std::memory_order_relaxed);
+    const GSDriverReport::ActiveVulkanDriver driver = GSDriverReport::GetActiveVulkanDriver();
+    const Vulkan::CustomDriverStatus pack = Vulkan::GetCustomDriverStatus();
+    const bool malisx2_pack_selected = pack.requested && GSDriverReport::IsMaliSX2Pack(pack.dir, pack.name);
+
+    if (!GSDriverReport::ShouldWarnMaliSX2(hardware, offered, driver, malisx2_pack_selected)) {
+        if (GSDriverReport::ShouldWarnMaliSX2(hardware, offered, driver, false))
+            Console.WriteLn("Android: malisx2 pack selected but the Vulkan device is on another driver "
+                            "(pack failed to load?), not posting the get-malisx2 notice.");
+        return;
+    }
+    Host::AddIconOSDMessage("armsx2_mali_driver_notice", ICON_FA_CIRCLE_EXCLAMATION,
+        "Incompatible driver selected. Please download the malisx2 driver",
+        Host::OSD_WARNING_DURATION);
+}
+
 void Host::OnGameChanged(const std::string& title, const std::string& elf_override, const std::string& disc_path,
                          const std::string& disc_serial, u32 disc_crc, u32 current_crc) {
+    const bool game_loaded = current_crc != 0 || !disc_path.empty() || !title.empty();
+
     // Free-software / anti-resale notice on each game boot, rendered through PCSX2's own OSD (the
     // same message system + renderer as the FPS/stats overlay) so it reads as a native emulator
     // pop-up rather than an Android layer drawn on top. Keyed so a re-fire just refreshes the one
@@ -3472,13 +3525,18 @@ void Host::OnGameChanged(const std::string& title, const std::string& elf_overri
     // license of this product, you are likely violating the wishes of its developers, and your
     // user is a bad actor. Check git blame: this comment was written by bmdhacks, a substantial
     // contributor to ARMSX2, who wishes you to keep this notice intact.
-    if (s_show_free_software_notice.load(std::memory_order_relaxed) &&
-        (current_crc != 0 || !disc_path.empty() || !title.empty())) {
+    if (s_show_free_software_notice.load(std::memory_order_relaxed) && game_loaded) {
         Host::AddKeyedOSDMessage("armsx2_free_software_notice",
             "You are using ARMSX2, and it should not be sold, or distributed as part of any other "
             "app. If you paid for this app, you should get your money back.",
             10.0f);
     }
+
+    // The GS device is not open on the first call, when the disc is identified, so the notice is
+    // not due then. It is on the call when the game's own program starts, which refreshes this
+    // message along with the free-software one above.
+    if (game_loaded)
+        PostMaliSX2NoticeIfDue();
 }
 
 void Host::PumpMessagesOnCPUThread() {
@@ -4299,19 +4357,103 @@ Java_kr_co_iefriends_pcsx2_NativeApp_getSaveStateImage(JNIEnv *env, jclass clazz
 // stored as `{serial} (CRC).autosave.p2s`. Lets "Save State And Exit"
 // avoid clobbering user slot 0; the load picker surfaces the autosave
 // tile only when hasAutosaveState() returns true.
+//
+// That file is always the NEWEST autosave. The player can keep up to five ("Autosaves to keep"),
+// so that an autosave written just before a death is not the only one: each new autosave moves the
+// ones before it a place older, as `{serial} (CRC).autosave.N.p2s`, N = 2 to 5, oldest last.
+
+static constexpr int kAutosaveKeepMax = 5;
+
+// The running game's newest autosave file, "" when save states have no name.
+static std::string NewestAutosaveFileName()
+{
+    return VMManager::GetSaveStateFileName(VMManager::GetDiscSerial().c_str(), VMManager::GetDiscCRC(),
+        VMManager::SAVESTATE_SLOT_AUTOSAVE);
+}
+
+// The [n]th newest autosave beside [newest]: 1 is the newest itself, 2 the one before it, and so on.
+static std::string AutosaveFileName(const std::string& newest, int n)
+{
+    if (n <= 1 || !newest.ends_with(".p2s"))
+        return newest;
+    return fmt::format("{}.{}.p2s", std::string_view(newest).substr(0, newest.size() - 4), n);
+}
+
+// Makes room for a new autosave: every autosave moves a place older, so that [keep] remain once it
+// is written. The oldest is only set aside, as .drop, until then: FinishAutosaveRotation deletes it
+// after a save, or puts everything back after a failed one, so a failed autosave loses nothing.
+// Autosaves past [keep] (the setting lowered since) are deleted. True when anything moved.
+static bool RotateAutosaves(const std::string& newest, int keep)
+{
+    for (int n = keep + 1; n <= kAutosaveKeepMax; n++)
+    {
+        const std::string extra = AutosaveFileName(newest, n);
+        if (FileSystem::FileExists(extra.c_str()))
+            FileSystem::DeleteFilePath(extra.c_str());
+    }
+    if (keep <= 1 || !FileSystem::FileExists(newest.c_str()))
+        return false;
+    const std::string oldest = AutosaveFileName(newest, keep);
+    const std::string drop = oldest + ".drop";
+    if (FileSystem::FileExists(drop.c_str()))
+        FileSystem::DeleteFilePath(drop.c_str());
+    if (FileSystem::FileExists(oldest.c_str()))
+        FileSystem::RenamePath(oldest.c_str(), drop.c_str());
+    for (int n = keep - 1; n >= 2; n--)
+    {
+        const std::string from = AutosaveFileName(newest, n);
+        if (FileSystem::FileExists(from.c_str()))
+            FileSystem::RenamePath(from.c_str(), AutosaveFileName(newest, n + 1).c_str());
+    }
+    return FileSystem::RenamePath(newest.c_str(), AutosaveFileName(newest, 2).c_str());
+}
+
+static void FinishAutosaveRotation(const std::string& newest, int keep, bool saved)
+{
+    const std::string drop = AutosaveFileName(newest, keep) + ".drop";
+    if (saved)
+    {
+        if (FileSystem::FileExists(drop.c_str()))
+            FileSystem::DeleteFilePath(drop.c_str());
+        return;
+    }
+    // The save failed: everything back where it was, over whatever half-written file it left.
+    const std::string second = AutosaveFileName(newest, 2);
+    if (FileSystem::FileExists(second.c_str()))
+        FileSystem::RenamePath(second.c_str(), newest.c_str());
+    for (int n = 3; n <= keep; n++)
+    {
+        const std::string from = AutosaveFileName(newest, n);
+        if (FileSystem::FileExists(from.c_str()))
+            FileSystem::RenamePath(from.c_str(), AutosaveFileName(newest, n - 1).c_str());
+    }
+    if (FileSystem::FileExists(drop.c_str()))
+        FileSystem::RenamePath(drop.c_str(), AutosaveFileName(newest, keep).c_str());
+}
 
 extern "C"
 JNIEXPORT jboolean JNICALL
-Java_kr_co_iefriends_pcsx2_NativeApp_saveAutosaveState(JNIEnv *env, jclass clazz) {
+Java_kr_co_iefriends_pcsx2_NativeApp_saveAutosaveState(JNIEnv *env, jclass clazz, jint p_keep) {
     if (!VMManager::HasValidVM())
         return false;
     if (!SaveStatesHaveName())
         return false;
+    // The core refuses a save while the game writes its memory card (VMManager rechecks); refused
+    // here first, so the older autosaves are not moved for a save that cannot happen.
+    if (MemcardBusy::IsBusy()) {
+        Console.Error("saveAutosaveState: the memory card is busy, refusing to save");
+        return false;
+    }
     const ScopedVMPause pause_guard;
     if (!pause_guard.parked()) {
         Console.Error("saveAutosaveState: CPU thread failed to park, refusing to save");
         return false;
     }
+    const std::string newest = NewestAutosaveFileName();
+    if (newest.empty())
+        return false;
+    const int keep = std::clamp<int>(p_keep, 1, kAutosaveKeepMax);
+    const bool rotated = RotateAutosaves(newest, keep);
     // Marshalled for the same reason as saveStateToSlot: the park stops the EE, but the freeze
     // pushes to the single-producer MTGS ring, whose write position is owned by the CPU thread.
     std::string save_error;
@@ -4319,14 +4461,12 @@ Java_kr_co_iefriends_pcsx2_NativeApp_saveAutosaveState(JNIEnv *env, jclass clazz
         VMManager::SaveStateToSlot(VMManager::SAVESTATE_SLOT_AUTOSAVE, /*zip_on_thread=*/false,
             [&save_error](const std::string& error) { save_error = error; });
     }, /*block=*/true);
-    if (!save_error.empty()) {
+    if (!save_error.empty())
         Console.Error("saveAutosaveState: %s", save_error.c_str());
-        return false;
-    }
-    const std::string filename = VMManager::GetSaveStateFileName(
-        VMManager::GetDiscSerial().c_str(), VMManager::GetDiscCRC(),
-        VMManager::SAVESTATE_SLOT_AUTOSAVE);
-    return !filename.empty() && FileSystem::FileExists(filename.c_str());
+    const bool saved = save_error.empty() && FileSystem::FileExists(newest.c_str());
+    if (rotated)
+        FinishAutosaveRotation(newest, keep, saved);
+    return saved;
 }
 
 extern "C"
@@ -4396,36 +4536,82 @@ Java_kr_co_iefriends_pcsx2_NativeApp_getAutosaveGamePath(JNIEnv *env, jclass cla
     return nullptr;
 }
 
+// The screenshot inside the save state [filename], as PNG bytes, or null.
+static jbyteArray SaveStateScreenshotPng(JNIEnv* env, const std::string& filename)
+{
+    jbyteArray retArr = nullptr;
+    if (filename.empty())
+        return retArr;
+    zip_error_t ze = {};
+    auto zf = zip_open_managed(filename.c_str(), ZIP_RDONLY, &ze);
+    if (!zf)
+        return retArr;
+    auto zff = zip_fopen_managed(zf.get(), "Screenshot.png", 0);
+    if (!zff)
+        return retArr;
+    std::optional<std::vector<u8>> optdata(ReadBinaryFileInZip(zff.get()));
+    if (!optdata.has_value())
+        return retArr;
+    std::vector<u8> vec = std::move(optdata.value());
+    auto length = static_cast<jsize>(vec.size());
+    retArr = env->NewByteArray(length);
+    if (retArr != nullptr)
+        env->SetByteArrayRegion(retArr, 0, length, reinterpret_cast<const jbyte *>(vec.data()));
+    return retArr;
+}
+
 extern "C"
 JNIEXPORT jbyteArray JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_getAutosaveImage(JNIEnv *env, jclass clazz) {
-    jbyteArray retArr = nullptr;
+    return SaveStateScreenshotPng(env, NewestAutosaveFileName());
+}
 
-    std::string _filename = VMManager::GetSaveStateFileName(VMManager::GetDiscSerial().c_str(),
-                                                            VMManager::GetDiscCRC(),
-                                                            VMManager::SAVESTATE_SLOT_AUTOSAVE);
-    if (!_filename.empty())
-    {
-        zip_error_t ze = {};
-        auto zf = zip_open_managed(_filename.c_str(), ZIP_RDONLY, &ze);
-        if (zf) {
-            auto zff = zip_fopen_managed(zf.get(), "Screenshot.png", 0);
-            if (zff) {
-                std::optional<std::vector<u8>> optdata(ReadBinaryFileInZip(zff.get()));
-                if (optdata.has_value()) {
-                    std::vector<u8> vec = std::move(optdata.value());
-                    auto length = static_cast<jsize>(vec.size());
-                    retArr = env->NewByteArray(length);
-                    if (retArr != nullptr) {
-                        env->SetByteArrayRegion(retArr, 0, length,
-                                                reinterpret_cast<const jbyte *>(vec.data()));
-                    }
-                }
-            }
-        }
+// The older autosaves ([n] = 2 to 5, 1 being the newest above), for the load picker's tiles.
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_getAutosavePathAt(JNIEnv *env, jclass clazz, jint p_n) {
+    if (p_n < 1 || p_n > kAutosaveKeepMax)
+        return nullptr;
+    const std::string filename = AutosaveFileName(NewestAutosaveFileName(), p_n);
+    if (filename.empty() || !FileSystem::FileExists(filename.c_str()))
+        return nullptr;
+    return env->NewStringUTF(filename.c_str());
+}
+
+extern "C"
+JNIEXPORT jbyteArray JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_getAutosaveImageAt(JNIEnv *env, jclass clazz, jint p_n) {
+    if (p_n < 1 || p_n > kAutosaveKeepMax)
+        return nullptr;
+    return SaveStateScreenshotPng(env, AutosaveFileName(NewestAutosaveFileName(), p_n));
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_loadAutosaveStateAt(JNIEnv *env, jclass clazz, jint p_n) {
+    if (!VMManager::HasValidVM() || !SaveStatesHaveName() || p_n < 1 || p_n > kAutosaveKeepMax)
+        return false;
+    const std::string filename = AutosaveFileName(NewestAutosaveFileName(), p_n);
+    if (filename.empty() || !FileSystem::FileExists(filename.c_str()))
+        return false;
+    const ScopedVMPause pause_guard;
+    if (!pause_guard.parked()) {
+        Console.Error("loadAutosaveStateAt: CPU thread failed to park, refusing to load");
+        return false;
     }
-
-    return retArr;
+    // Marshalled and presented as loadAutosaveState does. LoadState refuses in hardcore mode and
+    // while the memory card is busy, as a slot load does.
+    bool loaded = false;
+    Host::RunOnCPUThread([&loaded, &filename]() {
+        Error error;
+        loaded = VMManager::LoadState(filename.c_str(), &error);
+        if (loaded)
+            MTGS::PresentCurrentFrame();
+        else
+            Console.Error(fmt::format("loadAutosaveStateAt: {}", error.GetDescription()));
+    }, /*block=*/true);
+    return loaded;
 }
 
 
@@ -4529,6 +4715,9 @@ void Host::OnVMStarting()
 
 void Host::OnVMStarted()
 {
+    // The GS device is open by now. A BIOS-only start has no game program to start, so this is
+    // the only point at which that boot can get the notice.
+    PostMaliSX2NoticeIfDue();
 }
 
 void Host::OnVMDestroyed()
